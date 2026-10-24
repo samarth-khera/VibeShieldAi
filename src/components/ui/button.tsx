@@ -2,7 +2,7 @@ import Link from "next/link";
 import { cn } from "@/lib/utils";
 
 type Variant = "primary" | "secondary" | "ghost";
-type Size = "md" | "lg";
+type Size = "sm" | "md" | "lg";
 
 const base =
   "inline-flex items-center justify-center gap-2 rounded-full font-semibold whitespace-nowrap transition-all duration-300 ease-[var(--ease-luxury)] active:scale-[0.97] disabled:opacity-60 disabled:pointer-events-none cursor-pointer";
@@ -13,7 +13,7 @@ const variants: Record<Variant, string> = {
     "border border-line-bright bg-transparent text-foreground hover:border-accent hover:text-accent hover:-translate-y-0.5",
   ghost: "text-muted hover:text-foreground",
 };
-const sizes: Record<Size, string> = { md: "h-10 px-5 text-sm", lg: "h-12 px-7 text-[15px]" };
+const sizes: Record<Size, string> = { sm: "h-8 px-3 text-xs", md: "h-10 px-5 text-sm", lg: "h-12 px-7 text-[15px]" };
 
 export function buttonClass(variant: Variant = "primary", size: Size = "md", className?: string) {
   return cn(base, variants[variant], sizes[size], className);

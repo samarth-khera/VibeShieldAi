@@ -71,6 +71,7 @@ model ScanJob {
   infoCount          Int        @default(0)
 
   findings           Finding[]
+  remediations       Remediation[]
 
   attempts        Int        @default(0)
   createdAt       DateTime   @default(now())
@@ -114,4 +115,47 @@ model Finding {
   @@index([scanJobId])
   @@index([scanJobId, severity])
   @@index([scanJobId, category])
+}
+
+enum RemediationStatus {
+  preview
+  approved
+  applied
+  verified
+  needs_review
+  failed
+  rejected
+}
+
+model Remediation {
+  id                  String            @id @db.VarChar(36)
+  scanJobId           String            @db.VarChar(32)
+  scanJob             ScanJob           @relation(fields: [scanJobId], references: [id], onDelete: Cascade)
+
+  status              RemediationStatus @default(preview)
+  findingFingerprints Json              // Array of targeted fingerprints
+  commitSha           String            @db.VarChar(40)
+
+  patchSummary        String            @db.VarChar(500)
+  unifiedDiff         String            @db.Text
+  affectedFiles       Json              // string[]
+  eligibility         String            @db.VarChar(30) // "safe" | "potentially_breaking" | "unsuitable"
+  eligibilityReason   String            @db.VarChar(500)
+  requiresRotation    Boolean           @default(false)
+  warnings            Json?             // string[]
+
+  approvedAt          DateTime?
+  approvedOperations  Json?             // details of approved diff operations
+
+  rescanStatus        String?           @db.VarChar(30) // "verified" | "needs_review" | "failed"
+  rescanSummary       Json?             // { targetResolved: boolean, newFindingsCount: number }
+
+  branchName          String?           @db.VarChar(120)
+  pullRequestUrl      String?           @db.VarChar(300)
+
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@index([scanJobId])
+  @@index([status])
 }

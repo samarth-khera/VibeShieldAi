@@ -102,7 +102,7 @@ export class InMemoryJobStore implements JobStore {
   async saveFindings(jobId: string, items: NormalizedFinding[]): Promise<void> {
     const existing = this.findings.get(jobId) || [];
     const converted: FindingRecord[] = items.map((f, i) => ({
-      id: `f-${i}`,
+      id: f.id || `f-${existing.length + i + 1}`,
       scanJobId: jobId,
       fingerprint: f.fingerprint,
       scanner: f.scanner,
@@ -139,5 +139,45 @@ export class InMemoryJobStore implements JobStore {
     const list = this.findings.get(jobId) || [];
     const item = list.find((f) => f.id === findingId);
     if (item) item.aiExplanation = aiExplanation;
+  }
+
+  private remediations = new Map<string, import("@/server/remediation/types").RemediationRecord[]>();
+
+  async createRemediation(data: import("@/server/remediation/types").NewRemediation) {
+    const record: import("@/server/remediation/types").RemediationRecord = {
+      ...data,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const list = this.remediations.get(data.scanJobId) || [];
+    list.push(record);
+    this.remediations.set(data.scanJobId, list);
+    return record;
+  }
+
+  async getRemediation(scanJobId: string, remediationId: string) {
+    const list = this.remediations.get(scanJobId) || [];
+    return list.find((r) => r.id === remediationId) || null;
+  }
+
+  async listRemediations(scanJobId: string) {
+    return this.remediations.get(scanJobId) || [];
+  }
+
+  async updateRemediation(
+    scanJobId: string,
+    remediationId: string,
+    patch: Partial<import("@/server/remediation/types").RemediationRecord>,
+  ) {
+    const list = this.remediations.get(scanJobId) || [];
+    const index = list.findIndex((r) => r.id === remediationId);
+    if (index === -1) throw new Error("Remediation not found");
+    const updated = {
+      ...list[index],
+      ...patch,
+      updatedAt: new Date(),
+    };
+    list[index] = updated;
+    return updated;
   }
 }

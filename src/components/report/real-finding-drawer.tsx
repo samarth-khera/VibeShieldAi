@@ -23,15 +23,18 @@ import {
   type AiFindingExplanation,
   type PublicFinding,
 } from "@/lib/scan-client";
+import { RemediationPanel } from "./remediation-panel";
 
 export function RealFindingDrawer({
   jobId,
   finding,
   onClose,
+  mode = "review",
 }: {
   jobId: string;
   finding: PublicFinding | null;
   onClose: () => void;
+  mode?: "review" | "autofix";
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLElement>(null);
@@ -450,6 +453,11 @@ export function RealFindingDrawer({
               </div>
             </section>
           )}
+
+          {/* AI Remediation & Auto-Fix Panel */}
+          <section>
+            <RemediationPanel jobId={jobId} finding={finding} mode={mode} />
+          </section>
 
           {/* External References */}
           {finding.vulnerabilityId && (

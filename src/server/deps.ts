@@ -15,3 +15,14 @@ export function getScanDeps(): ScanDeps {
     workerOnline: isWorkerOnline,
   };
 }
+
+import { AnthropicProvider } from "./ai/client";
+import type { RemediationDeps } from "./remediation/service";
+
+export function getRemediationDeps(): RemediationDeps {
+  return {
+    store: prismaJobStore,
+    llmProvider: new AnthropicProvider(),
+    fetchImpl: fetch,
+  };
+}

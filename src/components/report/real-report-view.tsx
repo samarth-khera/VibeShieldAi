@@ -6,7 +6,9 @@ import {
   AlertCircle,
   AlertTriangle,
   ArrowLeft,
+  CheckCircle2,
   ChevronRight,
+  Eye,
   KeyRound,
   Layers,
   Loader2,
@@ -15,6 +17,7 @@ import {
   Search,
   SearchX,
   ShieldCheck,
+  Sparkles,
 } from "lucide-react";
 import { SeverityBadge, severityStyles } from "@/components/ui/badges";
 import { Button } from "@/components/ui/button";
@@ -25,6 +28,7 @@ import {
   type PublicFinding,
   type PublicScanJob,
 } from "@/lib/scan-client";
+import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
 import { cn } from "@/lib/utils";
 import { RealFindingDrawer } from "./real-finding-drawer";
 
@@ -40,6 +44,8 @@ export function RealReportView({ jobId }: { jobId: string }) {
   const [category, setCategory] = useState<string>("all");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [mode, setMode] = useState<"review" | "autofix">("review");
+  const [selectedFindingIds, setSelectedFindingIds] = useState<Set<string>>(new Set());
   const lastTrigger = useRef<HTMLElement | null>(null);
 
   const loadData = useCallback(async () => {
@@ -112,6 +118,38 @@ export function RealReportView({ jobId }: { jobId: string }) {
     setSelectedId(null);
     window.setTimeout(() => lastTrigger.current?.focus(), 0);
   }, []);
+
+  const toggleSelect = useCallback((id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setSelectedFindingIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const selectAllEligible = useCallback(() => {
+    const eligible = new Set<string>();
+    for (const f of filtered) {
+      const elig = classifyRemediationEligibility(f);
+      if (elig.canAutoFix) {
+        eligible.add(f.id);
+      }
+    }
+    setSelectedFindingIds(eligible);
+  }, [filtered]);
+
+  const eligibleSelectedCount = useMemo(() => {
+    let count = 0;
+    for (const f of findings) {
+      if (selectedFindingIds.has(f.id)) {
+        const elig = classifyRemediationEligibility(f);
+        if (elig.canAutoFix) count++;
+      }
+    }
+    return count;
+  }, [findings, selectedFindingIds]);
 
   const selected = useMemo(() => findings.find((f) => f.id === selectedId) ?? null, [findings, selectedId]);
 
@@ -321,8 +359,78 @@ export function RealReportView({ jobId }: { jobId: string }) {
           })}
         </ul>
 
+        {/* Remediation Mode Switcher */}
+        <div className="mt-8 rounded-xl border border-line-bright bg-surface p-5 sm:p-6 shadow-sm">
+          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-[11px] uppercase tracking-wider text-accent font-semibold">
+                  Remediation Workflow
+                </span>
+                <span className="rounded bg-accent/10 px-2 py-0.5 font-mono text-[10px] text-accent font-bold">
+                  Phase 6.5
+                </span>
+              </div>
+              <h2 className="mt-1 font-display text-xl font-bold tracking-tight">
+                {mode === "review" ? "Mode A — Review Only" : "Mode B — AI Auto-Fix"}
+              </h2>
+              <p className="mt-1 text-xs text-muted max-w-2xl leading-relaxed">
+                {mode === "review"
+                  ? "Read-only inspection. Browse findings, view AI root-cause analysis, and preview generated unified diffs without modifying repository files."
+                  : "Interactive remediation. Select eligible findings, review exact diffs, provide explicit approval, verify changes in an isolated sandbox with automated security rescan, and open a dedicated PR."}
+              </p>
+            </div>
+
+            <div className="flex shrink-0 items-center rounded-lg border border-line bg-surface-subtle p-1 font-mono text-xs">
+              <button
+                type="button"
+                onClick={() => setMode("review")}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 font-medium transition-all cursor-pointer",
+                  mode === "review"
+                    ? "bg-accent text-background shadow font-bold"
+                    : "text-muted hover:text-foreground"
+                )}
+              >
+                <Eye className="size-3.5" /> Review Only
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode("autofix")}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 font-medium transition-all cursor-pointer",
+                  mode === "autofix"
+                    ? "bg-accent text-background shadow font-bold"
+                    : "text-muted hover:text-foreground"
+                )}
+              >
+                <Sparkles className="size-3.5" /> AI Auto-Fix
+              </button>
+            </div>
+          </div>
+
+          {mode === "autofix" && (
+            <div className="mt-4 pt-4 border-t border-line/60 flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex flex-wrap items-center gap-3 text-muted">
+                <span className="inline-flex items-center gap-1 text-accent font-medium">
+                  <CheckCircle2 className="size-3.5" /> Safe to Auto-Fix
+                </span>
+                <span className="inline-flex items-center gap-1 text-sev-medium font-medium">
+                  <AlertTriangle className="size-3.5" /> Potentially Breaking
+                </span>
+                <span className="inline-flex items-center gap-1 text-sev-critical font-medium">
+                  <KeyRound className="size-3.5" /> Secret Rotation Required
+                </span>
+              </div>
+              <div className="font-mono text-[11px] text-muted">
+                Branch target: <code className="text-foreground">vibeshield/fixes/{jobId.slice(0, 8)}</code> (default branch protected)
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Findings Section */}
-        <section aria-label="Findings" className="mt-10">
+        <section aria-label="Findings" className="mt-8">
           <div className="flex flex-col gap-3 sm:flex-row">
             <label className="relative flex-1">
               <span className="sr-only">Search findings</span>
@@ -367,9 +475,55 @@ export function RealReportView({ jobId }: { jobId: string }) {
             </label>
           </div>
 
-          <p className="mt-5 font-mono text-xs uppercase tracking-wider text-muted" aria-live="polite">
-            Showing {filtered.length} of {findings.length} findings
-          </p>
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+            <p className="font-mono text-xs uppercase tracking-wider text-muted" aria-live="polite">
+              Showing {filtered.length} of {findings.length} findings
+            </p>
+
+            {mode === "autofix" && findings.length > 0 && (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={selectAllEligible}
+                  className="font-mono text-[11px] text-accent hover:underline cursor-pointer"
+                >
+                  Select All Eligible
+                </button>
+                <span className="text-line text-xs">|</span>
+                <button
+                  type="button"
+                  onClick={() => setSelectedFindingIds(new Set())}
+                  className="font-mono text-[11px] text-muted hover:underline cursor-pointer"
+                >
+                  Clear Selection
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Mode B Batch Selection Action Bar */}
+          {mode === "autofix" && selectedFindingIds.size > 0 && (
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-accent/40 bg-accent/5 p-3 text-xs">
+              <div className="flex items-center gap-2">
+                <span className="font-semibold text-foreground">
+                  {selectedFindingIds.size} findings selected
+                </span>
+                <span className="font-mono text-muted text-[11px]">
+                  ({eligibleSelectedCount} eligible for automated fix)
+                </span>
+              </div>
+              <Button
+                size="sm"
+                className="h-8 text-xs"
+                onClick={() => {
+                  const firstId = Array.from(selectedFindingIds)[0];
+                  if (firstId) setSelectedId(firstId);
+                }}
+              >
+                <Sparkles className="size-3.5" /> Review &amp; Auto-Fix Selected
+              </Button>
+            </div>
+          )}
 
           {/* Clean repository / No findings state */}
           {findings.length === 0 ? (
@@ -406,38 +560,83 @@ export function RealReportView({ jobId }: { jobId: string }) {
             </div>
           ) : (
             <ul className="mt-4 divide-y divide-line overflow-hidden rounded-xl border border-line bg-surface">
-              {filtered.map((f) => (
-                <li key={f.id}>
-                  <button
-                    onClick={(e) => {
-                      lastTrigger.current = e.currentTarget;
-                      setSelectedId(f.id);
-                    }}
-                    className="group flex w-full items-center justify-between gap-4 p-5 text-left transition-colors duration-300 hover:bg-elevated"
-                  >
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <SeverityBadge severity={f.severity === "info" ? "low" : f.severity} />
-                        <span className="font-mono text-[11px] uppercase tracking-wider text-muted">
-                          {f.scanner} · {f.category}
-                        </span>
-                        <span className="font-mono text-[11px] text-muted">· {f.ruleId}</span>
-                        {f.vulnerabilityId && (
-                          <span className="rounded bg-accent/10 px-2 py-0.5 font-mono text-[10px] text-accent">
-                            {f.vulnerabilityId}
-                          </span>
-                        )}
-                      </div>
-                      <p className="mt-2 font-semibold text-foreground">{f.title}</p>
-                      <p className="mt-0.5 break-all font-mono text-xs text-muted">
-                        {f.filePath}
-                        {f.startLine ? `:${f.startLine}` : ""}
-                      </p>
+              {filtered.map((f) => {
+                const elig = classifyRemediationEligibility(f);
+                const isSelectedForBatch = selectedFindingIds.has(f.id);
+
+                return (
+                  <li key={f.id}>
+                    <div className="group flex w-full items-center justify-between gap-4 p-5 text-left transition-colors duration-300 hover:bg-elevated">
+                      {mode === "autofix" && (
+                        <button
+                          type="button"
+                          role="checkbox"
+                          aria-checked={isSelectedForBatch}
+                          onClick={(e) => toggleSelect(f.id, e)}
+                          className={cn(
+                            "flex size-5 shrink-0 items-center justify-center rounded border transition-colors cursor-pointer",
+                            isSelectedForBatch
+                              ? "border-accent bg-accent/20 text-accent"
+                              : "border-line bg-surface hover:border-accent"
+                          )}
+                          aria-label={`Select finding ${f.title}`}
+                        >
+                          {isSelectedForBatch && <CheckCircle2 className="size-3.5 text-accent" />}
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          lastTrigger.current = e.currentTarget;
+                          setSelectedId(f.id);
+                        }}
+                        className="flex flex-1 items-center justify-between gap-4 text-left cursor-pointer"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <SeverityBadge severity={f.severity === "info" ? "low" : f.severity} />
+                            <span className="font-mono text-[11px] uppercase tracking-wider text-muted">
+                              {f.scanner} · {f.category}
+                            </span>
+                            <span className="font-mono text-[11px] text-muted">· {f.ruleId}</span>
+                            {f.vulnerabilityId && (
+                              <span className="rounded bg-accent/10 px-2 py-0.5 font-mono text-[10px] text-accent">
+                                {f.vulnerabilityId}
+                              </span>
+                            )}
+
+                            {/* Eligibility indicator badge */}
+                            {elig.eligibility === "safe" ? (
+                              <span className="inline-flex items-center gap-1 rounded bg-accent/15 px-2 py-0.5 font-mono text-[10px] text-accent font-semibold">
+                                <CheckCircle2 className="size-3" /> Safe Fix
+                              </span>
+                            ) : elig.eligibility === "potentially_breaking" ? (
+                              <span className="inline-flex items-center gap-1 rounded bg-sev-medium/15 px-2 py-0.5 font-mono text-[10px] text-sev-medium font-semibold">
+                                <AlertTriangle className="size-3" /> Potentially Breaking
+                              </span>
+                            ) : elig.requiresRotation ? (
+                              <span className="inline-flex items-center gap-1 rounded bg-sev-critical/15 px-2 py-0.5 font-mono text-[10px] text-sev-critical font-semibold">
+                                <KeyRound className="size-3" /> Rotate Credential
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 rounded bg-surface-subtle border border-line px-2 py-0.5 font-mono text-[10px] text-muted">
+                                Manual Review
+                              </span>
+                            )}
+                          </div>
+                          <p className="mt-2 font-semibold text-foreground">{f.title}</p>
+                          <p className="mt-0.5 break-all font-mono text-xs text-muted">
+                            {f.filePath}
+                            {f.startLine ? `:${f.startLine}` : ""}
+                          </p>
+                        </div>
+                        <ChevronRight className="size-5 shrink-0 text-muted transition-transform duration-300 group-hover:translate-x-1 group-hover:text-accent" aria-hidden />
+                      </button>
                     </div>
-                    <ChevronRight className="size-5 shrink-0 text-muted transition-transform duration-300 group-hover:translate-x-1 group-hover:text-accent" aria-hidden />
-                  </button>
-                </li>
-              ))}
+                  </li>
+                );
+              })}
             </ul>
           )}
 
@@ -448,7 +647,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
           </div>
         </section>
 
-        <RealFindingDrawer jobId={jobId} finding={selected} onClose={close} />
+        <RealFindingDrawer jobId={jobId} finding={selected} onClose={close} mode={mode} />
       </div>
     </div>
   );

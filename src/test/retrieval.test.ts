@@ -102,6 +102,10 @@ class MockJobStore implements JobStore {
     return null;
   }
   async saveFindingAiExplanation(): Promise<void> {}
+  async createRemediation(): Promise<never> { throw new Error("not implemented"); }
+  async getRemediation(): Promise<null> { return null; }
+  async listRemediations(): Promise<[]> { return []; }
+  async updateRemediation(): Promise<never> { throw new Error("not implemented"); }
 }
 
 describe("runRetrieval pipeline", () => {

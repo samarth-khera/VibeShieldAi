@@ -100,6 +100,11 @@ export interface JobStore {
   getFindings(jobId: string, filter?: FindingsFilter): Promise<{ findings: FindingRecord[]; total: number }>;
   getFinding(jobId: string, findingId: string): Promise<FindingRecord | null>;
   saveFindingAiExplanation(jobId: string, findingId: string, aiExplanation: unknown): Promise<void>;
+
+  createRemediation(data: import("./remediation/types").NewRemediation): Promise<import("./remediation/types").RemediationRecord>;
+  getRemediation(scanJobId: string, remediationId: string): Promise<import("./remediation/types").RemediationRecord | null>;
+  listRemediations(scanJobId: string): Promise<import("./remediation/types").RemediationRecord[]>;
+  updateRemediation(scanJobId: string, remediationId: string, patch: Partial<import("./remediation/types").RemediationRecord>): Promise<import("./remediation/types").RemediationRecord>;
 }
 
 /** 192 bits of CSPRNG output → 32 URL-safe chars. Unguessable; acts as the access capability. */

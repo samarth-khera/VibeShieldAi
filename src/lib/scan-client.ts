@@ -222,3 +222,65 @@ export const explainFindingWithAi = (id: string, findingId: string) =>
     { method: "POST" }
   );
 
+export type PublicRemediation = {
+  id: string;
+  scanJobId: string;
+  status: "preview" | "approved" | "applied" | "verified" | "needs_review" | "failed" | "rejected";
+  findingFingerprints: string[];
+  commitSha: string;
+  patchSummary: string;
+  unifiedDiff: string;
+  affectedFiles: string[];
+  eligibility: "safe" | "potentially_breaking" | "unsuitable";
+  eligibilityReason: string;
+  requiresRotation: boolean;
+  warnings: string[];
+  approvedAt: string | null;
+  rescanStatus: "verified" | "needs_review" | "failed" | null;
+  rescanSummary: {
+    targetResolved: boolean;
+    originalFindingsCount: number;
+    postRescanFindingsCount: number;
+    newFindingsCount: number;
+    resolvedFingerprints: string[];
+    remainingFingerprints: string[];
+    regressions: string[];
+  } | null;
+  branchName: string | null;
+  pullRequestUrl: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export const createRemediationPreview = (jobId: string, findingId: string) =>
+  request<PublicRemediation>(`/api/scans/${encodeURIComponent(jobId)}/remediation/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ findingId }),
+  });
+
+export const listRemediations = (jobId: string) =>
+  request<PublicRemediation[]>(`/api/scans/${encodeURIComponent(jobId)}/remediation`);
+
+export const approveRemediation = (jobId: string, remediationId: string) =>
+  request<PublicRemediation>(
+    `/api/scans/${encodeURIComponent(jobId)}/remediation/${encodeURIComponent(remediationId)}/approve`,
+    { method: "POST" },
+  );
+
+export const applyRemediation = (jobId: string, remediationId: string) =>
+  request<PublicRemediation>(
+    `/api/scans/${encodeURIComponent(jobId)}/remediation/${encodeURIComponent(remediationId)}/apply`,
+    { method: "POST" },
+  );
+
+export const createRemediationPr = (jobId: string, remediationId: string, token?: string) =>
+  request<{ remediation: PublicRemediation; message: string; hasWriteAccess: boolean }>(
+    `/api/scans/${encodeURIComponent(jobId)}/remediation/${encodeURIComponent(remediationId)}/pr`,
+    {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    },
+  );
+
+

@@ -167,6 +167,11 @@ class TestJobStore implements JobStore {
       item.aiExplanation = aiExplanation;
     }
   }
+
+  async createRemediation(): Promise<never> { throw new Error("not implemented"); }
+  async getRemediation(): Promise<null> { return null; }
+  async listRemediations(): Promise<[]> { return []; }
+  async updateRemediation(): Promise<never> { throw new Error("not implemented"); }
 }
 
 describe("Scan Findings API & Service Integration", () => {

@@ -134,4 +134,60 @@ export const prismaJobStore: JobStore = {
       data: { aiExplanation: aiExplanation as Prisma.InputJsonValue },
     });
   },
+
+  async createRemediation(data) {
+    const created = await prisma.remediation.create({
+      data: {
+        id: data.id,
+        scanJobId: data.scanJobId,
+        status: data.status,
+        findingFingerprints: data.findingFingerprints as Prisma.InputJsonValue,
+        commitSha: data.commitSha,
+        patchSummary: data.patchSummary,
+        unifiedDiff: data.unifiedDiff,
+        affectedFiles: data.affectedFiles as Prisma.InputJsonValue,
+        eligibility: data.eligibility,
+        eligibilityReason: data.eligibilityReason,
+        requiresRotation: data.requiresRotation,
+        warnings: (data.warnings || []) as Prisma.InputJsonValue,
+        approvedAt: data.approvedAt,
+        approvedOperations: data.approvedOperations as Prisma.InputJsonValue,
+        rescanStatus: data.rescanStatus,
+        rescanSummary: data.rescanSummary as Prisma.InputJsonValue,
+        branchName: data.branchName,
+        pullRequestUrl: data.pullRequestUrl,
+      },
+    });
+    return created as unknown as import("./remediation/types").RemediationRecord;
+  },
+
+  async getRemediation(scanJobId, remediationId) {
+    const r = await prisma.remediation.findFirst({
+      where: { id: remediationId, scanJobId },
+    });
+    return (r as unknown as import("./remediation/types").RemediationRecord) || null;
+  },
+
+  async listRemediations(scanJobId) {
+    const list = await prisma.remediation.findMany({
+      where: { scanJobId },
+      orderBy: { createdAt: "desc" },
+    });
+    return list as unknown as import("./remediation/types").RemediationRecord[];
+  },
+
+  async updateRemediation(scanJobId, remediationId, patch) {
+    const updated = await prisma.remediation.update({
+      where: { id: remediationId },
+      data: {
+        ...patch,
+        findingFingerprints: patch.findingFingerprints ? (patch.findingFingerprints as Prisma.InputJsonValue) : undefined,
+        affectedFiles: patch.affectedFiles ? (patch.affectedFiles as Prisma.InputJsonValue) : undefined,
+        warnings: patch.warnings ? (patch.warnings as Prisma.InputJsonValue) : undefined,
+        approvedOperations: patch.approvedOperations ? (patch.approvedOperations as Prisma.InputJsonValue) : undefined,
+        rescanSummary: patch.rescanSummary ? (patch.rescanSummary as Prisma.InputJsonValue) : undefined,
+      } as Prisma.RemediationUpdateInput,
+    });
+    return updated as unknown as import("./remediation/types").RemediationRecord;
+  },
 };
