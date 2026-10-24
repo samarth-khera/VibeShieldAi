@@ -21,6 +21,7 @@ export type FindingRecord = {
   remediation: string | null;
   packageInfo: unknown;
   metadata: unknown;
+  aiExplanation?: unknown;
   createdAt: Date;
 };
 
@@ -98,6 +99,7 @@ export interface JobStore {
   saveFindings(jobId: string, findings: NormalizedFinding[]): Promise<void>;
   getFindings(jobId: string, filter?: FindingsFilter): Promise<{ findings: FindingRecord[]; total: number }>;
   getFinding(jobId: string, findingId: string): Promise<FindingRecord | null>;
+  saveFindingAiExplanation(jobId: string, findingId: string, aiExplanation: unknown): Promise<void>;
 }
 
 /** 192 bits of CSPRNG output → 32 URL-safe chars. Unguessable; acts as the access capability. */

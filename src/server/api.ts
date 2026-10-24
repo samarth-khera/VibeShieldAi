@@ -32,6 +32,7 @@ export function toPublicFinding(f: FindingRecord) {
     remediation: f.remediation,
     packageInfo: f.packageInfo,
     metadata: f.metadata,
+    aiExplanation: f.aiExplanation ?? null,
     createdAt: f.createdAt.toISOString(),
   };
 }

@@ -4,6 +4,8 @@ import { fail, ok, toPublicFinding, toPublicJob } from "./api";
 import { log } from "./errors";
 import { JOB_ID_RE, MAX_ATTEMPTS, type JobStore } from "./job-store";
 import type { RateLimitResult } from "./rate-limit";
+import { explainFinding } from "./ai/service";
+import type { LlmProvider } from "./ai/client";
 
 export type ScanDeps = {
   store: JobStore;
@@ -12,6 +14,7 @@ export type ScanDeps = {
   rateLimit: (headers: Headers) => Promise<RateLimitResult>;
   workerOnline: () => Promise<boolean>;
   now?: () => Date;
+  llmProvider?: LlmProvider;
 };
 
 const MAX_BODY_BYTES = 2048;
@@ -203,4 +206,41 @@ export async function getScanFinding(id: string, findingId: string, deps: ScanDe
   if (!finding) return fail(404, "not_found", "Finding not found.");
 
   return ok(toPublicFinding(finding));
+}
+
+/** POST /api/scans/:id/findings/:findingId/explain */
+export async function explainScanFinding(
+  id: string,
+  findingId: string,
+  req: Request,
+  deps: ScanDeps
+): Promise<Response> {
+  if (!JOB_ID_RE.test(id)) return fail(404, "not_found", "Scan job not found.");
+  if (!findingId || findingId.length > 50) return fail(400, "invalid_id", "Invalid finding identifier.");
+
+  const job = await deps.store.get(id).catch(() => undefined);
+  if (!job) return fail(404, "not_found", "Scan job not found.");
+
+  // Rate limit check for AI requests
+  const limit = await deps.rateLimit(req.headers).catch(() => ({ allowed: true, retryAfterSeconds: 0 }));
+  if (!limit.allowed) {
+    return fail(429, "rate_limited", "Too many AI analysis requests. Please wait before trying again.", {
+      "Retry-After": String(limit.retryAfterSeconds),
+    });
+  }
+
+  try {
+    const result = await explainFinding(id, findingId, {
+      store: deps.store,
+      provider: deps.llmProvider,
+    });
+    return ok(result);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("Finding not found")) {
+      return fail(404, "not_found", "Finding not found.");
+    }
+    log("warn", "ai_explain_error", { jobId: id, findingId, error: message });
+    return fail(500, "ai_error", "An error occurred during AI analysis. Please retry.");
+  }
 }

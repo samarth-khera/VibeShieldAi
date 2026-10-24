@@ -159,6 +159,14 @@ class TestJobStore implements JobStore {
     const all = this.findings.get(scanJobId) || [];
     return all.find((f) => f.id === findingId || f.fingerprint === findingId) ?? null;
   }
+
+  async saveFindingAiExplanation(scanJobId: string, findingId: string, aiExplanation: unknown): Promise<void> {
+    const all = this.findings.get(scanJobId) || [];
+    const item = all.find((f) => f.id === findingId || f.fingerprint === findingId);
+    if (item) {
+      item.aiExplanation = aiExplanation;
+    }
+  }
 }
 
 describe("Scan Findings API & Service Integration", () => {

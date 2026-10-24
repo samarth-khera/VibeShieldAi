@@ -448,7 +448,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
           </div>
         </section>
 
-        <RealFindingDrawer finding={selected} onClose={close} />
+        <RealFindingDrawer jobId={jobId} finding={selected} onClose={close} />
       </div>
     </div>
   );

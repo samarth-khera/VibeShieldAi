@@ -107,6 +107,7 @@ model Finding {
   remediation      String?   @db.Text
   packageInfo      Json?
   metadata         Json?
+  aiExplanation    Json?
   createdAt        DateTime  @default(now())
 
   @@unique([scanJobId, fingerprint])

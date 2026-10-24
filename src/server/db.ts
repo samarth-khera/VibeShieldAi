@@ -127,4 +127,11 @@ export const prismaJobStore: JobStore = {
     });
     return (finding as FindingRecord) || null;
   },
+
+  async saveFindingAiExplanation(jobId: string, findingId: string, aiExplanation: unknown) {
+    await prisma.finding.updateMany({
+      where: { id: findingId, scanJobId: jobId },
+      data: { aiExplanation: aiExplanation as Prisma.InputJsonValue },
+    });
+  },
 };

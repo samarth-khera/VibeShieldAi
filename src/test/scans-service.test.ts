@@ -107,6 +107,7 @@ class InMemoryJobStore implements JobStore {
   async getFinding(): Promise<null> {
     return null;
   }
+  async saveFindingAiExplanation(): Promise<void> {}
 }
 
 describe("scans-service API logic", () => {

@@ -101,6 +101,7 @@ class MockJobStore implements JobStore {
   async getFinding(): Promise<null> {
     return null;
   }
+  async saveFindingAiExplanation(): Promise<void> {}
 }
 
 describe("runRetrieval pipeline", () => {

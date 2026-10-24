@@ -33,6 +33,12 @@ export type PublicFinding = {
     ecosystem?: string;
   } | null;
   metadata?: Record<string, unknown> | null;
+  aiExplanation?: {
+    cacheKey?: string;
+    model?: string;
+    explanation: AiFindingExplanation;
+    generatedAt?: string;
+  } | null;
   createdAt: string;
 };
 
@@ -176,3 +182,43 @@ export const fetchFindings = (
 
 export const fetchFindingDetail = (id: string, findingId: string) =>
   request<PublicFinding>(`/api/scans/${encodeURIComponent(id)}/findings/${encodeURIComponent(findingId)}`);
+
+export type CodeExample = {
+  language: string;
+  code: string;
+  title?: string;
+  isDiff?: boolean;
+};
+
+export type AiFindingExplanation = {
+  summary: string;
+  whyItMatters: string;
+  impact: string;
+  exploitabilityConditions: string;
+  remediationSteps: string[];
+  codeExample?: CodeExample | null;
+  verificationSteps: string[];
+  uncertainties: string[];
+  disclaimer: string;
+};
+
+export type AiExplainResult =
+  | {
+      available: true;
+      cached: boolean;
+      model: string;
+      explanation: AiFindingExplanation;
+      generatedAt: string;
+    }
+  | {
+      available: false;
+      code: string;
+      message: string;
+    };
+
+export const explainFindingWithAi = (id: string, findingId: string) =>
+  request<AiExplainResult>(
+    `/api/scans/${encodeURIComponent(id)}/findings/${encodeURIComponent(findingId)}/explain`,
+    { method: "POST" }
+  );
+
