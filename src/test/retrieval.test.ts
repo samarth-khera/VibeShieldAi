@@ -30,6 +30,22 @@ class MockJobStore implements JobStore {
       unpackedBytes: null,
       failureCategory: null,
       errorMessage: null,
+      gitleaksStatus: null,
+      gitleaksDurationMs: null,
+      gitleaksError: null,
+      semgrepStatus: null,
+      semgrepDurationMs: null,
+      semgrepError: null,
+      osvStatus: null,
+      osvDurationMs: null,
+      osvError: null,
+      scannerVersions: null,
+      scanCoverage: null,
+      criticalCount: 0,
+      highCount: 0,
+      mediumCount: 0,
+      lowCount: 0,
+      infoCount: 0,
       attempts: 0,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -54,6 +70,13 @@ class MockJobStore implements JobStore {
     return true;
   }
 
+  async claimForScan(id: string): Promise<boolean> {
+    const j = this.jobs.get(id);
+    if (!j) return false;
+    j.status = "scanning";
+    return true;
+  }
+
   async update(id: string, patch: JobPatch): Promise<void> {
     const j = this.jobs.get(id);
     if (!j) return;
@@ -69,6 +92,14 @@ class MockJobStore implements JobStore {
 
   async deleteExpired(): Promise<number> {
     return 0;
+  }
+
+  async saveFindings(): Promise<void> {}
+  async getFindings(): Promise<{ findings: []; total: 0 }> {
+    return { findings: [], total: 0 };
+  }
+  async getFinding(): Promise<null> {
+    return null;
   }
 }
 

@@ -1,6 +1,6 @@
 import { parseGithubRepoUrl } from "@/lib/github-url";
 import type { ServerConfig } from "./config";
-import { fail, ok, toPublicJob } from "./api";
+import { fail, ok, toPublicFinding, toPublicJob } from "./api";
 import { log } from "./errors";
 import { JOB_ID_RE, MAX_ATTEMPTS, type JobStore } from "./job-store";
 import type { RateLimitResult } from "./rate-limit";
@@ -67,7 +67,14 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
     await deps.enqueue(job.id, 0);
   } catch {
     // Nothing was queued: remove the orphan row so no job is left pretending to be pending.
-    await deps.store.update(job.id, { status: "failed", failureCategory: "queue_unavailable", errorMessage: "The scan queue is unavailable.", completedAt: now }).catch(() => undefined);
+    await deps.store
+      .update(job.id, {
+        status: "failed",
+        failureCategory: "queue_unavailable",
+        errorMessage: "The scan queue is unavailable.",
+        completedAt: now,
+      })
+      .catch(() => undefined);
     log("error", "enqueue_failed", { jobId: job.id });
     return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
   }
@@ -94,6 +101,43 @@ export async function getScanRepository(id: string, deps: ScanDeps): Promise<Res
   return ok({ jobId: job.id, status: job.status, repository: toPublicJob(job).repository });
 }
 
+/** POST /api/scans/:id/scan — explicit action to start or retry security scan */
+export async function startScan(id: string, deps: ScanDeps): Promise<Response> {
+  if (!JOB_ID_RE.test(id)) return fail(404, "not_found", "Scan job not found.");
+  const job = await deps.store.get(id).catch(() => undefined);
+  if (job === undefined) return fail(503, "service_unavailable", "The service is temporarily unavailable.");
+  if (!job) return fail(404, "not_found", "Scan job not found.");
+
+  if (job.status === "scanning" || job.status === "retrieving") {
+    return fail(409, "already_scanning", "A scan is already in progress for this repository.");
+  }
+
+  const now = (deps.now ?? (() => new Date()))();
+  await deps.store.update(id, {
+    status: "queued",
+    failureCategory: null,
+    errorMessage: null,
+    completedAt: null,
+  });
+
+  try {
+    await deps.enqueue(id, job.attempts + 1);
+  } catch {
+    await deps.store
+      .update(id, {
+        status: "failed",
+        failureCategory: "queue_unavailable",
+        errorMessage: "The scan queue is unavailable.",
+        completedAt: now,
+      })
+      .catch(() => undefined);
+    return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
+  }
+
+  const fresh = (await deps.store.get(id)) ?? job;
+  return ok(toPublicJob(fresh), 202);
+}
+
 /** POST /api/scans/:id/retry */
 export async function retryScan(id: string, deps: ScanDeps): Promise<Response> {
   if (!JOB_ID_RE.test(id)) return fail(404, "not_found", "Scan job not found.");
@@ -106,9 +150,57 @@ export async function retryScan(id: string, deps: ScanDeps): Promise<Response> {
   try {
     await deps.enqueue(id, job.attempts + 1);
   } catch {
-    await deps.store.update(id, { status: "failed", failureCategory: "queue_unavailable", errorMessage: "The scan queue is unavailable.", completedAt: (deps.now ?? (() => new Date()))() }).catch(() => undefined);
+    await deps.store
+      .update(id, {
+        status: "failed",
+        failureCategory: "queue_unavailable",
+        errorMessage: "The scan queue is unavailable.",
+        completedAt: (deps.now ?? (() => new Date()))(),
+      })
+      .catch(() => undefined);
     return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
   }
   const fresh = (await deps.store.get(id)) ?? job;
   return ok(toPublicJob(fresh), 202);
+}
+
+/** GET /api/scans/:id/findings */
+export async function listScanFindings(id: string, req: Request, deps: ScanDeps): Promise<Response> {
+  if (!JOB_ID_RE.test(id)) return fail(404, "not_found", "Scan job not found.");
+  const job = await deps.store.get(id).catch(() => undefined);
+  if (job === undefined) return fail(503, "service_unavailable", "The service is temporarily unavailable.");
+  if (!job) return fail(404, "not_found", "Scan job not found.");
+
+  const url = new URL(req.url);
+  const severity = url.searchParams.get("severity") || undefined;
+  const category = url.searchParams.get("category") || undefined;
+  const query = url.searchParams.get("query") || undefined;
+  const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : 100;
+  const rawOffset = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+  const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+
+  const result = await deps.store.getFindings(id, { severity, category, query, limit, offset });
+  return ok({
+    jobId: id,
+    status: job.status,
+    total: result.total,
+    limit,
+    offset,
+    findings: result.findings.map(toPublicFinding),
+  });
+}
+
+/** GET /api/scans/:id/findings/:findingId */
+export async function getScanFinding(id: string, findingId: string, deps: ScanDeps): Promise<Response> {
+  if (!JOB_ID_RE.test(id)) return fail(404, "not_found", "Scan job not found.");
+  if (!findingId || findingId.length > 50) return fail(400, "invalid_id", "Invalid finding identifier.");
+
+  const job = await deps.store.get(id).catch(() => undefined);
+  if (!job) return fail(404, "not_found", "Scan job not found.");
+
+  const finding = await deps.store.getFinding(id, findingId).catch(() => undefined);
+  if (!finding) return fail(404, "not_found", "Finding not found.");
+
+  return ok(toPublicFinding(finding));
 }

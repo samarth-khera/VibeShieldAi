@@ -10,9 +10,11 @@ import { useScanJob } from "./use-scan-job";
 export function ScanForm() {
   const id = useId();
   const [value, setValue] = useState("");
-  const { flow, submit, retry, recheck, reset, setClientError } = useScanJob();
+  const { flow, submit, startScanNow, retry, recheck, reset, setClientError } = useScanJob();
 
-  const busy = flow.phase === "validating" || (flow.phase === "job" && ["queued", "retrieving"].includes(flow.job.status));
+  const busy =
+    flow.phase === "validating" ||
+    (flow.phase === "job" && ["queued", "retrieving", "scanning"].includes(flow.job.status));
   const hasError = flow.phase === "error";
 
   function onSubmit(e: React.FormEvent) {
@@ -56,7 +58,7 @@ export function ScanForm() {
             {flow.phase === "validating" ? (
               <><Loader2 className="size-4 animate-spin" aria-hidden /> Validating repository…</>
             ) : busy ? (
-              <><Loader2 className="size-4 animate-spin" aria-hidden /> Processing…</>
+              <><Loader2 className="size-4 animate-spin" aria-hidden /> Scanning…</>
             ) : (
               <>Scan Repository <ArrowRight className="size-4" aria-hidden /></>
             )}
@@ -75,6 +77,7 @@ export function ScanForm() {
             job={flow.job}
             stale={flow.stale}
             pollError={flow.pollError}
+            onStartScan={() => void startScanNow(flow.job.id)}
             onRetry={() => void retry(flow.job.id)}
             onRecheck={() => recheck(flow.job.id)}
             onReset={reset}
@@ -84,9 +87,11 @@ export function ScanForm() {
 
       <div id={`${id}-hint`} className="mt-1 flex flex-wrap items-center gap-x-5 gap-y-3">
         <Button href="/demo-report" variant="secondary">
-          <FileSearch className="size-4" aria-hidden /> View Sample Report
+          <FileSearch className="size-4" aria-hidden /> View Sample Report (Demo)
         </Button>
-        <p className="font-mono text-xs text-muted">Retrieval only — security scanning is not connected yet · public repos</p>
+        <p className="font-mono text-xs text-muted">
+          Real security analysis: Gitleaks secrets · Semgrep rules · OSV-Scanner lockfiles
+        </p>
       </div>
     </div>
   );

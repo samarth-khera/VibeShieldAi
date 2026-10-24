@@ -11,13 +11,17 @@ enum ScanStatus {
   queued
   retrieving
   ready_for_scan
+  scanning
+  completed
+  completed_with_warnings
+  cancelled
   invalid_repository
   download_failed
   rejected_by_limits
   failed
 }
 
-/// One repository-retrieval job. Stores metadata only — never repository contents or secrets.
+/// One repository security scan job. Stores metadata and findings only — never raw secrets or repository archives.
 model ScanJob {
   /// Non-guessable public identifier (192 bits, base64url). Acts as the access capability.
   id              String     @id @db.VarChar(32)
@@ -44,6 +48,30 @@ model ScanJob {
   failureCategory String?    @db.VarChar(40)
   errorMessage    String?    @db.VarChar(300)
 
+  // Scanner status and metrics
+  gitleaksStatus     String?    @db.VarChar(30)
+  gitleaksDurationMs Int?
+  gitleaksError      String?    @db.VarChar(300)
+
+  semgrepStatus      String?    @db.VarChar(30)
+  semgrepDurationMs  Int?
+  semgrepError       String?    @db.VarChar(300)
+
+  osvStatus          String?    @db.VarChar(30)
+  osvDurationMs      Int?
+  osvError           String?    @db.VarChar(300)
+
+  scannerVersions    Json?
+  scanCoverage       Json?
+
+  criticalCount      Int        @default(0)
+  highCount          Int        @default(0)
+  mediumCount        Int        @default(0)
+  lowCount           Int        @default(0)
+  infoCount          Int        @default(0)
+
+  findings           Finding[]
+
   attempts        Int        @default(0)
   createdAt       DateTime   @default(now())
   updatedAt       DateTime   @updatedAt
@@ -56,4 +84,33 @@ model ScanJob {
   @@index([expiresAt])
   @@index([owner, repo])
   @@index([createdAt])
+}
+
+model Finding {
+  id               String    @id @default(cuid()) @db.VarChar(36)
+  scanJobId        String    @db.VarChar(32)
+  scanJob          ScanJob   @relation(fields: [scanJobId], references: [id], onDelete: Cascade)
+
+  fingerprint      String    @db.VarChar(64)
+  scanner          String    @db.VarChar(30)
+  ruleId           String    @db.VarChar(120)
+  category         String    @db.VarChar(50)
+  severity         String    @db.VarChar(20)
+  originalSeverity String?   @db.VarChar(50)
+  title            String    @db.VarChar(250)
+  description      String    @db.Text
+  filePath         String    @db.VarChar(500)
+  startLine        Int?
+  endLine          Int?
+  redactedEvidence String?   @db.Text
+  vulnerabilityId  String?   @db.VarChar(100)
+  remediation      String?   @db.Text
+  packageInfo      Json?
+  metadata         Json?
+  createdAt        DateTime  @default(now())
+
+  @@unique([scanJobId, fingerprint])
+  @@index([scanJobId])
+  @@index([scanJobId, severity])
+  @@index([scanJobId, category])
 }

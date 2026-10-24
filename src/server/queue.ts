@@ -11,10 +11,8 @@ function redisUrl(): string {
 /** Fail-fast connection for the web process: if Redis is down, commands error instead of hanging. */
 export function createApiRedis(): IORedis {
   const r = new IORedis(redisUrl(), {
-    enableOfflineQueue: false,
-    maxRetriesPerRequest: 1,
-    connectTimeout: 3000,
-    lazyConnect: false,
+    maxRetriesPerRequest: null,
+    connectTimeout: 5000,
   });
   r.on("error", () => undefined); // surfaced via command failures; never log URLs/credentials
   return r;

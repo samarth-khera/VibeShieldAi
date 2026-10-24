@@ -25,6 +25,22 @@ class InMemoryJobStore implements JobStore {
       unpackedBytes: null,
       failureCategory: null,
       errorMessage: null,
+      gitleaksStatus: null,
+      gitleaksDurationMs: null,
+      gitleaksError: null,
+      semgrepStatus: null,
+      semgrepDurationMs: null,
+      semgrepError: null,
+      osvStatus: null,
+      osvDurationMs: null,
+      osvError: null,
+      scannerVersions: null,
+      scanCoverage: null,
+      criticalCount: 0,
+      highCount: 0,
+      mediumCount: 0,
+      lowCount: 0,
+      infoCount: 0,
       attempts: 0,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -46,6 +62,13 @@ class InMemoryJobStore implements JobStore {
     job.status = "retrieving";
     job.startedAt = new Date();
     job.attempts++;
+    return true;
+  }
+
+  async claimForScan(id: string): Promise<boolean> {
+    const job = this.jobs.get(id);
+    if (!job) return false;
+    job.status = "scanning";
     return true;
   }
 
@@ -75,6 +98,14 @@ class InMemoryJobStore implements JobStore {
       }
     }
     return count;
+  }
+
+  async saveFindings(): Promise<void> {}
+  async getFindings(): Promise<{ findings: []; total: 0 }> {
+    return { findings: [], total: 0 };
+  }
+  async getFinding(): Promise<null> {
+    return null;
   }
 }
 

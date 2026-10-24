@@ -1,4 +1,4 @@
-import type { JobRecord } from "./job-store";
+import type { FindingRecord, JobRecord } from "./job-store";
 import { RETRYABLE_STATUSES } from "./job-store";
 
 export type ApiErrorBody = { error: { code: string; message: string } };
@@ -13,8 +13,39 @@ export function fail(status: number, code: string, message: string, extra?: Reco
   return Response.json({ error: { code, message } } satisfies ApiErrorBody, { status, headers: { ...baseHeaders, ...extra } });
 }
 
-/** Whitelisted public projection. Never includes internal fields, error text beyond the sanitized message, or env. */
+export function toPublicFinding(f: FindingRecord) {
+  return {
+    id: f.id,
+    fingerprint: f.fingerprint,
+    scanner: f.scanner,
+    ruleId: f.ruleId,
+    category: f.category,
+    severity: f.severity,
+    originalSeverity: f.originalSeverity,
+    title: f.title,
+    description: f.description,
+    filePath: f.filePath,
+    startLine: f.startLine,
+    endLine: f.endLine,
+    redactedEvidence: f.redactedEvidence,
+    vulnerabilityId: f.vulnerabilityId,
+    remediation: f.remediation,
+    packageInfo: f.packageInfo,
+    metadata: f.metadata,
+    createdAt: f.createdAt.toISOString(),
+  };
+}
+
+/** Whitelisted public projection. Never includes internal fields, error text beyond the sanitized message, or raw secrets. */
 export function toPublicJob(job: JobRecord, workerOnline?: boolean) {
+  const scanPerformed = ["completed", "completed_with_warnings"].includes(job.status);
+  const totalFindings =
+    (job.criticalCount ?? 0) +
+    (job.highCount ?? 0) +
+    (job.mediumCount ?? 0) +
+    (job.lowCount ?? 0) +
+    (job.infoCount ?? 0);
+
   return {
     id: job.id,
     status: job.status,
@@ -30,13 +61,41 @@ export function toPublicJob(job: JobRecord, workerOnline?: boolean) {
       language: job.primaryLanguage,
     },
     retrieval:
-      job.status === "ready_for_scan"
+      job.fileCount != null
         ? { fileCount: job.fileCount, unpackedBytes: job.unpackedBytes, archiveBytes: job.archiveBytes }
         : null,
+    scanners: {
+      gitleaks: {
+        status: job.gitleaksStatus ?? (job.status === "scanning" ? "running" : null),
+        durationMs: job.gitleaksDurationMs ?? null,
+        error: job.gitleaksError ?? null,
+      },
+      semgrep: {
+        status: job.semgrepStatus ?? (job.status === "scanning" ? "running" : null),
+        durationMs: job.semgrepDurationMs ?? null,
+        error: job.semgrepError ?? null,
+      },
+      osvScanner: {
+        status: job.osvStatus ?? (job.status === "scanning" ? "running" : null),
+        durationMs: job.osvDurationMs ?? null,
+        error: job.osvError ?? null,
+      },
+    },
+    scannerVersions: job.scannerVersions ?? null,
+    scanCoverage: job.scanCoverage ?? null,
+    summary: scanPerformed
+      ? {
+          critical: job.criticalCount ?? 0,
+          high: job.highCount ?? 0,
+          medium: job.mediumCount ?? 0,
+          low: job.lowCount ?? 0,
+          info: job.infoCount ?? 0,
+          total: totalFindings,
+        }
+      : null,
     failure: job.errorMessage ? { category: job.failureCategory, message: job.errorMessage } : null,
     retryable: RETRYABLE_STATUSES.has(job.status),
-    /** Explicit: retrieval is not a security scan. Phase 3 adds scanning. */
-    scanPerformed: false,
+    scanPerformed,
     workerOnline: job.status === "queued" ? (workerOnline ?? null) : null,
     createdAt: job.createdAt.toISOString(),
     updatedAt: job.updatedAt.toISOString(),

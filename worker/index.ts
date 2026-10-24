@@ -12,7 +12,7 @@ import { getConfig } from "../src/server/config";
 import { prismaJobStore, prisma } from "../src/server/db";
 import { log } from "../src/server/errors";
 import { QUEUE_NAME, type RetrievalPayload } from "../src/server/queue";
-import { runRetrieval } from "../src/server/retrieval";
+import { runScanPipeline } from "../src/server/scan-pipeline";
 import { JOB_ID_RE } from "../src/server/job-store";
 
 const config = getConfig();
@@ -26,7 +26,7 @@ const worker = new Worker<RetrievalPayload>(
   async (job) => {
     const { jobId } = job.data;
     if (!JOB_ID_RE.test(jobId)) return "ignored";
-    return runRetrieval(jobId, { store: prismaJobStore, config, fetchImpl: fetch });
+    return runScanPipeline(jobId, { store: prismaJobStore, config, fetchImpl: fetch });
   },
   { connection, concurrency: config.workerConcurrency, lockDuration: config.retrievalTimeoutMs + 30_000 },
 );

@@ -6,6 +6,7 @@ import {
   TERMINAL_STATUSES,
   fetchScan,
   retryScan as apiRetry,
+  startSecurityScan as apiStartScan,
   submitScan,
   type PublicScanJob,
 } from "@/lib/scan-client";
@@ -17,9 +18,9 @@ export type ScanFlow =
   | { phase: "job"; job: PublicScanJob; stale: boolean; pollError: boolean };
 
 const POLL_FAST_MS = 1500;
-const POLL_SLOW_MS = 3500;
-const FAST_POLLS = 10;
-const STALE_AFTER_MS = 5 * 60_000;
+const POLL_SLOW_MS = 3000;
+const FAST_POLLS = 15;
+const STALE_AFTER_MS = 10 * 60_000;
 const MAX_POLL_FAILURES = 3;
 
 /** Owns submit → poll → terminal lifecycle. Polling stops on terminal state, unmount or reset. */
@@ -84,6 +85,23 @@ export function useScanJob() {
     [poll, stop],
   );
 
+  const startScanNow = useCallback(
+    async (id: string) => {
+      stop();
+      const myRun = runId.current;
+      try {
+        const job = await apiStartScan(id);
+        if (myRun !== runId.current) return;
+        setFlow({ phase: "job", job, stale: false, pollError: false });
+        poll(id, Date.now(), 0, 0, myRun);
+      } catch (e) {
+        if (myRun !== runId.current) return;
+        setFlow({ phase: "error", message: e instanceof ApiRequestError ? e.message : "Starting scan failed. Please try again." });
+      }
+    },
+    [poll, stop],
+  );
+
   const retry = useCallback(
     async (id: string) => {
       stop();
@@ -122,5 +140,5 @@ export function useScanJob() {
     setFlow({ phase: "error", message });
   }, [stop]);
 
-  return { flow, submit, retry, recheck, reset, setClientError };
+  return { flow, submit, startScanNow, retry, recheck, reset, setClientError };
 }
