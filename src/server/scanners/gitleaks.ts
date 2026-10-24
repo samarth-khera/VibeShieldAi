@@ -1,6 +1,6 @@
 import path from "node:path";
 import { runSubprocess } from "./runner";
-import { computeFingerprint, redactEvidence } from "./redact";
+import { computeFingerprint, redactEvidence, redactText } from "./redact";
 import type { NormalizedFinding, SingleScannerResult } from "./types";
 
 export type GitleaksRawFinding = {
@@ -107,7 +107,7 @@ export async function runGitleaksScan(
       scanner: "gitleaks",
       status: "failed",
       durationMs: Date.now() - startTime,
-      error: err instanceof Error ? err.message : "Gitleaks execution failed",
+      error: redactText(err instanceof Error ? err.message : "Gitleaks execution failed"),
       findings: [],
       coverage: { scanned: false, limitations: ["Gitleaks scanner failed during execution."] },
     };

@@ -240,7 +240,7 @@ export function RealFindingDrawer({
                 </div>
                 <div>
                   <h3 className="font-display text-sm font-bold text-foreground">AI Security Analyst</h3>
-                  <p className="text-[11px] text-muted">Grounded remediation & exploitability analysis</p>
+                  <p className="text-[11px] text-muted">Grounded remediation &amp; exploitability analysis</p>
                 </div>
               </div>
 

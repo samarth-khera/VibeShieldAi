@@ -141,11 +141,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return json.data;
 }
 
-export const submitScan = (repositoryUrl: string) =>
+export const submitScan = (repositoryUrl: string, turnstileToken?: string) =>
   request<PublicScanJob>("/api/scans", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ repositoryUrl }),
+    body: JSON.stringify({ repositoryUrl, turnstileToken }),
   });
 
 export const fetchScan = (id: string) => request<PublicScanJob>(`/api/scans/${encodeURIComponent(id)}`);

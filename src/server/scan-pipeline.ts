@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -70,6 +70,7 @@ export async function runScanPipeline(jobId: string, deps: PipelineDeps): Promis
     // Bounded download and extraction
     const res = await openArchive(fetchImpl, job.owner, job.repo, commitSha, config, controller.signal);
     workspace = await mkdtemp(path.join(deps.tmpRoot ?? tmpdir(), "vibeshield-"));
+    await chmod(workspace, 0o700);
     const sourceDir = path.join(workspace, "src");
     const source = Readable.fromWeb(res.body as never);
     controller.signal.addEventListener(

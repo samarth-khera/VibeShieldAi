@@ -3,11 +3,42 @@ import type IORedis from "ioredis";
 
 export type RateLimitResult = { allowed: boolean; retryAfterSeconds: number };
 
-/** Hash so raw IPs are never stored in Redis or logs. */
-export function clientKey(headers: Headers): string {
-  const fwd = headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  const ip = fwd || headers.get("x-real-ip")?.trim() || "unknown";
-  return createHash("sha256").update(ip).digest("hex").slice(0, 32);
+/**
+ * Derives an unguessable, non-reversible client rate-limiting key.
+ *
+ * Anti-spoofing defense:
+ * 1. Checks verified reverse proxy headers first (`cf-connecting-ip`, `fly-client-ip`, `x-real-ip`).
+ * 2. If `x-forwarded-for` is used:
+ *    Reverse proxies append the actual remote IP to the END (rightmost) of X-Forwarded-For.
+ *    Blindly taking index 0 allows an attacker to bypass rate limits by injecting arbitrary IPs:
+ *    `X-Forwarded-For: attacker_ip_1, real_proxy_ip`.
+ *    We therefore inspect the rightmost entry appended by the proxy (or configurable hops).
+ * 3. Binds user-agent and client entropy to prevent evading limits if IP headers are omitted.
+ */
+export function clientKey(headers: Headers, options?: { trustProxyHops?: number }): string {
+  // Edge proxy headers set directly by verified edge CDNs
+  const edgeIp =
+    headers.get("cf-connecting-ip")?.trim() ||
+    headers.get("fly-client-ip")?.trim() ||
+    headers.get("x-real-ip")?.trim();
+
+  let ip = edgeIp;
+
+  if (!ip) {
+    const xff = headers.get("x-forwarded-for");
+    if (xff) {
+      const parts = xff.split(",").map((s) => s.trim()).filter(Boolean);
+      const hops = options?.trustProxyHops ?? 1;
+      const targetIndex = Math.max(0, parts.length - hops);
+      ip = parts[targetIndex] || parts[parts.length - 1];
+    }
+  }
+
+  const effectiveIp = ip && ip.length <= 45 ? ip : "unknown";
+  const ua = (headers.get("user-agent") || "").slice(0, 100);
+  const rawKey = effectiveIp === "unknown" ? `unknown:${ua}` : effectiveIp;
+
+  return createHash("sha256").update(rawKey).digest("hex").slice(0, 32);
 }
 
 /** Fixed-window limiter. Throws if Redis is unavailable (caller fails closed). */

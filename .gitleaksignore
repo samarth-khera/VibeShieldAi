@@ -1,0 +1,2 @@
+# Gitleaks ignore file for synthetic test fixtures in historical commits
+0f48891e8512a918fb9b3a0f5d786e6e54587fa8:src/test/scanners.test.ts:github-pat:168

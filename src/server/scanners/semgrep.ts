@@ -1,6 +1,6 @@
 import path from "node:path";
 import { runSubprocess } from "./runner";
-import { computeFingerprint, redactEvidence } from "./redact";
+import { computeFingerprint, redactEvidence, redactText } from "./redact";
 import type { NormalizedFinding, NormalizedSeverity, SingleScannerResult } from "./types";
 
 export type SemgrepRawResult = {
@@ -148,7 +148,7 @@ export async function runSemgrepScan(
       scanner: "semgrep",
       status: "failed",
       durationMs: Date.now() - startTime,
-      error: err instanceof Error ? err.message : "Semgrep execution failed",
+      error: redactText(err instanceof Error ? err.message : "Semgrep execution failed"),
       findings: [],
       coverage: { scanned: false, limitations: ["Semgrep static analysis failed during execution."] },
     };

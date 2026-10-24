@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { safeEntryPath, extractArchiveSafely } from "@/server/archive";
 import { RetrievalError } from "@/server/errors";
 import { Readable } from "node:stream";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
@@ -80,6 +80,13 @@ describe("extractArchiveSafely", () => {
 
     const readmeContent = await readFile(path.join(tmpWorkspace, "README.md"), "utf8");
     expect(readmeContent).toBe("# Hello World");
+
+    // Verify restricted permissions
+    const fileStat = await stat(path.join(tmpWorkspace, "README.md"));
+    expect(fileStat.mode & 0o777).toBe(0o600);
+
+    const dirStat = await stat(path.join(tmpWorkspace, "src"));
+    expect(dirStat.mode & 0o777).toBe(0o700);
   });
 
   it("rejects archives exceeding file count limit", async () => {

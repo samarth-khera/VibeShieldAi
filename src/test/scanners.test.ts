@@ -164,8 +164,9 @@ describe("Security Scanners Integration & Acceptance", () => {
     });
 
     it("orchestrates all 3 scanners and deduplicates findings", async () => {
-      // 1. Fake secret
-      await writeFile(path.join(testDir, "secrets.ts"), `const key = "ghp_012345678901234567890123456789012345";\n`);
+      // 1. Fake secret (constructed dynamically to keep source free of static secret matches)
+      const syntheticToken = ["ghp", "012345678901234567890123456789012345"].join("_");
+      await writeFile(path.join(testDir, "secrets.ts"), `const key = "${syntheticToken}";\n`);
       // 2. Insecure eval
       await writeFile(path.join(testDir, "insecure.ts"), `eval("1+1");\n`);
       // 3. Vulnerable lodash lockfile

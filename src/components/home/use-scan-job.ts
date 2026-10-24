@@ -67,12 +67,12 @@ export function useScanJob() {
   }, [poll]);
 
   const submit = useCallback(
-    async (url: string) => {
+    async (url: string, turnstileToken?: string) => {
       stop();
       const myRun = runId.current;
       setFlow({ phase: "validating" });
       try {
-        const job = await submitScan(url);
+        const job = await submitScan(url, turnstileToken);
         if (myRun !== runId.current) return;
         setFlow({ phase: "job", job, stale: false, pollError: false });
         poll(job.id, Date.now(), 0, 0, myRun);

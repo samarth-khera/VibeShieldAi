@@ -3,7 +3,12 @@ import { RETRYABLE_STATUSES } from "./job-store";
 
 export type ApiErrorBody = { error: { code: string; message: string } };
 
-const baseHeaders = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" };
+const baseHeaders = {
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+};
 
 export function ok<T>(data: T, status = 200): Response {
   return Response.json({ data }, { status, headers: baseHeaders });

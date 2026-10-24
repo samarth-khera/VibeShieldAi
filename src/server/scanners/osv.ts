@@ -1,6 +1,6 @@
 import path from "node:path";
 import { runSubprocess } from "./runner";
-import { computeFingerprint } from "./redact";
+import { computeFingerprint, redactText } from "./redact";
 import type { NormalizedFinding, NormalizedSeverity, SingleScannerResult } from "./types";
 
 export type OSVVulnerability = {
@@ -87,7 +87,7 @@ function findFixedVersion(vuln: OSVVulnerability): string | null {
 
 export async function runOsvScan(
   targetDir: string,
-  options?: { binaryPath?: string; timeoutMs?: number },
+  options?: { binaryPath?: string; timeoutMs?: number; offline?: boolean },
 ): Promise<SingleScannerResult> {
   const binary = options?.binaryPath || process.env.OSV_SCANNER_PATH || "osv-scanner";
   const startTime = Date.now();
@@ -96,9 +96,15 @@ export async function runOsvScan(
     const { realpath } = await import("node:fs/promises");
     const scanPath = await realpath(targetDir).catch(() => path.resolve(targetDir));
 
+    const args = ["scan", "source", "-r", "--format", "json", "--allow-no-lockfiles", "--no-ignore", "--no-resolve"];
+    if (process.env.OSV_OFFLINE === "true" || options?.offline) {
+      args.push("--offline");
+    }
+    args.push(scanPath);
+
     const res = await runSubprocess(
       binary,
-      ["scan", "source", "-r", "--format", "json", "--allow-no-lockfiles", "--no-ignore", scanPath],
+      args,
       {
         cwd: scanPath,
         timeoutMs: options?.timeoutMs ?? 60_000,
@@ -216,7 +222,7 @@ export async function runOsvScan(
       scanner: "osv-scanner",
       status: "failed",
       durationMs: Date.now() - startTime,
-      error: err instanceof Error ? err.message : "OSV-Scanner execution failed",
+      error: redactText(err instanceof Error ? err.message : "OSV-Scanner execution failed"),
       findings: [],
       coverage: {
         scanned: false,

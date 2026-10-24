@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -52,6 +52,7 @@ export async function runRetrieval(jobId: string, deps: RetrievalDeps): Promise<
 
     const res = await openArchive(fetchImpl, job.owner, job.repo, sha, config, controller.signal);
     workspace = await mkdtemp(path.join(deps.tmpRoot ?? tmpdir(), "vibeshield-"));
+    await chmod(workspace, 0o700);
     const source = Readable.fromWeb(res.body as never);
     controller.signal.addEventListener("abort", () => source.destroy(new RetrievalError("download_failed", "timeout", "Retrieval timed out.")), { once: true });
 

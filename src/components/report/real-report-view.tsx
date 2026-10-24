@@ -236,7 +236,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
                   {job.scanners.gitleaks.status ?? "pending"}
                 </span>
               </div>
-              <p className="mt-2 text-muted">Secret & credential detection</p>
+              <p className="mt-2 text-muted">Secret &amp; credential detection</p>
               <p className="mt-1 text-[11px] text-muted/70">
                 Duration: {job.scanners.gitleaks.durationMs ? `${job.scanners.gitleaks.durationMs}ms` : "—"}
               </p>
@@ -443,7 +443,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
 
           <div className="mt-8 rounded-lg border border-line/60 bg-surface/40 p-4 font-mono text-[11px] text-muted">
             <p>
-              🔒 Security & Privacy: Evidence is strictly redacted. Discovered secret values and credentials are never stored, logged, or sent to external services.
+              🔒 Security &amp; Privacy: Evidence is strictly redacted. Discovered secret values and credentials are never stored, logged, or sent to external services.
             </p>
           </div>
         </section>

@@ -3,11 +3,20 @@
  * Downloads repository archives from approved GitHub hosts with hard limits and verifies safe
  * extraction. It never executes, installs or builds repository code, and performs no security scanning.
  */
+import { existsSync } from "node:fs";
 import { readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import IORedis from "ioredis";
 import { Worker } from "bullmq";
+
+if (existsSync(".env") && typeof process.loadEnvFile === "function") {
+  try {
+    process.loadEnvFile(".env");
+  } catch {
+    // Ignore if unreadable
+  }
+}
 import { getConfig } from "../src/server/config";
 import { prismaJobStore, prisma } from "../src/server/db";
 import { log } from "../src/server/errors";

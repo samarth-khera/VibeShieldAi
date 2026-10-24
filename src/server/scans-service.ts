@@ -6,6 +6,7 @@ import { JOB_ID_RE, MAX_ATTEMPTS, type JobStore } from "./job-store";
 import type { RateLimitResult } from "./rate-limit";
 import { explainFinding } from "./ai/service";
 import type { LlmProvider } from "./ai/client";
+import { verifyTurnstileToken } from "./turnstile";
 
 export type ScanDeps = {
   store: JobStore;
@@ -15,6 +16,7 @@ export type ScanDeps = {
   workerOnline: () => Promise<boolean>;
   now?: () => Date;
   llmProvider?: LlmProvider;
+  verifyTurnstile?: typeof verifyTurnstileToken;
 };
 
 const MAX_BODY_BYTES = 2048;
@@ -48,8 +50,20 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
   } catch {
     return fail(400, "invalid_json", "Request body must be valid JSON.");
   }
-  const parsed = parseGithubRepoUrl((body as { repositoryUrl?: unknown } | null)?.repositoryUrl);
+  const rawBody = body as { repositoryUrl?: unknown; turnstileToken?: unknown } | null;
+  const parsed = parseGithubRepoUrl(rawBody?.repositoryUrl);
   if (!parsed.ok) return fail(400, parsed.code, parsed.error);
+
+  const turnstileToken = typeof rawBody?.turnstileToken === "string" ? rawBody.turnstileToken : undefined;
+  const clientIp = req.headers.get("cf-connecting-ip")?.trim() || req.headers.get("x-real-ip")?.trim() || undefined;
+  const turnstileFn = deps.verifyTurnstile ?? verifyTurnstileToken;
+  const turnstileResult = await turnstileFn({ token: turnstileToken, clientIp });
+  if (!turnstileResult.success) {
+    if (turnstileResult.status === "service_unavailable") {
+      return fail(503, "abuse_protection_unavailable", turnstileResult.message);
+    }
+    return fail(403, "turnstile_verification_failed", turnstileResult.message);
+  }
 
   const now = (deps.now ?? (() => new Date()))();
   let job;

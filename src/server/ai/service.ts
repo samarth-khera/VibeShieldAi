@@ -32,6 +32,11 @@ export async function explainFinding(
     maxTokens?: number;
   }
 ): Promise<AiExplainResult> {
+  const finding: FindingRecord | null = await deps.store.getFinding(jobId, findingId).catch(() => null);
+  if (!finding) {
+    throw new Error("Finding not found");
+  }
+
   const provider = deps.provider || getLlmProvider();
   const modelName = provider.getModelName();
 
@@ -42,11 +47,6 @@ export async function explainFinding(
       message:
         "AI Security Analyst is currently unavailable because ANTHROPIC_API_KEY is not configured on the server.",
     };
-  }
-
-  const finding: FindingRecord | null = await deps.store.getFinding(jobId, findingId).catch(() => null);
-  if (!finding) {
-    throw new Error("Finding not found");
   }
 
   const contextHash = computeContextHash(finding, AI_PROMPT_VERSION, modelName);

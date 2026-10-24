@@ -20,7 +20,7 @@ export class AnthropicProvider implements LlmProvider {
 
   constructor(apiKey?: string, modelName?: string) {
     this.apiKey = apiKey || process.env.ANTHROPIC_API_KEY;
-    this.modelName = modelName || process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
+    this.modelName = modelName || process.env.ANTHROPIC_MODEL || "claude-sonnet-5-5";
 
     if (this.apiKey) {
       this.client = new Anthropic({ apiKey: this.apiKey });

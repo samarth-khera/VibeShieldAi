@@ -10,6 +10,16 @@ const SECRET_PATTERNS: RegExp[] = [
   /xox[baprs]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*/g,
   // Stripe keys
   /(?:sk|rk)_(?:live|test)_[0-9a-zA-Z]{24,99}/g,
+  // Anthropic API keys
+  /sk-ant-[A-Za-z0-9_-]{20,}/g,
+  // OpenAI API keys
+  /sk-[A-Za-z0-9_-]{32,}/g,
+  // SendGrid API keys
+  /SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}/g,
+  // JWT tokens
+  /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+  // Database connection credentials (e.g. postgres://user:password@host/db)
+  /(?:postgres|postgresql|mysql|mongodb|redis):\/\/[^:\s]+:([^@\s]+)@[^\s]+/gi,
   // Private keys
   /-----BEGIN [A-Z0-9 ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]+PRIVATE KEY-----/g,
   // Generic high-entropy assignments: key = "..."

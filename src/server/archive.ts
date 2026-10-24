@@ -16,10 +16,14 @@ const reject = (category: string, message: string) => new RetrievalError("reject
  * directory), or throws for anything that could escape the workspace.
  */
 export function safeEntryPath(root: string, entryPath: string): string | null {
-  if (entryPath.includes("\0") || entryPath.includes("\\")) throw reject("unsafe_path", "Archive contains an unsafe path.");
+  if (entryPath.includes("\0") || entryPath.includes("\\") || entryPath.includes(":")) {
+    throw reject("unsafe_path", "Archive contains an unsafe path.");
+  }
   if (entryPath.startsWith("/") || /^[A-Za-z]:/.test(entryPath)) throw reject("unsafe_path", "Archive contains an unsafe path.");
   const parts = entryPath.split("/").filter((p) => p !== "" && p !== ".");
-  if (parts.some((p) => p === "..")) throw reject("unsafe_path", "Archive contains an unsafe path.");
+  if (parts.some((p) => p === "..") || path.normalize(entryPath).split(path.sep).includes("..")) {
+    throw reject("unsafe_path", "Archive contains an unsafe path.");
+  }
   const rel = parts.slice(1); // strip "<owner>-<repo>-<sha>/"
   if (rel.length === 0) return null;
   const resolved = path.resolve(root, ...rel);
@@ -47,7 +51,7 @@ function counter(max: number, category: string, message: string, bump: (n: numbe
  * Nothing in the archive is ever executed.
  */
 export async function extractArchiveSafely(source: Readable, root: string, limits: ArchiveLimits): Promise<ArchiveStats> {
-  await mkdir(root, { recursive: true });
+  await mkdir(root, { recursive: true, mode: 0o700 });
   const stats: ArchiveStats = { fileCount: 0, unpackedBytes: 0, skippedLinks: 0 };
   let failure: RetrievalError | null = null;
   const writes: Promise<void>[] = [];
@@ -75,7 +79,7 @@ export async function extractArchiveSafely(source: Readable, root: string, limit
         const dest = safeEntryPath(root, entry.path);
         if (!dest) return void entry.resume();
         if (type === "Directory") {
-          writes.push(mkdir(dest, { recursive: true }).then(() => undefined));
+          writes.push(mkdir(dest, { recursive: true, mode: 0o700 }).then(() => undefined));
           return void entry.resume();
         }
         stats.fileCount++;
@@ -83,10 +87,10 @@ export async function extractArchiveSafely(source: Readable, root: string, limit
         if (stats.fileCount > limits.maxFileCount) throw reject("file_count", "Repository has too many files.");
         if (stats.unpackedBytes > limits.maxUnpackedBytes) throw reject("unpacked_size", "Repository is too large once unpacked.");
         writes.push(
-          mkdir(path.dirname(dest), { recursive: true }).then(
+          mkdir(path.dirname(dest), { recursive: true, mode: 0o700 }).then(
             () =>
               new Promise<void>((resolve, reject2) => {
-                const ws = createWriteStream(dest, { flags: "wx", mode: 0o644 });
+                const ws = createWriteStream(dest, { flags: "wx", mode: 0o600 });
                 ws.on("error", reject2);
                 ws.on("finish", resolve);
                 entry.on("error", reject2);

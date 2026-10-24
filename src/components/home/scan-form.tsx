@@ -6,10 +6,13 @@ import { Button } from "@/components/ui/button";
 import { cn, parseGithubUrl } from "@/lib/utils";
 import { ScanStatusPanel } from "./scan-status";
 import { useScanJob } from "./use-scan-job";
+import { TurnstileWidget } from "./turnstile-widget";
 
 export function ScanForm() {
   const id = useId();
   const [value, setValue] = useState("");
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  const siteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
   const { flow, submit, startScanNow, retry, recheck, reset, setClientError } = useScanJob();
 
   const busy =
@@ -22,7 +25,10 @@ export function ScanForm() {
     if (busy) return;
     const r = parseGithubUrl(value); // instant client-side feedback; the server re-validates
     if (!r.ok) return setClientError(r.error);
-    void submit(value.trim());
+    if (siteKey && !turnstileToken) {
+      return setClientError("Please complete the security verification challenge before scanning.");
+    }
+    void submit(value.trim(), turnstileToken || undefined);
   }
 
   return (
@@ -64,6 +70,13 @@ export function ScanForm() {
             )}
           </Button>
         </div>
+        {siteKey && (
+          <TurnstileWidget
+            siteKey={siteKey}
+            onVerify={(token) => setTurnstileToken(token)}
+            onExpire={() => setTurnstileToken(null)}
+          />
+        )}
       </form>
 
       <div aria-live="polite" className="mt-3 min-h-6">
