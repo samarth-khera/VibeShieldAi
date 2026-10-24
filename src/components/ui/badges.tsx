@@ -1,11 +1,11 @@
 import { cn } from "@/lib/utils";
 import type { Severity } from "@/lib/demo-data";
 
-export const severityStyles: Record<Severity, { label: string; chip: string; dot: string }> = {
-  critical: { label: "Critical", chip: "bg-[#fde8f0] text-[#b4235a] border-[#f7c6d9]", dot: "bg-[#d6336c]" },
-  high: { label: "High", chip: "bg-[#fff0e3] text-[#b84708] border-[#fbd5b5]", dot: "bg-[#e8590c]" },
-  medium: { label: "Medium", chip: "bg-[#fdf5df] text-[#8a5a0b] border-[#f3e0a8]", dot: "bg-[#d9a21b]" },
-  low: { label: "Low", chip: "bg-[#e6f1ff] text-[#1f5fae] border-[#bfdaf8]", dot: "bg-[#2b7bd6]" },
+export const severityStyles: Record<Severity, { label: string; chip: string; dot: string; text: string }> = {
+  critical: { label: "Critical", chip: "bg-sev-critical/10 text-sev-critical border-sev-critical/30", dot: "bg-sev-critical", text: "text-sev-critical" },
+  high: { label: "High", chip: "bg-sev-high/10 text-sev-high border-sev-high/30", dot: "bg-sev-high", text: "text-sev-high" },
+  medium: { label: "Medium", chip: "bg-sev-medium/10 text-sev-medium border-sev-medium/30", dot: "bg-sev-medium", text: "text-sev-medium" },
+  low: { label: "Low", chip: "bg-sev-low/10 text-sev-low border-sev-low/30", dot: "bg-sev-low", text: "text-sev-low" },
 };
 
 export function SeverityBadge({ severity, className }: { severity: Severity; className?: string }) {
@@ -13,7 +13,7 @@ export function SeverityBadge({ severity, className }: { severity: Severity; cla
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-semibold",
+        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 font-mono text-[11px] font-medium uppercase tracking-wider",
         s.chip,
         className,
       )}
@@ -24,15 +24,15 @@ export function SeverityBadge({ severity, className }: { severity: Severity; cla
   );
 }
 
-export function DemoBadge({ className }: { className?: string }) {
+export function DemoBadge({ className, children = "Demo data" }: { className?: string; children?: React.ReactNode }) {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full border border-brand/25 bg-brand-soft px-2.5 py-0.5 text-xs font-semibold text-brand-ink",
+        "inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-0.5 font-mono text-[11px] font-medium uppercase tracking-wider text-accent",
         className,
       )}
     >
-      Demo data
+      {children}
     </span>
   );
 }

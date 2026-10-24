@@ -1,28 +1,17 @@
-import { KeyRound, Code2, Package, Settings2 } from "lucide-react";
-
-const items = [
-  { icon: KeyRound, label: "Secrets" },
-  { icon: Code2, label: "Code Analysis" },
-  { icon: Package, label: "Dependencies" },
-  { icon: Settings2, label: "Configuration" },
-];
+const words = ["SECRET DETECTION", "CODE ANALYSIS", "DEPENDENCY AUDITS", "CONFIGURATION CHECKS", "SECURITY INSIGHTS"];
 
 export function Ticker() {
-  // Two identical halves → seamless -50% loop. Second half hidden from assistive tech.
-  const half = [...items, ...items, ...items];
+  const set = [...words, ...words];
   return (
-    <section aria-label="What VibeShield AI checks" className="py-10">
-      <div className="ticker-wrap relative overflow-hidden [mask-image:linear-gradient(90deg,transparent,#000_10%,#000_90%,transparent)]">
-        <div className="ticker-track flex w-max animate-ticker">
+    <section aria-label="Capabilities" className="border-y border-line bg-surface py-5">
+      <div className="marquee-wrap relative overflow-hidden [mask-image:linear-gradient(90deg,transparent,#000_8%,#000_92%,transparent)]">
+        <div className="marquee-track flex w-max animate-marquee">
           {[0, 1].map((copy) => (
-            <ul key={copy} aria-hidden={copy === 1} className="flex shrink-0 items-center gap-4 pr-4">
-              {half.map((it, i) => (
-                <li
-                  key={i}
-                  className="flex items-center gap-2.5 rounded-full border border-border bg-white px-5 py-2.5 text-sm font-semibold text-foreground shadow-sm"
-                >
-                  <it.icon className="size-4 text-brand" aria-hidden />
-                  {it.label}
+            <ul key={copy} aria-hidden={copy === 1} className="flex shrink-0 items-center">
+              {set.map((w, i) => (
+                <li key={i} className="flex items-center font-display text-xl font-bold uppercase tracking-wide text-foreground/90 sm:text-2xl">
+                  <span className="px-6 sm:px-8">{w}</span>
+                  <span className="text-accent" aria-hidden>✦</span>
                 </li>
               ))}
             </ul>

@@ -1,21 +1,21 @@
 import type { Metadata } from "next";
-import { Inter, Plus_Jakarta_Sans, Geist_Mono } from "next/font/google";
+import { Inter, Space_Grotesk, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
 const inter = Inter({ variable: "--font-inter", subsets: ["latin"] });
-const jakarta = Plus_Jakarta_Sans({ variable: "--font-jakarta", subsets: ["latin"] });
-const mono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
+const grotesk = Space_Grotesk({ variable: "--font-space-grotesk", subsets: ["latin"] });
+const mono = JetBrains_Mono({ variable: "--font-jetbrains-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
   title: "VibeShield AI — Find the security holes AI left behind",
   description:
-    "VibeShield AI helps developers identify secrets, insecure code patterns, vulnerable dependencies and risky configuration in AI-generated projects.",
+    "Scan your GitHub repository for exposed secrets, insecure code patterns and vulnerable dependencies. Live scanning is not connected yet — explore the sample report.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`${inter.variable} ${jakarta.variable} ${mono.variable} antialiased`}>
-      <body className="min-h-screen flex flex-col">{children}</body>
+    <html lang="en" data-scroll-behavior="smooth" className={`${inter.variable} ${grotesk.variable} ${mono.variable} antialiased`}>
+      <body className="flex min-h-screen flex-col">{children}</body>
     </html>
   );
 }
