@@ -1,0 +1,171 @@
+export type Severity = "critical" | "high" | "medium" | "low";
+export type Category = "Secrets" | "Code Analysis" | "Dependencies" | "Configuration";
+
+export type Finding = {
+  id: string;
+  title: string;
+  severity: Severity;
+  category: Category;
+  file: string;
+  line: number;
+  summary: string;
+  impact: string;
+  evidence: { startLine: number; lines: string[]; highlight: number }[];
+  remediation: string[];
+  reference?: string;
+};
+
+export const demoRepo = {
+  owner: "acme-demo",
+  name: "ai-notes-app",
+  url: "https://github.com/acme-demo/ai-notes-app",
+  branch: "main",
+  commit: "a1b2c3d",
+  scannedAt: "Sample report — not a real scan",
+  filesAnalyzed: 148,
+  linesAnalyzed: "12.4k",
+  score: 54,
+};
+
+export const demoFindings: Finding[] = [
+  {
+    id: "VS-001",
+    title: "Hard-coded Stripe secret key",
+    severity: "critical",
+    category: "Secrets",
+    file: "src/lib/payments.ts",
+    line: 7,
+    summary: "A live-format payment API key is committed directly in source code.",
+    impact:
+      "Anyone with repository access (or a leaked clone) could use this key to create charges, read customer data or issue refunds until it is rotated.",
+    evidence: [
+      {
+        startLine: 5,
+        highlight: 7,
+        lines: [
+          'import Stripe from "stripe";',
+          "",
+          'const STRIPE_KEY = "sk_live_51N•••••••••••••••••••••••Qx9a";',
+          "",
+          "export const stripe = new Stripe(STRIPE_KEY);",
+        ],
+      },
+    ],
+    remediation: [
+      "Revoke and rotate the key in your payment provider dashboard immediately.",
+      "Load the secret from an environment variable: process.env.STRIPE_SECRET_KEY.",
+      "Add the .env file to .gitignore and purge the key from git history.",
+      "Enable secret scanning / push protection on the repository.",
+    ],
+    reference: "CWE-798: Use of Hard-coded Credentials",
+  },
+  {
+    id: "VS-002",
+    title: "SQL query built with string concatenation",
+    severity: "high",
+    category: "Code Analysis",
+    file: "src/app/api/notes/search/route.ts",
+    line: 21,
+    summary: "User-supplied input is interpolated directly into a SQL statement.",
+    impact:
+      "An attacker can alter the query to read, modify or delete data from other users' notes (SQL injection).",
+    evidence: [
+      {
+        startLine: 19,
+        highlight: 21,
+        lines: [
+          "const q = new URL(req.url).searchParams.get(\"q\");",
+          "",
+          "const rows = await db.query(",
+          "  `SELECT * FROM notes WHERE title LIKE '%${q}%'`",
+          ");",
+        ],
+      },
+    ],
+    remediation: [
+      "Use parameterized queries: db.query('... LIKE $1', [`%${q}%`]).",
+      "Validate and length-limit the input before it reaches the database layer.",
+      "Run the database role with least privilege.",
+    ],
+    reference: "CWE-89: SQL Injection",
+  },
+  {
+    id: "VS-003",
+    title: "Vulnerable dependency: example-markdown@2.3.1",
+    severity: "high",
+    category: "Dependencies",
+    file: "package.json",
+    line: 24,
+    summary: "A pinned package version has a published advisory (illustrative).",
+    impact:
+      "Rendering untrusted markdown with this version may allow script injection (XSS) in the browser.",
+    evidence: [
+      {
+        startLine: 22,
+        highlight: 24,
+        lines: [
+          '"dependencies": {',
+          '  "next": "^16.0.0",',
+          '  "example-markdown": "2.3.1",',
+          '  "react": "^19.0.0"',
+          "}",
+        ],
+      },
+    ],
+    remediation: [
+      "Upgrade to example-markdown 2.4.0 or later (illustrative fixed version).",
+      "Sanitize rendered HTML with an allow-list sanitizer.",
+      "Add automated dependency audits to CI.",
+    ],
+    reference: "Illustrative advisory — not a real CVE",
+  },
+  {
+    id: "VS-004",
+    title: "Wildcard CORS with credentials enabled",
+    severity: "medium",
+    category: "Configuration",
+    file: "src/middleware.ts",
+    line: 12,
+    summary: "The API accepts cross-origin requests from any origin.",
+    impact:
+      "Malicious sites could make authenticated requests on behalf of signed-in users.",
+    evidence: [
+      {
+        startLine: 10,
+        highlight: 12,
+        lines: [
+          "const res = NextResponse.next();",
+          'res.headers.set("Access-Control-Allow-Credentials", "true");',
+          'res.headers.set("Access-Control-Allow-Origin", "*");',
+          "return res;",
+        ],
+      },
+    ],
+    remediation: [
+      "Allow only a specific list of trusted origins.",
+      "Never combine wildcard origins with credentialed requests.",
+    ],
+    reference: "CWE-942: Permissive Cross-domain Policy",
+  },
+  {
+    id: "VS-005",
+    title: "Debug mode enabled in production config",
+    severity: "low",
+    category: "Configuration",
+    file: "config/app.config.json",
+    line: 4,
+    summary: "Verbose error output is switched on in the shipped configuration.",
+    impact: "Stack traces may reveal internal paths and library versions to users.",
+    evidence: [
+      {
+        startLine: 2,
+        highlight: 4,
+        lines: ["{", '  "env": "production",', '  "debug": true,', '  "logLevel": "verbose"', "}"],
+      },
+    ],
+    remediation: ["Set debug to false for production.", "Log details server-side only."],
+    reference: "CWE-489: Active Debug Code",
+  },
+];
+
+export const categories: Category[] = ["Secrets", "Code Analysis", "Dependencies", "Configuration"];
