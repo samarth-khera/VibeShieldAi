@@ -1,0 +1,59 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ScanStatus {
+  queued
+  retrieving
+  ready_for_scan
+  invalid_repository
+  download_failed
+  rejected_by_limits
+  failed
+}
+
+/// One repository-retrieval job. Stores metadata only — never repository contents or secrets.
+model ScanJob {
+  /// Non-guessable public identifier (192 bits, base64url). Acts as the access capability.
+  id              String     @id @db.VarChar(32)
+  status          ScanStatus @default(queued)
+
+  owner           String     @db.VarChar(39)
+  repo            String     @db.VarChar(100)
+  repositoryUrl   String     @db.VarChar(200)
+
+  // Repository metadata (filled by the worker)
+  defaultBranch   String?    @db.VarChar(255)
+  commitSha       String?    @db.VarChar(40)
+  description     String?    @db.VarChar(500)
+  repoSizeKb      Int?
+  stars           Int?
+  primaryLanguage String?    @db.VarChar(100)
+
+  // Retrieval stats (after bounded download + safe extraction check)
+  archiveBytes    Int?
+  fileCount       Int?
+  unpackedBytes   Int?
+
+  // Failure info (sanitized)
+  failureCategory String?    @db.VarChar(40)
+  errorMessage    String?    @db.VarChar(300)
+
+  attempts        Int        @default(0)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  startedAt       DateTime?
+  completedAt     DateTime?
+  /// Rows past this time are deleted by the worker's cleanup task.
+  expiresAt       DateTime
+
+  @@index([status])
+  @@index([expiresAt])
+  @@index([owner, repo])
+  @@index([createdAt])
+}
