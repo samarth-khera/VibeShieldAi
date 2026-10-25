@@ -89,6 +89,105 @@ export function validateUnifiedDiff(diff: string): PatchValidationResult {
 }
 
 /**
+ * Strictly verifies whether an eval() argument has defensible, proven JSON data flow.
+ *
+ * Requirements:
+ * 1. Do NOT treat function names (parseJson, parseConfig, deserializeJson),
+ *    variable names (rawJson, jsonData), comments, imports, or isolated keywords
+ *    as sufficient proof that an eval() argument contains JSON text.
+ * 2. Parameters, external inputs (req, query, body, input, process, etc.), and reassignments
+ *    must fail closed.
+ * 3. Only locally defined, unpolluted constants assigned from a statically verified JSON literal
+ *    (validated with JSON.parse) or JSON.stringify() qualify as proven JSON data flow.
+ */
+function verifyJsonSourceProof(localContext: string, cleanVar: string): boolean {
+  if (!cleanVar || !localContext) return false;
+
+  const lines = localContext.split("\n");
+
+  // 1. cleanVar cannot be a function parameter in any line of localContext
+  for (const line of lines) {
+    if (
+      (line.includes("function") && line.includes(cleanVar) && line.includes("(") && line.includes(")")) ||
+      (line.includes("=>") && line.includes(cleanVar)) ||
+      (line.includes(`${cleanVar}:`) || line.includes(`${cleanVar} :`))
+    ) {
+      const openParen = line.indexOf("(");
+      const closeParen = line.lastIndexOf(")");
+      if (openParen !== -1 && closeParen > openParen) {
+        const insideParens = line.slice(openParen + 1, closeParen);
+        const tokens = insideParens.split(/[\s,:]+/);
+        if (tokens.includes(cleanVar)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  // 2. Find declarations and assignments of cleanVar in localContext
+  const assignmentRHSList: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    let rhs: string | null = null;
+
+    if (trimmed.startsWith("const ") || trimmed.startsWith("let ") || trimmed.startsWith("var ")) {
+      const parts = trimmed.slice(trimmed.indexOf(" ") + 1).split("=");
+      if (parts.length >= 2 && parts[0].trim() === cleanVar) {
+        rhs = parts.slice(1).join("=").trim().replace(/;$/, "");
+      }
+    } else if (trimmed.startsWith(`${cleanVar} =`) || trimmed.startsWith(`${cleanVar}=`)) {
+      const parts = trimmed.split("=");
+      if (parts.length >= 2 && parts[0].trim() === cleanVar) {
+        rhs = parts.slice(1).join("=").trim().replace(/;$/, "");
+      }
+    }
+
+    if (rhs !== null) {
+      assignmentRHSList.push(rhs);
+    }
+  }
+
+  // If there are zero assignments, or more than one (reassignment / conflicting data flow), reject!
+  if (assignmentRHSList.length !== 1) {
+    return false;
+  }
+
+  const rhs = assignmentRHSList[0];
+
+  // 3. Reject any RHS that references untrusted sources, parameters, or external state
+  const untrustedRef = /\b(?:req|request|res|response|params|query|body|input|payload|script|code|cmd|command|user|process|window|document|fetch|argv|eval)\b/i;
+  if (untrustedRef.test(rhs)) {
+    return false;
+  }
+
+  // 4. Case A: Direct call to JSON.stringify(...)
+  if (/^JSON\.stringify\s*\(/.test(rhs)) {
+    return true;
+  }
+
+  // 5. Case B: Static string literal containing valid JSON
+  const singleQuoteMatch = rhs.match(/^'([\s\S]*)'$/);
+  const doubleQuoteMatch = rhs.match(/^"([\s\S]*)"$/);
+  const backtickMatch = rhs.match(/^`([\s\S]*)`$/);
+
+  const rawLiteral = (singleQuoteMatch || doubleQuoteMatch || backtickMatch)?.[1];
+  if (rawLiteral !== undefined) {
+    if (rawLiteral.includes("${")) {
+      return false;
+    }
+    try {
+      const unescaped = rawLiteral.replace(/\\"/g, '"').replace(/\\'/g, "'");
+      const parsed = JSON.parse(unescaped);
+      return typeof parsed === "object" && parsed !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Generates an automated, user-reviewable patch for an eligible security finding.
  */
 export async function generateRemediationPatch(params: {
@@ -196,30 +295,10 @@ export async function generateRemediationPatch(params: {
     const localEnd = Math.min(sourceLines.length, actualLineIdx + 11);
     const localContext = sourceLines.slice(localStart, localEnd).join("\n");
 
-    const isExplicitJsonVar = /^(?:raw_?json|json_?(?:str(?:ing)?|data|text|payload|content)?)$/i.test(cleanVar);
-
-    // Verify evidence about the relevant input variable and its data flow
-    const localFunctionDenotesJson =
-      /\bfunction\s+[a-zA-Z0-9_]*(?:json|config)[a-zA-Z0-9_]*\s*\(/i.test(localContext) ||
-      /\b(?:parseJson|readJson|loadJson|parseConfig|deserializeJson|parseLegacyJson)\b/i.test(localContext);
-
-    const cleanVarLines = localContext
-      .split("\n")
-      .filter((line) => line.includes(cleanVar));
-
-    const localDataFlowShowsJson =
-      cleanVarLines.some((line) => /\b(?:json|config|application\/json)\b/i.test(line)) ||
-      /\bapplication\/json\b/i.test(localContext) ||
-      /\/\/\s*(?:parse|incoming|verify|read)\s+(?:incoming\s+)?json/i.test(localContext) ||
-      /\/\*[\s\S]*?(?:json text|json payload|json string|json data)[\s\S]*?\*\//i.test(localContext);
-
-    const localShowsArbitraryExecution =
-      /\bfunction\s+(?:run|execute|eval|exec|do|handle)[A-Za-z0-9_]*(?:payload|code|script|action|command)/i.test(localContext);
-
-    const isVerifiedJsonInput =
-      !localShowsArbitraryExecution &&
-      ((isExplicitJsonVar && (localFunctionDenotesJson || localDataFlowShowsJson)) ||
-       (!isExplicitJsonVar && localFunctionDenotesJson && localDataFlowShowsJson));
+    // Do NOT treat function names (parseJson, parseConfig, deserializeJson),
+    // variable names (rawJson, jsonData), comments, imports, or isolated keywords
+    // as proof. Require verified local data-flow proof that the input is valid JSON text.
+    const isVerifiedJsonInput = verifyJsonSourceProof(localContext, cleanVar);
 
     if (!isVerifiedJsonInput) {
       throw new Error(

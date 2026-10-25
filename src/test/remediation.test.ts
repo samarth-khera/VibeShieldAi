@@ -437,18 +437,18 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         defaultBranch: "main",
       });
 
-      const originalSource = 'export function parseLegacyJson(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n';
+      const originalSource = 'export function getStaticConfig() {\n  const rawJson = \'{"version": 1}\';\n  return eval("(" + rawJson + ")");\n}\n';
       await store.saveFindings(job.id, [
         makeFinding({
           scanner: "semgrep",
           ruleId: "semgrep:eval-detected",
           category: "Code Analysis",
           severity: "high",
-          title: "Legacy JSON deserialization",
+          title: "Verified JSON literal deserialization",
           filePath: "src/parser.ts",
           fingerprint: "fp-eval-1234",
-          startLine: 2,
-          endLine: 2,
+          startLine: 3,
+          endLine: 3,
           redactedEvidence: '  return eval("(" + rawJson + ")");',
         }),
       ]);
@@ -499,8 +499,8 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
           title: "Legacy JSON deserialization",
           filePath: "src/parser.ts",
           fingerprint: "fp-eval-1234",
-          startLine: 2,
-          endLine: 2,
+          startLine: 3,
+          endLine: 3,
           redactedEvidence: '  return eval("(" + rawJson + ")");',
         }),
       ]);
@@ -509,7 +509,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/parser.ts": 'export function parseLegacyJson(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n' },
+        sourceFiles: { "src/parser.ts": 'export function getStaticConfig() {\n  const rawJson = \'{"status": "ok"}\';\n  return eval("(" + rawJson + ")");\n}\n' },
       };
 
       const preview = await createPreview(job.id, evalFinding.id, deps);
@@ -539,7 +539,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         defaultBranch: "main",
       });
 
-      const vulnerableSource = 'export function parseLegacyJson(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n';
+      const vulnerableSource = 'export function getStaticConfig() {\n  const rawJson = \'{"version": 1, "status": "active"}\';\n  return eval("(" + rawJson + ")");\n}\n';
       const evalFinding = makeFinding({
         scanner: "semgrep",
         ruleId: "semgrep:eval-detected",
@@ -548,8 +548,8 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         title: "Legacy JSON deserialization",
         filePath: "src/parser.ts",
         fingerprint: "fp-eval-verified-99",
-        startLine: 2,
-        endLine: 2,
+        startLine: 3,
+        endLine: 3,
         redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
 
@@ -671,8 +671,8 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         title: "Legacy JSON deserialization",
         filePath: "src/parser.ts",
         fingerprint: "fp-eval-incomplete",
-        startLine: 2,
-        endLine: 2,
+        startLine: 3,
+        endLine: 3,
         redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
 
@@ -703,7 +703,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/parser.ts": 'export function parseLegacyJson(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n' },
+        sourceFiles: { "src/parser.ts": 'export function getStaticConfig() {\n  const rawJson = \'{"status": "ok"}\';\n  return eval("(" + rawJson + ")");\n}\n' },
         scanEngine: mockFailingScanEngine,
       };
 
@@ -786,7 +786,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
     });
 
     it("case 4: a genuinely verified JSON-parsing transformation is accepted only when its preconditions are established", async () => {
-      // Precondition A: surrounding source context confirms JSON parsing + explicit JSON-named variable
+      // Precondition A: surrounding source context proves local static JSON literal assignment
       const verifiedFinding = makeFinding({
         scanner: "semgrep",
         ruleId: "semgrep:eval-detected",
@@ -798,8 +798,8 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         redactedEvidence: "  return eval(jsonData);",
       });
 
-      const sourceContent = `export function parseConfig(jsonData: string) {
-  // Parse incoming JSON configuration
+      const sourceContent = `export function loadDefaultConfig() {
+  const jsonData = '{"theme": "dark", "version": 1}';
   return eval(jsonData);
 }`;
 
@@ -814,8 +814,9 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       expect(patchResult.unifiedDiff).toContain("+  return JSON.parse(jsonData);");
       expect(patchResult.patchSummary).toMatch(/Replace unsafe dynamic eval\(\) with safe JSON\.parse\(\)/);
 
-      // Precondition B: classic pre-JSON.parse deserialization idiom with verified source context
-      const idiomSource = `export function parseLegacyJson(rawJson: string) {
+      // Precondition B: classic pre-JSON.parse deserialization idiom with proven local static JSON literal
+      const idiomSource = `export function getLegacyPayload() {
+  const rawJson = '{"items": [1, 2, 3]}';
   return eval("(" + rawJson + ")");
 }`;
       const idiomFinding = makeFinding({
@@ -824,8 +825,8 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         title: "Legacy JSON deserialization",
         description: "Legacy pre-JSON.parse deserialization idiom",
         filePath: "src/parser.ts",
-        startLine: 2,
-        endLine: 2,
+        startLine: 3,
+        endLine: 3,
         redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
 
@@ -1078,8 +1079,8 @@ export function executeUserPayload(rawData: string) {
         ruleId: "semgrep:eval-detected",
         filePath: "src/config.ts",
         fingerprint: "fp-unapproved",
-        startLine: 2,
-        endLine: 2,
+        startLine: 3,
+        endLine: 3,
         redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
       await store.saveFindings(job.id, [finding]);
@@ -1087,7 +1088,7 @@ export function executeUserPayload(rawData: string) {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/config.ts": 'export function parseConfig(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n' },
+        sourceFiles: { "src/config.ts": 'export function getStaticConfig() {\n  const rawJson = \'{"status": "ok"}\';\n  return eval("(" + rawJson + ")");\n}\n' },
       };
 
       const preview = await createPreview(job.id, savedFindings6[0].id, deps);
@@ -1119,8 +1120,8 @@ export function executeUserPayload(rawData: string) {
         ruleId: "semgrep:eval-detected",
         filePath: "src/config.ts",
         fingerprint: "fp-target",
-        startLine: 2,
-        endLine: 2,
+        startLine: 3,
+        endLine: 3,
         redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
       await store.saveFindings(job.id, [finding]);
@@ -1128,7 +1129,7 @@ export function executeUserPayload(rawData: string) {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/config.ts": 'export function parseConfig(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n' },
+        sourceFiles: { "src/config.ts": 'export function getStaticConfig() {\n  const rawJson = \'{"status": "ok"}\';\n  return eval("(" + rawJson + ")");\n}\n' },
       };
 
       const preview = await createPreview(job.id, savedFindings7[0].id, deps);
@@ -1197,6 +1198,122 @@ export function executeUserPayload(rawData: string) {
 
       expect(failedRescanResult.status).toBe("needs_review");
       expect(failedRescanResult.rescanStatus).toBe("failed");
+    });
+
+    it("regression: rejects nearby function with JSON-related name that passes arbitrary user-controlled script to eval()", async () => {
+      const misleadingFnSource = `export function parseJson(userInput: string) {
+  // Misleading function name, but input is arbitrary untrusted script
+  return eval(userInput);
+}`;
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        title: "Unsafe eval in parseJson",
+        filePath: "src/json-helper.ts",
+        startLine: 3,
+        endLine: 3,
+        redactedEvidence: "  return eval(userInput);",
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-misleading-fn",
+          commitSha: "sha-1",
+          sourceContent: misleadingFnSource,
+        })
+      ).rejects.toThrow(
+        /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+      );
+    });
+
+    it("regression: rejects misleading variable name when input originates from untrusted source", async () => {
+      const misleadingVarSource = `export function handleRequest(req: any) {
+  // Misleading variable name rawJson, but assigned from untrusted query
+  const rawJson = req.query.command;
+  return eval("(" + rawJson + ")");
+}`;
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        title: "Legacy wrapper with untrusted query",
+        filePath: "src/api-handler.ts",
+        startLine: 4,
+        endLine: 4,
+        redactedEvidence: '  return eval("(" + rawJson + ")");',
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-misleading-var",
+          commitSha: "sha-1",
+          sourceContent: misleadingVarSource,
+        })
+      ).rejects.toThrow(
+        /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+      );
+    });
+
+    it("regression: rejects conflicting data-flow evidence where cleanVar is reassigned", async () => {
+      const conflictingFlowSource = `export function processPayload(input: string) {
+  let data = '{"safe": true}';
+  if (input) {
+    data = input;
+  }
+  return eval("(" + data + ")");
+}`;
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        title: "Conflicting data flow reassignment",
+        filePath: "src/payload.ts",
+        startLine: 6,
+        endLine: 6,
+        redactedEvidence: '  return eval("(" + data + ")");',
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-conflicting-flow",
+          commitSha: "sha-1",
+          sourceContent: conflictingFlowSource,
+        })
+      ).rejects.toThrow(
+        /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+      );
+    });
+
+    it("regression: rejects ambiguous source context with no verifiable local assignment", async () => {
+      const ambiguousSource = `export function computeDynamic(ref: unknown) {
+  // Ambiguous: target variable has unknown external origin
+  return eval("(" + target + ")");
+}`;
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        title: "Ambiguous source context",
+        filePath: "src/ambiguous.ts",
+        startLine: 3,
+        endLine: 3,
+        redactedEvidence: '  return eval("(" + target + ")");',
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-ambiguous-ctx",
+          commitSha: "sha-1",
+          sourceContent: ambiguousSource,
+        })
+      ).rejects.toThrow(
+        /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+      );
     });
   });
 });
