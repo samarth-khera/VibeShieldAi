@@ -65,33 +65,6 @@ jobs:
         run: |
           osv-scanner scan source --download-offline-databases . || osv-scanner --download-offline-databases || true
 
-      - name: Cache Ollama Models
-        uses: actions/cache@v4
-        with:
-          path: ~/.ollama/models
-          key: ollama-qwen3.5-2b-v1
-
-      - name: Install and Start Ollama with Qwen3.5 2B
-        run: |
-          set -e
-          echo "Installing Ollama..."
-          curl -fsSL https://ollama.com/install.sh | sh
-
-          echo "Starting Ollama server in background..."
-          ollama serve &
-
-          echo "Waiting for Ollama to accept connections..."
-          for i in {1..30}; do
-            if curl -s http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              echo "Ollama is ready!"
-              break
-            fi
-            sleep 1
-          done
-
-          echo "Pulling local model qwen3.5:2b..."
-          ollama pull qwen3.5:2b
-
       - name: Install NPM Dependencies
         run: npm ci
 
@@ -107,6 +80,4 @@ jobs:
           REPOSITORY_URL: ${{ github.event.inputs.repository_url }}
           CALLBACK_URL: ${{ github.event.inputs.callback_url }}
           CALLBACK_SECRET: ${{ secrets.SCAN_CALLBACK_SECRET }}
-          OLLAMA_BASE_URL: 'http://127.0.0.1:11434'
-          OLLAMA_MODEL: 'qwen3.5:2b'
         run: npx tsx scripts/run-actions-worker.ts

@@ -7,6 +7,8 @@ import {
 } from "./types";
 import { AI_PROMPT_VERSION, SYSTEM_PROMPT, buildUserPrompt, computeContextHash } from "./prompts";
 import { getLlmProvider, type LlmProvider } from "./client";
+import { tripAiCircuitBreaker, recordAiRequest } from "./circuit-breaker";
+import { isQuotaExhaustedError } from "./gemini-provider";
 
 function extractJson(text: string): string {
   const trimmed = text.trim();
@@ -30,6 +32,7 @@ export async function explainFinding(
     provider?: LlmProvider;
     timeoutMs?: number;
     maxTokens?: number;
+    clientIpHash?: string;
   }
 ): Promise<AiExplainResult> {
   const finding: FindingRecord | null = await deps.store.getFinding(jobId, findingId).catch(() => null);
@@ -88,12 +91,25 @@ export async function explainFinding(
         Number.parseInt(process.env.OLLAMA_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || "120000", 10),
     });
   } catch (err: unknown) {
+    if (isQuotaExhaustedError(err)) {
+      await tripAiCircuitBreaker({
+        reason: "quota_exhausted",
+        message:
+          "AI Security Analyst is temporarily offline due to upstream daily quota limits. Security scanners remain fully operational.",
+      }).catch(() => undefined);
+      return {
+        available: false,
+        code: "quota_exhausted",
+        message:
+          "AI Security Analyst is temporarily unavailable due to upstream daily quota limits. Security scanner findings remain fully accessible.",
+      };
+    }
     const message = err instanceof Error ? err.message : String(err);
     if (message.includes("timed out") || message.includes("timeout")) {
       return {
         available: false,
         code: "timeout",
-        message: "The local AI analysis request timed out. Please try again.",
+        message: "The AI analysis request timed out. Please try again.",
       };
     }
     if (message.includes("not installed in Ollama") || message.includes("not found")) {
@@ -104,7 +120,7 @@ export async function explainFinding(
       };
     }
     if (
-      message.includes("Ollama service is unavailable") ||
+      message.includes("service is unavailable") ||
       message.includes("ECONNREFUSED") ||
       message.includes("Failed to fetch")
     ) {
@@ -112,13 +128,13 @@ export async function explainFinding(
         available: false,
         code: "service_unavailable",
         message:
-          "The local Ollama inference service is offline or unreachable. Scanner findings and static guidance remain accessible.",
+          "The AI inference service is temporarily offline or unreachable. Scanner findings and static guidance remain accessible.",
       };
     }
     return {
       available: false,
       code: "provider_error",
-      message: "The local AI provider encountered an issue analyzing this finding. Please retry shortly.",
+      message: "The AI provider encountered an issue analyzing this finding. Please retry shortly.",
     };
   }
 
@@ -161,6 +177,16 @@ export async function explainFinding(
     // Non-fatal: if caching fails, return the valid explanation to the client anyway
     console.error("Failed to persist AI explanation cache:", err);
   });
+
+  if (deps.clientIpHash) {
+    await recordAiRequest({
+      clientIpHash: deps.clientIpHash,
+      scanJobId: jobId,
+      findingId: finding.id,
+      action: "explain",
+      success: true,
+    }).catch(() => undefined);
+  }
 
   return {
     available: true,

@@ -16,6 +16,7 @@
     "postinstall": "prisma generate"
   },
   "dependencies": {
+    "@google/genai": "^2.31.0",
     "@prisma/client": "^6.19.3",
     "bullmq": "^6.4.1",
     "clsx": "^2.1.1",

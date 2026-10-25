@@ -5,7 +5,10 @@ import { log } from "./errors";
 import { JOB_ID_RE, MAX_ATTEMPTS, type JobStore } from "./job-store";
 import { clientKey, type RateLimitResult } from "./rate-limit";
 import { explainFinding } from "./ai/service";
-import type { LlmProvider } from "./ai/client";
+import { getLlmProvider, type LlmProvider } from "./ai/client";
+import { checkAiQuotaAndCircuitBreaker, type AiQuotaCheckResult } from "./ai/circuit-breaker";
+import { computeContextHash, AI_PROMPT_VERSION } from "./ai/prompts";
+import { AiExplanationSchema, type CachedAiExplanation } from "./ai/types";
 import { verifyTurnstileToken } from "./turnstile";
 
 export type ScanDeps = {
@@ -270,7 +273,9 @@ export async function explainScanFinding(
   deps: ScanDeps
 ): Promise<Response> {
   if (!JOB_ID_RE.test(id)) return fail(404, "not_found", "Scan job not found.");
-  if (!findingId || findingId.length > 50) return fail(400, "invalid_id", "Invalid finding identifier.");
+  if (!findingId || findingId.length > 50 || !/^[A-Za-z0-9_-]+$/.test(findingId)) {
+    return fail(400, "invalid_id", "Invalid finding identifier.");
+  }
 
   const job = await deps.store.get(id).catch(() => undefined);
   if (!job) return fail(404, "not_found", "Scan job not found.");
@@ -283,10 +288,55 @@ export async function explainScanFinding(
     });
   }
 
+  const finding = await deps.store.getFinding(id, findingId).catch(() => null);
+  if (!finding) return fail(404, "not_found", "Finding not found.");
+
+  const provider = deps.llmProvider || getLlmProvider();
+  const modelName = provider.getModelName();
+  const contextHash = computeContextHash(finding, AI_PROMPT_VERSION, modelName);
+  const cacheKey = `${finding.fingerprint}:${contextHash}:${AI_PROMPT_VERSION}:${modelName}`;
+
+  // 1. Return cached explanation immediately if available
+  const existingCache = finding.aiExplanation as CachedAiExplanation | undefined;
+  if (
+    existingCache &&
+    existingCache.cacheKey === cacheKey &&
+    existingCache.explanation
+  ) {
+    const parseResult = AiExplanationSchema.safeParse(existingCache.explanation);
+    if (parseResult.success) {
+      return ok({
+        available: true,
+        cached: true,
+        model: existingCache.model,
+        explanation: parseResult.data,
+        generatedAt: existingCache.generatedAt,
+      });
+    }
+  }
+
+  if (!provider.isConfigured()) {
+    return ok({
+      available: false,
+      code: "ai_not_configured",
+      message: "AI Security Analyst is currently unavailable or disabled on the server.",
+    });
+  }
+
+  // 2. Database-backed circuit breaker and atomic per-IP/global quota checks
+  const ipHash = clientKey(req.headers);
+  const quotaCheck: AiQuotaCheckResult = await checkAiQuotaAndCircuitBreaker(ipHash).catch(() => ({ allowed: true }));
+  if (!quotaCheck.allowed) {
+    return fail(429, quotaCheck.reason || "rate_limited", quotaCheck.message || "Too many AI analysis requests. Please wait before trying again.", {
+      "Retry-After": String(quotaCheck.retryAfterSeconds || 60),
+    });
+  }
+
   try {
     const result = await explainFinding(id, findingId, {
       store: deps.store,
-      provider: deps.llmProvider,
+      provider,
+      clientIpHash: ipHash,
     });
     return ok(result);
   } catch (err: unknown) {

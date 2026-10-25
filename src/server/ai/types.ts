@@ -46,6 +46,7 @@ export type AiExplainResult =
       available: false;
       code:
         | "ai_not_configured"
+        | "quota_exhausted"
         | "provider_error"
         | "rate_limited"
         | "invalid_response"

@@ -165,3 +165,30 @@ model Remediation {
   @@index([scanJobId])
   @@index([status])
 }
+
+/// Global Gemini circuit breaker persisted across serverless instances in PostgreSQL.
+model AiCircuitBreaker {
+  id                  String    @id @db.VarChar(32) // "global"
+  isOpen              Boolean   @default(false)
+  openedAt            DateTime?
+  reason              String?   @db.VarChar(50) // "quota_exhausted" | "rate_limited" | "api_error" | "manual"
+  message             String?   @db.VarChar(500)
+  cooldownUntil       DateTime?
+  consecutiveFailures Int       @default(0)
+  lastFailureAt       DateTime?
+  updatedAt           DateTime  @updatedAt
+}
+
+/// Atomic log of on-demand AI requests for enforcing per-IP and global daily quotas.
+model AiRequestLog {
+  id           String    @id @default(cuid()) @db.VarChar(36)
+  clientIpHash String    @db.VarChar(64)
+  scanJobId    String?   @db.VarChar(32)
+  findingId    String?   @db.VarChar(36)
+  action       String    @db.VarChar(30) // "explain" | "remediation"
+  success      Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+
+  @@index([clientIpHash, createdAt])
+  @@index([createdAt])
+}

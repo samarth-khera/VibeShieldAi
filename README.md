@@ -1,36 +1,53 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# VibeShield AI
 
-## Getting Started
+> **Zero-Cost, Multi-Scanner Public GitHub Repository Security Auditor & AI Remediation Engine**
+> Live at [https://vibeshield-ai-phi.vercel.app](https://vibeshield-ai-phi.vercel.app/)
 
-First, run the development server:
+## Key Capabilities
+
+1. **Real Security Scanners Running in Parallel**:
+   - **Gitleaks**: Secrets and credential scanning across files and git history.
+   - **Semgrep**: AST-based static application security testing (SAST) for insecure patterns and injection vulnerabilities.
+   - **OSV-Scanner**: Open Source Vulnerability scanner checking dependencies against Google's OSV database.
+2. **Scan Execution Independent of AI**:
+   - Scans run in an isolated ephemeral environment via GitHub Actions.
+   - Reports and findings are delivered and displayed as soon as the scanners finish (~10-20 seconds), without waiting for AI.
+3. **On-Demand AI Security Analyst (Google Gemini 2.5 Flash)**:
+   - Server-side explanations powered by the official `@google/genai` SDK.
+   - Strictly bounded finding context, zero repo archive uploads, robust prompt-injection defenses.
+   - Explanations are cached in PostgreSQL to eliminate duplicate AI calls.
+4. **Zero-Billing Guardrails & Circuit Breaker**:
+   - Designed for Google AI Studio Free Tier (₹0 billing).
+   - Atomic PostgreSQL quotas (per-IP hourly, per-IP daily, global daily cap).
+   - Automatic global circuit breaker trips on `429 RESOURCE_EXHAUSTED` to halt upstream requests and prevent retry storms.
+   - Administrative inspection and reset via `/api/admin/circuit-breaker`.
+5. **Approved AI Remediation & Sandbox Verification**:
+   - Surgical unified git diff generation with anti-traversal safety validation.
+   - Explicit human review and approval required before applying fixes.
+   - Isolated sandbox rescan verification to confirm vulnerability resolution without regressions.
+
+## Documentation
+- [Gemini Free-Tier Setup & Zero-Billing Guide](docs/gemini-setup.md)
+
+## Development
 
 ```bash
+# Install dependencies
+npm install
+
+# Run database migrations
+npm run db:migrate:dev
+
+# Run tests
+npm test
+
+# Run typecheck & linter
+npm run typecheck
+npm run lint
+
+# Start local Next.js dev server
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## License
+MIT

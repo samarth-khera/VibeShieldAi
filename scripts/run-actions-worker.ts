@@ -8,13 +8,7 @@ import { fetchCommitSha, fetchRepoMetadata, openArchive } from "../src/server/gi
 import { extractArchiveSafely } from "../src/server/archive";
 import { runSecurityScanEngine } from "../src/server/scanners/engine";
 import { redactText } from "../src/server/scanners/redact";
-import { OllamaProvider } from "../src/server/ai/client";
-import { SYSTEM_PROMPT, buildUserPrompt, computeContextHash, AI_PROMPT_VERSION } from "../src/server/ai/prompts";
-import { AiExplanationSchema } from "../src/server/ai/types";
-import { classifyRemediationEligibility } from "../src/server/remediation/eligibility";
-import { generateRemediationPatch } from "../src/server/remediation/patch";
 import { signCallbackPayload } from "../src/server/callback-auth";
-import { randomUUID } from "node:crypto";
 
 async function main() {
   const jobId = process.env.JOB_ID?.trim();
@@ -80,109 +74,10 @@ async function main() {
     console.log(`Scan completed with status: ${scanResult.status}`);
     console.log(`Findings count: ${scanResult.findings.length} (Critical: ${scanResult.counts.critical}, High: ${scanResult.counts.high}, Medium: ${scanResult.counts.medium}, Low: ${scanResult.counts.low}, Info: ${scanResult.counts.info})`);
 
-    // Local AI inference via Ollama
-    const ollamaUrl = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
-    const ollamaModel = process.env.OLLAMA_MODEL || "qwen3.5:2b";
-    let ollamaProvider: OllamaProvider | null = null;
-
-    try {
-      const pingRes = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
-      if (pingRes.ok) {
-        ollamaProvider = new OllamaProvider({
-          baseUrl: ollamaUrl,
-          modelName: ollamaModel,
-          timeoutMs: 45_000,
-          maxConcurrency: 1,
-        });
-        console.log(`Connected to local Ollama on ephemeral runner with model ${ollamaModel}.`);
-      }
-    } catch {
-      console.log("Local Ollama is not active or unavailable on this runner. Skipping precomputed AI explanations.");
-    }
-
-    const precomputedRemediations: Array<{
-      id: string;
-      findingFingerprints: string[];
-      commitSha: string;
-      patchSummary: string;
-      unifiedDiff: string;
-      affectedFiles: string[];
-      eligibility: "safe" | "potentially_breaking" | "unsuitable";
-      eligibilityReason: string;
-      requiresRotation: boolean;
-      warnings?: string[];
-    }> = [];
-
-    // Precompute explanations and fixes for high/critical findings (bounded to top 5)
-    if (ollamaProvider) {
-      const targetFindings = scanResult.findings
-        .filter((f) => f.severity === "critical" || f.severity === "high")
-        .slice(0, 5);
-
-      for (const finding of targetFindings) {
-        try {
-          console.log(`Generating local AI explanation for ${finding.ruleId} (${finding.filePath}:${finding.startLine})...`);
-          const userPrompt = buildUserPrompt(finding as never);
-          const rawExplanation = await ollamaProvider.generateText({
-            system: SYSTEM_PROMPT,
-            userPrompt,
-            format: "json",
-            maxTokens: 1000,
-            timeoutMs: 35_000,
-          });
-
-          let parsedExplanation;
-          try {
-            const cleaned = rawExplanation.trim().replace(/^```(?:json)?\n?/i, "").replace(/\n?```$/i, "").trim();
-            parsedExplanation = JSON.parse(cleaned);
-          } catch {
-            // Non-JSON fallback
-          }
-
-          if (parsedExplanation) {
-            const valid = AiExplanationSchema.safeParse(parsedExplanation);
-            if (valid.success) {
-              const contextHash = computeContextHash(finding as never, AI_PROMPT_VERSION, ollamaModel);
-              finding.aiExplanation = {
-                explanation: valid.data,
-                generatedAt: new Date().toISOString(),
-                model: ollamaModel,
-                promptVersion: AI_PROMPT_VERSION,
-                contextHash,
-                cacheKey: `${finding.fingerprint}:${contextHash}:${AI_PROMPT_VERSION}:${ollamaModel}`,
-              };
-            }
-          }
-
-          // Remediation preview if eligible
-          const eligibility = classifyRemediationEligibility(finding);
-          if (eligibility.canAutoFix) {
-            console.log(`Generating proposed remediation diff for ${finding.ruleId}...`);
-            const patchRes = await generateRemediationPatch({
-              finding: finding as never,
-              scanJobId: jobId,
-              commitSha,
-              llmProvider: ollamaProvider,
-            });
-
-            if (patchRes.unifiedDiff) {
-              precomputedRemediations.push({
-                id: randomUUID(),
-                findingFingerprints: [finding.fingerprint],
-                commitSha,
-                patchSummary: patchRes.patchSummary,
-                unifiedDiff: patchRes.unifiedDiff,
-                affectedFiles: patchRes.affectedFiles,
-                eligibility: eligibility.eligibility,
-                eligibilityReason: eligibility.reason,
-                requiresRotation: eligibility.requiresRotation,
-                warnings: eligibility.warnings,
-              });
-            }
-          }
-        } catch (aiErr) {
-          console.warn(`AI precomputation error for finding ${finding.fingerprint}:`, aiErr);
-        }
+    // Sanitize all findings before sending
+    for (const f of scanResult.findings) {
+      if (f.redactedEvidence) {
+        f.redactedEvidence = redactText(f.redactedEvidence);
       }
     }
 
@@ -221,7 +116,7 @@ async function main() {
 
       counts: scanResult.counts,
       findings: scanResult.findings,
-      remediations: precomputedRemediations,
+      remediations: [],
     };
 
     console.log("Signing payload and sending callback to Vercel control plane...");

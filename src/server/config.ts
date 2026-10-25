@@ -25,6 +25,18 @@ export type ServerConfig = {
   githubWorkflowRef: string;
   scanCallbackSecret?: string;
   appUrl: string;
+
+  // Gemini AI Free-Tier Guardrails & Circuit Breaker
+  geminiApiKey?: string;
+  geminiModel?: string;
+  aiGeminiEnabled?: boolean;
+  aiProvider?: string;
+  aiMaxRequestsPerIpHourly?: number;
+  aiMaxRequestsPerIpDaily?: number;
+  aiGlobalDailyCap?: number;
+  aiMaxTokens?: number;
+  aiCircuitBreakerCooldownHours?: number;
+  adminSecret?: string;
 };
 
 function int(name: string, fallback: number): number {
@@ -80,6 +92,18 @@ export function getConfig(): ServerConfig {
     githubWorkflowRef: process.env.GITHUB_WORKFLOW_REF?.trim() || "main",
     scanCallbackSecret: process.env.SCAN_CALLBACK_SECRET?.trim() || undefined,
     appUrl,
+
+    // Gemini AI Free-Tier Guardrails & Circuit Breaker
+    geminiApiKey: process.env.GEMINI_API_KEY?.trim() || undefined,
+    geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash",
+    aiGeminiEnabled: process.env.AI_GEMINI_ENABLED !== "false",
+    aiProvider: (process.env.AI_PROVIDER?.trim() || "gemini").toLowerCase(),
+    aiMaxRequestsPerIpHourly: int("AI_MAX_REQUESTS_PER_IP_HOURLY", 5),
+    aiMaxRequestsPerIpDaily: int("AI_MAX_REQUESTS_PER_IP_DAILY", 15),
+    aiGlobalDailyCap: int("AI_GLOBAL_DAILY_CAP", 50),
+    aiMaxTokens: int("AI_MAX_OUTPUT_TOKENS", 800),
+    aiCircuitBreakerCooldownHours: int("AI_CIRCUIT_BREAKER_COOLDOWN_HOURS", 24),
+    adminSecret: process.env.ADMIN_SECRET?.trim() || process.env.SCAN_CALLBACK_SECRET?.trim() || undefined,
   };
 }
 

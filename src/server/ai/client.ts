@@ -176,11 +176,19 @@ export class OllamaProvider implements LlmProvider {
   }
 }
 
+import { GeminiProvider } from "./gemini-provider";
+export { GeminiProvider } from "./gemini-provider";
+
 let defaultProvider: LlmProvider | null = null;
 
 export function getLlmProvider(): LlmProvider {
   if (!defaultProvider) {
-    defaultProvider = new OllamaProvider();
+    const providerType = (process.env.AI_PROVIDER || "gemini").toLowerCase();
+    if (providerType === "ollama") {
+      defaultProvider = new OllamaProvider();
+    } else {
+      defaultProvider = new GeminiProvider();
+    }
   }
   return defaultProvider;
 }
