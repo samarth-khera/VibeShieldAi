@@ -2,6 +2,7 @@ import { Prisma, PrismaClient } from "@prisma/client";
 import {
   newJobId,
   RETRYABLE_STATUSES,
+  type CreateJobWithQuotaResult,
   type FindingRecord,
   type FindingsFilter,
   type JobPatch,
@@ -57,6 +58,121 @@ export async function withDbRetry<T>(
 export const prismaJobStore: JobStore = {
   create: (data: NewJob) =>
     withDbRetry(() => prisma.scanJob.create({ data: { id: newJobId(), ...data } }) as Promise<JobRecord>),
+
+  async createWithQuota(data: NewJob, config, now = new Date()): Promise<CreateJobWithQuotaResult> {
+    return withDbRetry(async () => {
+      return await prisma.$transaction(
+        async (tx) => {
+          // Lock key: 84239105 (VibeShield scan creation mutex).
+          // PostgreSQL advisory xact lock provides transaction-scoped mutual exclusion
+          // across all web instances/connections without blocking concurrent SELECT queries on ScanJob.
+          const txAny = tx as unknown as { $executeRaw?: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown> };
+          if (typeof txAny.$executeRaw === "function") {
+            await txAny.$executeRaw`SELECT pg_advisory_xact_lock(84239105)`;
+          }
+
+          const activeThreshold = new Date(now.getTime() - config.jobTimeoutMs);
+          const oneHourAgo = new Date(now.getTime() - 3600_000);
+          const oneDayAgo = new Date(now.getTime() - 86400_000);
+
+          // 1. Active scan concurrency check (1 active scan at a time)
+          const activeCount = await tx.scanJob.count({
+            where: {
+              status: { in: ["queued", "retrieving", "ready_for_scan", "scanning"] },
+              createdAt: { gte: activeThreshold },
+            },
+          });
+
+          if (activeCount >= config.maxConcurrentHeavyScans) {
+            return {
+              ok: false,
+              rateLimit: {
+                allowed: false,
+                retryAfterSeconds: 60,
+                reason: "concurrency_limit" as const,
+                message:
+                  "A security scan is currently running. Free-tier quota allows 1 active scan at a time. Please retry in 1 minute.",
+              },
+            };
+          }
+
+          // 2. Per-IP hourly check
+          if (data.clientIpHash) {
+            const ipHourlyCount = await tx.scanJob.count({
+              where: {
+                clientIpHash: data.clientIpHash,
+                createdAt: { gte: oneHourAgo },
+              },
+            });
+
+            if (ipHourlyCount >= config.maxScansPerIpHourly) {
+              return {
+                ok: false,
+                rateLimit: {
+                  allowed: false,
+                  retryAfterSeconds: 1800,
+                  reason: "hourly_ip_limit" as const,
+                  message: `Free-tier quota: maximum ${config.maxScansPerIpHourly} scan submissions per client IP per hour reached.`,
+                },
+              };
+            }
+
+            // 3. Per-IP daily check
+            const ipDailyCount = await tx.scanJob.count({
+              where: {
+                clientIpHash: data.clientIpHash,
+                createdAt: { gte: oneDayAgo },
+              },
+            });
+
+            if (ipDailyCount >= config.maxScansPerIpDaily) {
+              return {
+                ok: false,
+                rateLimit: {
+                  allowed: false,
+                  retryAfterSeconds: 3600,
+                  reason: "daily_ip_limit" as const,
+                  message: `Free-tier quota: maximum ${config.maxScansPerIpDaily} scan submissions per client IP per day reached.`,
+                },
+              };
+            }
+          }
+
+          // 4. Global daily cap check
+          const globalDailyCount = await tx.scanJob.count({
+            where: {
+              createdAt: { gte: oneDayAgo },
+            },
+          });
+
+          if (globalDailyCount >= config.globalDailyScanCap) {
+            return {
+              ok: false,
+              rateLimit: {
+                allowed: false,
+                retryAfterSeconds: 7200,
+                reason: "global_daily_limit" as const,
+                message: `Global daily free-tier scan limit (${config.globalDailyScanCap} scans) reached. The queue resets in 24 hours.`,
+              },
+            };
+          }
+
+          // 5. Quota check passed: create scan job row atomically within this locked transaction
+          const id = newJobId();
+          const job = (await tx.scanJob.create({
+            data: { id, status: "queued", ...data },
+          })) as unknown as JobRecord;
+
+          return { ok: true, job };
+        },
+        {
+          timeout: 15000,
+          isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+        },
+      );
+    });
+  },
+
   get: (id) =>
     withDbRetry(() => prisma.scanJob.findUnique({ where: { id } }) as Promise<JobRecord | null>),
 

@@ -97,6 +97,27 @@ describe("Cloudflare Turnstile Abuse Protection", () => {
     expect(res.errorCodes).toContain("action-mismatch");
   });
 
+  it("rejects when action is missing but expected action is configured", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        success: true,
+        // action omitted
+      }),
+    });
+
+    const res = await verifyTurnstileToken({
+      token: "valid-token",
+      secretKey: "0x4AAAAAAtestsecret",
+      expectedAction: "scan_submit",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    expect(res.success).toBe(false);
+    expect(res.status).toBe("failed");
+    expect(res.errorCodes).toContain("missing-action");
+  });
+
   it("rejects when hostname mismatches configured expected hostname", async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
@@ -116,6 +137,58 @@ describe("Cloudflare Turnstile Abuse Protection", () => {
     expect(res.success).toBe(false);
     expect(res.status).toBe("failed");
     expect(res.errorCodes).toContain("hostname-mismatch");
+  });
+
+  it("rejects when hostname is missing but expected hostname is configured", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        success: true,
+        // hostname omitted
+      }),
+    });
+
+    const res = await verifyTurnstileToken({
+      token: "valid-token",
+      secretKey: "0x4AAAAAAtestsecret",
+      expectedHostname: "vibeshield.ai",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    expect(res.success).toBe(false);
+    expect(res.status).toBe("failed");
+    expect(res.errorCodes).toContain("missing-hostname");
+  });
+
+  it("fails closed with service_unavailable on Cloudflare HTTP 500 error", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+    });
+
+    const res = await verifyTurnstileToken({
+      token: "valid-token",
+      secretKey: "0x4AAAAAAtestsecret",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    expect(res.success).toBe(false);
+    expect(res.status).toBe("service_unavailable");
+    expect(res.errorCodes).toContain("http-500");
+  });
+
+  it("fails closed with service_unavailable on network or timeout error", async () => {
+    const mockFetch = vi.fn().mockRejectedValue(new Error("Connection reset"));
+
+    const res = await verifyTurnstileToken({
+      token: "valid-token",
+      secretKey: "0x4AAAAAAtestsecret",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    expect(res.success).toBe(false);
+    expect(res.status).toBe("service_unavailable");
+    expect(res.errorCodes).toContain("network-error");
   });
 
   it("rejects submitScan with 403 when Turnstile token verification fails", async () => {

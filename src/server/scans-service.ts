@@ -76,18 +76,48 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
 
   const now = (deps.now ?? (() => new Date()))();
   let job;
-  try {
-    job = await deps.store.create({
-      owner: parsed.owner,
-      repo: parsed.repo,
-      repositoryUrl: parsed.url,
-      clientIpHash: clientKey(req.headers),
-      expiresAt: new Date(now.getTime() + deps.config.jobTtlHours * 3600_000),
-    });
-  } catch (err) {
-    console.error("Job store create failed:", err);
-    log("error", "job_create_failed");
-    return fail(503, "service_unavailable", "The service is temporarily unavailable. Please try again shortly.");
+
+  if (deps.store.createWithQuota) {
+    let quotaRes;
+    try {
+      quotaRes = await deps.store.createWithQuota(
+        {
+          owner: parsed.owner,
+          repo: parsed.repo,
+          repositoryUrl: parsed.url,
+          clientIpHash: clientKey(req.headers),
+          expiresAt: new Date(now.getTime() + deps.config.jobTtlHours * 3600_000),
+        },
+        deps.config,
+        now,
+      );
+    } catch (err) {
+      console.error("Job store createWithQuota failed:", err);
+      log("error", "job_create_failed");
+      return fail(503, "service_unavailable", "The service is temporarily unavailable. Please try again shortly.");
+    }
+
+    if (!quotaRes.ok) {
+      const limit = quotaRes.rateLimit;
+      return fail(429, limit.reason || "rate_limited", limit.message || "Too many scan requests. Please wait before trying again.", {
+        "Retry-After": String(limit.retryAfterSeconds),
+      });
+    }
+    job = quotaRes.job;
+  } else {
+    try {
+      job = await deps.store.create({
+        owner: parsed.owner,
+        repo: parsed.repo,
+        repositoryUrl: parsed.url,
+        clientIpHash: clientKey(req.headers),
+        expiresAt: new Date(now.getTime() + deps.config.jobTtlHours * 3600_000),
+      });
+    } catch (err) {
+      console.error("Job store create failed:", err);
+      log("error", "job_create_failed");
+      return fail(503, "service_unavailable", "The service is temporarily unavailable. Please try again shortly.");
+    }
   }
 
   try {

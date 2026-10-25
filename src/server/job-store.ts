@@ -88,9 +88,21 @@ export type FindingsFilter = {
   offset?: number;
 };
 
+export type CreateJobWithQuotaResult =
+  | { ok: true; job: JobRecord }
+  | { ok: false; rateLimit: import("./rate-limit").RateLimitResult };
+
 /** Persistence port. Implemented by Prisma in production and in-memory in tests. */
 export interface JobStore {
   create(data: NewJob): Promise<JobRecord>;
+  createWithQuota?(
+    data: NewJob,
+    config: Pick<
+      import("./config").ServerConfig,
+      "maxScansPerIpHourly" | "maxScansPerIpDaily" | "globalDailyScanCap" | "maxConcurrentHeavyScans" | "jobTimeoutMs"
+    >,
+    now?: Date,
+  ): Promise<CreateJobWithQuotaResult>;
   get(id: string): Promise<JobRecord | null>;
   /** Atomically moves queued (or a stale `retrieving`) job to `retrieving`. Returns false if not claimable. */
   claim(id: string, staleBefore: Date): Promise<boolean>;

@@ -1,9 +1,120 @@
-import { newJobId, type JobRecord, type JobStore, type NewJob, type JobPatch, type FindingRecord } from "@/server/job-store";
+import {
+  newJobId,
+  type JobRecord,
+  type JobStore,
+  type NewJob,
+  type JobPatch,
+  type FindingRecord,
+  type CreateJobWithQuotaResult,
+} from "@/server/job-store";
 import type { NormalizedFinding } from "@/server/scanners/types";
+import type { ServerConfig } from "@/server/config";
 
 export class InMemoryJobStore implements JobStore {
   private jobs = new Map<string, JobRecord>();
   private findings = new Map<string, FindingRecord[]>();
+  private mutex = Promise.resolve();
+
+  async createWithQuota(
+    data: NewJob,
+    config: Pick<
+      ServerConfig,
+      "maxScansPerIpHourly" | "maxScansPerIpDaily" | "globalDailyScanCap" | "maxConcurrentHeavyScans" | "jobTimeoutMs"
+    >,
+    now: Date = new Date(),
+  ): Promise<CreateJobWithQuotaResult> {
+    let release: () => void;
+    const nextMutex = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const currentMutex = this.mutex;
+    this.mutex = nextMutex;
+
+    await currentMutex;
+    try {
+      const activeThreshold = new Date(now.getTime() - config.jobTimeoutMs);
+      const oneHourAgo = new Date(now.getTime() - 3600_000);
+      const oneDayAgo = new Date(now.getTime() - 86400_000);
+
+      let activeCount = 0;
+      let ipHourlyCount = 0;
+      let ipDailyCount = 0;
+      let globalDailyCount = 0;
+
+      for (const job of this.jobs.values()) {
+        const createdAt = job.createdAt;
+        if (
+          ["queued", "retrieving", "ready_for_scan", "scanning"].includes(job.status) &&
+          createdAt >= activeThreshold
+        ) {
+          activeCount++;
+        }
+        if (createdAt >= oneDayAgo) {
+          globalDailyCount++;
+          if (data.clientIpHash && job.clientIpHash === data.clientIpHash) {
+            ipDailyCount++;
+            if (createdAt >= oneHourAgo) {
+              ipHourlyCount++;
+            }
+          }
+        }
+      }
+
+      if (activeCount >= config.maxConcurrentHeavyScans) {
+        return {
+          ok: false,
+          rateLimit: {
+            allowed: false,
+            retryAfterSeconds: 60,
+            reason: "concurrency_limit",
+            message:
+              "A security scan is currently running. Free-tier quota allows 1 active scan at a time. Please retry in 1 minute.",
+          },
+        };
+      }
+
+      if (data.clientIpHash && ipHourlyCount >= config.maxScansPerIpHourly) {
+        return {
+          ok: false,
+          rateLimit: {
+            allowed: false,
+            retryAfterSeconds: 1800,
+            reason: "hourly_ip_limit",
+            message: `Free-tier quota: maximum ${config.maxScansPerIpHourly} scan submissions per client IP per hour reached.`,
+          },
+        };
+      }
+
+      if (data.clientIpHash && ipDailyCount >= config.maxScansPerIpDaily) {
+        return {
+          ok: false,
+          rateLimit: {
+            allowed: false,
+            retryAfterSeconds: 3600,
+            reason: "daily_ip_limit",
+            message: `Free-tier quota: maximum ${config.maxScansPerIpDaily} scan submissions per client IP per day reached.`,
+          },
+        };
+      }
+
+      if (globalDailyCount >= config.globalDailyScanCap) {
+        return {
+          ok: false,
+          rateLimit: {
+            allowed: false,
+            retryAfterSeconds: 7200,
+            reason: "global_daily_limit",
+            message: `Global daily free-tier scan limit (${config.globalDailyScanCap} scans) reached. The queue resets in 24 hours.`,
+          },
+        };
+      }
+
+      const job = await this.create(data);
+      return { ok: true, job };
+    } finally {
+      release!();
+    }
+  }
 
   async create(data: NewJob): Promise<JobRecord> {
     const id = newJobId();

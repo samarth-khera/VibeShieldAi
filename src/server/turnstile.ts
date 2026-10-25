@@ -115,24 +115,32 @@ export async function verifyTurnstileToken(params: VerifyTurnstileParams): Promi
       };
     }
 
-    // Validate expected action if specified
-    if (expectedAction && data.action && data.action !== expectedAction) {
-      return {
-        success: false,
-        status: "failed",
-        message: "Security verification action mismatch.",
-        errorCodes: ["action-mismatch"],
-      };
+    // Validate expected action if specified (require exact equality; reject missing or mismatched)
+    if (expectedAction) {
+      if (!data.action || data.action !== expectedAction) {
+        return {
+          success: false,
+          status: "failed",
+          message: !data.action
+            ? "Security verification action missing."
+            : "Security verification action mismatch.",
+          errorCodes: [!data.action ? "missing-action" : "action-mismatch"],
+        };
+      }
     }
 
-    // Validate expected hostname if specified
-    if (expectedHostname && data.hostname && data.hostname.toLowerCase() !== expectedHostname.toLowerCase()) {
-      return {
-        success: false,
-        status: "failed",
-        message: "Security verification hostname mismatch.",
-        errorCodes: ["hostname-mismatch"],
-      };
+    // Validate expected hostname if specified (require exact equality; reject missing or mismatched)
+    if (expectedHostname) {
+      if (!data.hostname || data.hostname.toLowerCase() !== expectedHostname.toLowerCase()) {
+        return {
+          success: false,
+          status: "failed",
+          message: !data.hostname
+            ? "Security verification hostname missing."
+            : "Security verification hostname mismatch.",
+          errorCodes: [!data.hostname ? "missing-hostname" : "hostname-mismatch"],
+        };
+      }
     }
 
     return {
