@@ -1,0 +1,109 @@
+name: VibeShield Security Scanner Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'VibeShield Scan Job ID'
+        required: true
+        type: string
+      repository_url:
+        description: 'Public GitHub repository URL to scan'
+        required: true
+        type: string
+      callback_url:
+        description: 'Signed results callback endpoint'
+        required: true
+        type: string
+
+# Free-tier concurrency limit (Rule 8: 1 active scan at a time)
+concurrency:
+  group: vibeshield-scanner-worker
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Execute Security Scan & Local AI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout VibeShield AI
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Set up Python for Semgrep
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Scanner Binaries (Gitleaks, Semgrep, OSV-Scanner)
+        run: |
+          set -e
+          echo "Installing Gitleaks..."
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz | sudo tar -xz -C /usr/local/bin gitleaks
+          sudo chmod +x /usr/local/bin/gitleaks
+
+          echo "Installing Semgrep..."
+          pip install --no-cache-dir semgrep
+
+          echo "Installing OSV-Scanner..."
+          sudo curl -sSL https://github.com/google/osv-scanner/releases/download/v1.7.0/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          sudo chmod +x /usr/local/bin/osv-scanner
+
+          echo "Verifying scanner versions:"
+          gitleaks version
+          semgrep --version
+          osv-scanner --version
+
+      - name: Pre-cache OSV Vulnerability Database
+        run: |
+          osv-scanner --download-offline-databases || true
+
+      - name: Cache Ollama Models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-qwen3.5-2b-v1
+
+      - name: Install and Start Ollama with Qwen3.5 2B
+        run: |
+          set -e
+          echo "Installing Ollama..."
+          curl -fsSL https://ollama.com/install.sh | sh
+
+          echo "Starting Ollama server in background..."
+          ollama serve &
+
+          echo "Waiting for Ollama to accept connections..."
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              echo "Ollama is ready!"
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Pulling local model qwen3.5:2b..."
+          ollama pull qwen3.5:2b
+
+      - name: Install NPM Dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Execute Scanner Worker Pipeline
+        env:
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          REPOSITORY_URL: ${{ github.event.inputs.repository_url }}
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          CALLBACK_SECRET: ${{ secrets.SCAN_CALLBACK_SECRET }}
+          OLLAMA_BASE_URL: 'http://127.0.0.1:11434'
+          OLLAMA_MODEL: 'qwen3.5:2b'
+        run: npx tsx scripts/run-actions-worker.ts

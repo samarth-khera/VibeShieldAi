@@ -24,6 +24,7 @@ export type NormalizedFinding = {
     ecosystem?: string;
   } | null;
   metadata?: Record<string, unknown> | null;
+  aiExplanation?: unknown;
 };
 
 export type ScannerStatus = "completed" | "failed" | "skipped";

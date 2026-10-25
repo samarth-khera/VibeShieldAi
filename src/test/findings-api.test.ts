@@ -60,6 +60,9 @@ class TestJobStore implements JobStore {
       updatedAt: new Date(),
       startedAt: null,
       completedAt: null,
+      clientIpHash: null,
+      workflowRunId: null,
+      workflowRunUrl: null,
       expiresAt: data.expiresAt,
     };
     this.jobs.set(id, record);

@@ -73,6 +73,10 @@ model ScanJob {
   findings           Finding[]
   remediations       Remediation[]
 
+  clientIpHash    String?    @db.VarChar(64)
+  workflowRunId   String?    @db.VarChar(100)
+  workflowRunUrl  String?    @db.VarChar(300)
+
   attempts        Int        @default(0)
   createdAt       DateTime   @default(now())
   updatedAt       DateTime   @updatedAt
@@ -85,6 +89,7 @@ model ScanJob {
   @@index([expiresAt])
   @@index([owner, repo])
   @@index([createdAt])
+  @@index([clientIpHash, createdAt])
 }
 
 model Finding {

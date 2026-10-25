@@ -46,6 +46,9 @@ class InMemoryJobStore implements JobStore {
       updatedAt: new Date(),
       startedAt: null,
       completedAt: null,
+      clientIpHash: null,
+      workflowRunId: null,
+      workflowRunUrl: null,
       expiresAt: data.expiresAt,
     };
     this.jobs.set(id, record);
@@ -134,6 +137,15 @@ describe("scans-service API logic", () => {
       rateLimitWindowSeconds: 3600,
       workerConcurrency: 2,
       jobTtlHours: 24,
+      maxScansPerIpHourly: 3,
+      maxScansPerIpDaily: 5,
+      globalDailyScanCap: 20,
+      maxConcurrentHeavyScans: 1,
+      jobTimeoutMs: 900_000,
+      scanDispatchBackend: "bullmq",
+      githubRepository: "samarth-khera/VibeShieldAi",
+      githubWorkflowRef: "main",
+      appUrl: "http://localhost:3000",
     };
     deps = {
       store,

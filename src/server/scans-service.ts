@@ -3,7 +3,7 @@ import type { ServerConfig } from "./config";
 import { fail, ok, toPublicFinding, toPublicJob } from "./api";
 import { log } from "./errors";
 import { JOB_ID_RE, MAX_ATTEMPTS, type JobStore } from "./job-store";
-import type { RateLimitResult } from "./rate-limit";
+import { clientKey, type RateLimitResult } from "./rate-limit";
 import { explainFinding } from "./ai/service";
 import type { LlmProvider } from "./ai/client";
 import { verifyTurnstileToken } from "./turnstile";
@@ -11,12 +11,13 @@ import { verifyTurnstileToken } from "./turnstile";
 export type ScanDeps = {
   store: JobStore;
   config: ServerConfig;
-  enqueue: (jobId: string, attempt: number) => Promise<void>;
+  enqueue: (jobId: string, attempt: number, repoUrl?: string) => Promise<void>;
   rateLimit: (headers: Headers) => Promise<RateLimitResult>;
   workerOnline: () => Promise<boolean>;
   now?: () => Date;
   llmProvider?: LlmProvider;
   verifyTurnstile?: typeof verifyTurnstileToken;
+  verifyRepo?: (owner: string, repo: string) => Promise<{ ok: boolean; code?: string; error?: string }>;
 };
 
 const MAX_BODY_BYTES = 2048;
@@ -37,7 +38,7 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
     return fail(503, "service_unavailable", "The service is temporarily unavailable. Please try again shortly.");
   }
   if (!limit.allowed) {
-    return fail(429, "rate_limited", "Too many scan requests. Please wait before trying again.", {
+    return fail(429, limit.reason || "rate_limited", limit.message || "Too many scan requests. Please wait before trying again.", {
       "Retry-After": String(limit.retryAfterSeconds),
     });
   }
@@ -65,6 +66,14 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
     return fail(403, "turnstile_verification_failed", turnstileResult.message);
   }
 
+  // Pre-validate public repository accessibility if verifier provided
+  if (deps.verifyRepo) {
+    const repoCheck = await deps.verifyRepo(parsed.owner, parsed.repo);
+    if (!repoCheck.ok) {
+      return fail(400, repoCheck.code || "invalid_repository", repoCheck.error || "Repository is not accessible.");
+    }
+  }
+
   const now = (deps.now ?? (() => new Date()))();
   let job;
   try {
@@ -72,6 +81,7 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
       owner: parsed.owner,
       repo: parsed.repo,
       repositoryUrl: parsed.url,
+      clientIpHash: clientKey(req.headers),
       expiresAt: new Date(now.getTime() + deps.config.jobTtlHours * 3600_000),
     });
   } catch (err) {
@@ -81,7 +91,7 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
   }
 
   try {
-    await deps.enqueue(job.id, 0);
+    await deps.enqueue(job.id, 0, parsed.url);
   } catch {
     // Nothing was queued: remove the orphan row so no job is left pretending to be pending.
     await deps.store

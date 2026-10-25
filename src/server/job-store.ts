@@ -63,6 +63,9 @@ export type JobRecord = {
   mediumCount: number;
   lowCount: number;
   infoCount: number;
+  clientIpHash: string | null;
+  workflowRunId: string | null;
+  workflowRunUrl: string | null;
 
   attempts: number;
   createdAt: Date;
@@ -72,7 +75,9 @@ export type JobRecord = {
   expiresAt: Date;
 };
 
-export type NewJob = Pick<JobRecord, "owner" | "repo" | "repositoryUrl" | "expiresAt">;
+export type NewJob = Pick<JobRecord, "owner" | "repo" | "repositoryUrl" | "expiresAt"> & {
+  clientIpHash?: string | null;
+};
 export type JobPatch = Partial<Omit<JobRecord, "id" | "createdAt" | "updatedAt">>;
 
 export type FindingsFilter = {
