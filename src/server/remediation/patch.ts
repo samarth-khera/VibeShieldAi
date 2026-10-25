@@ -193,9 +193,25 @@ Generate a minimal, exact unified diff applying the fix for ${cleanFile}.`;
   const evidence = (finding.redactedEvidence || "").trimEnd();
   const rule = (finding.ruleId || "").toLowerCase();
 
-  // Pattern A: eval() to JSON.parse()
+  // Pattern A: eval() to JSON.parse() ONLY when evidence/remediation/context confirms data parsing
   if (evidence && (rule.includes("eval") || rule.includes("code-execution"))) {
     if (/\beval\s*\(/.test(evidence)) {
+      // Reject generic replacement where arbitrary JavaScript execution semantics must be preserved
+      const isArbitraryScriptExecution =
+        /\beval\s*\(\s*(?:script|code|js|program|command|func|snippet)\b/i.test(evidence) ||
+        /\b(?:script|runtime|function|arbitrary code)\b/i.test(finding.description || "");
+
+      const hasExplicitDataParsingContext =
+        /json|parse|payload|body|data|input|expr|value|str/i.test(evidence) ||
+        /json|parse/i.test(finding.title || "") ||
+        /json\.parse/i.test(finding.remediation || "");
+
+      if (isArbitraryScriptExecution && !hasExplicitDataParsingContext) {
+        throw new Error(
+          `Cannot safely replace eval() with JSON.parse() where arbitrary JavaScript execution semantics must be preserved for ${finding.ruleId}. Manual code review is required.`
+        );
+      }
+
       const securedEvidence = evidence.replace(/\beval\s*\(([^)]+)\)/g, "JSON.parse($1)");
       if (securedEvidence !== evidence) {
         const start = finding.startLine ?? 1;

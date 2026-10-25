@@ -627,6 +627,28 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       ).rejects.toThrow(/Cannot generate automated patch.*Manual code review is required/);
     });
 
+    it("rejects generic eval() replacement when arbitrary JavaScript execution semantics must be preserved", async () => {
+      const arbitraryScriptFinding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "js-code-execution-eval",
+        category: "Code Analysis",
+        severity: "critical",
+        title: "Dynamic code execution",
+        filePath: "src/runner.ts",
+        description: "Executes arbitrary script passed by user",
+        redactedEvidence: "  return eval(script);",
+        remediation: "Avoid dynamic execution of arbitrary script.",
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding: arbitraryScriptFinding,
+          scanJobId: "job-1",
+          commitSha: "sha-1",
+        })
+      ).rejects.toThrow(/Cannot safely replace eval\(\) with JSON\.parse\(\) where arbitrary JavaScript execution semantics must be preserved/);
+    });
+
     it("marks remediation as needs_review if rescan still detects the targeted finding", async () => {
       const store = new InMemoryJobStore();
       const job = await store.create({
