@@ -45,7 +45,7 @@ export async function explainFinding(
       available: false,
       code: "ai_not_configured",
       message:
-        "AI Security Analyst is currently unavailable because ANTHROPIC_API_KEY is not configured on the server.",
+        "Local AI Security Analyst is currently unavailable or disabled on the server.",
     };
   }
 
@@ -79,8 +79,13 @@ export async function explainFinding(
     rawText = await provider.generateText({
       system: SYSTEM_PROMPT,
       userPrompt,
-      maxTokens: deps.maxTokens ?? 1500,
-      timeoutMs: deps.timeoutMs ?? 25000,
+      format: "json",
+      maxTokens:
+        deps.maxTokens ??
+        Number.parseInt(process.env.AI_MAX_OUTPUT_TOKENS || "800", 10),
+      timeoutMs:
+        deps.timeoutMs ??
+        Number.parseInt(process.env.OLLAMA_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || "120000", 10),
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
@@ -88,13 +93,32 @@ export async function explainFinding(
       return {
         available: false,
         code: "timeout",
-        message: "The AI analysis request timed out. Please try again.",
+        message: "The local AI analysis request timed out. Please try again.",
+      };
+    }
+    if (message.includes("not installed in Ollama") || message.includes("not found")) {
+      return {
+        available: false,
+        code: "model_missing",
+        message: `The configured local model is not installed in Ollama (${provider.getModelName()}). Please pull the model on the host.`,
+      };
+    }
+    if (
+      message.includes("Ollama service is unavailable") ||
+      message.includes("ECONNREFUSED") ||
+      message.includes("Failed to fetch")
+    ) {
+      return {
+        available: false,
+        code: "service_unavailable",
+        message:
+          "The local Ollama inference service is offline or unreachable. Scanner findings and static guidance remain accessible.",
       };
     }
     return {
       available: false,
       code: "provider_error",
-      message: "The AI provider encountered an issue analyzing this finding. Please retry shortly.",
+      message: "The local AI provider encountered an issue analyzing this finding. Please retry shortly.",
     };
   }
 

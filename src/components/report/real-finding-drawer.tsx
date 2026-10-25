@@ -62,7 +62,7 @@ export function RealFindingDrawer({
         ? {
             explanation: finding.aiExplanation.explanation,
             isCached: true,
-            model: finding.aiExplanation.model || "claude-3-5-sonnet-latest",
+            model: finding.aiExplanation.model || "qwen3.5:4b-q4_K_M",
           }
         : null)
     : null;
@@ -261,7 +261,7 @@ export function RealFindingDrawer({
             {isExplaining && (
               <div className="mt-4 flex flex-col items-center justify-center rounded-lg border border-line bg-background/50 py-8 text-center">
                 <RefreshCw className="size-6 animate-spin text-accent" />
-                <p className="mt-3 text-xs font-medium text-foreground">Analyzing finding with Claude 3.5...</p>
+                <p className="mt-3 text-xs font-medium text-foreground">Analyzing finding with local AI (Qwen 3.5)...</p>
                 <p className="mt-1 text-[11px] text-muted">
                   Grounding guidance in scanner evidence and evaluating exploitability prerequisites.
                 </p>
@@ -274,9 +274,9 @@ export function RealFindingDrawer({
                 <div className="flex items-start gap-3">
                   <HelpCircle className="size-5 shrink-0 text-muted" />
                   <div>
-                    <h4 className="text-xs font-semibold text-foreground">AI Analyst Not Configured</h4>
+                    <h4 className="text-xs font-semibold text-foreground">Local AI Unavailable</h4>
                     <p className="mt-1 text-xs leading-relaxed text-muted">
-                      The server is running without an <code className="rounded bg-surface px-1 py-0.5 text-accent">ANTHROPIC_API_KEY</code>.
+                      Local AI inference via Ollama is currently offline or disabled on the server.
                       Automated scanner findings and static remediation remain fully accessible below.
                     </p>
                   </div>
@@ -308,7 +308,7 @@ export function RealFindingDrawer({
                 {/* Meta header (model & cache badge) */}
                 <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-muted">
                   <span className="flex items-center gap-1.5">
-                    <Terminal className="size-3 text-accent" /> {modelUsed || "claude-3-5-sonnet-latest"}
+                    <Terminal className="size-3 text-accent" /> {modelUsed || "qwen3.5:4b-q4_K_M"}
                   </span>
                   {isCached && (
                     <span className="inline-flex items-center gap-1 rounded bg-accent/10 px-2 py-0.5 text-accent font-semibold">

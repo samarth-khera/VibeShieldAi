@@ -16,7 +16,6 @@
     "postinstall": "prisma generate"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^1.3.0",
     "@prisma/client": "^6.19.3",
     "bullmq": "^6.4.1",
     "clsx": "^2.1.1",

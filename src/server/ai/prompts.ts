@@ -14,6 +14,7 @@ CRITICAL SECURITY & SAFETY RULES:
 4. UNTESTED PATCHES: Clearly explain that any suggested code examples or patches are illustrative and must be tested by the developer.
 5. GROUNDING: Clearly distinguish between confirmed facts from scanner evidence and potential impact or assumptions.
 6. FORMAT: You must output ONLY valid, well-formed JSON matching the required schema. Do not enclose in markdown code blocks or add introductory text outside the JSON object.
+7. CONCISENESS: Keep explanations focused and direct (1-2 clear sentences per field, maximum 3 bullet points per array). Avoid conversational filler to ensure fast, deterministic response generation.
 
 REQUIRED JSON OUTPUT SCHEMA:
 {

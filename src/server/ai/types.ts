@@ -44,6 +44,13 @@ export type AiExplainResult =
     }
   | {
       available: false;
-      code: "ai_not_configured" | "provider_error" | "rate_limited" | "invalid_response" | "timeout";
+      code:
+        | "ai_not_configured"
+        | "provider_error"
+        | "rate_limited"
+        | "invalid_response"
+        | "timeout"
+        | "model_missing"
+        | "service_unavailable";
       message: string;
     };

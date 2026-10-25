@@ -166,7 +166,7 @@ Generate a minimal, exact unified diff applying the fix for ${cleanFile}.`;
         system: systemPrompt,
         userPrompt,
         maxTokens: 1000,
-        timeoutMs: 20000,
+        timeoutMs: Number.parseInt(process.env.OLLAMA_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || "120000", 10),
       });
 
       // Extract unified diff lines from response

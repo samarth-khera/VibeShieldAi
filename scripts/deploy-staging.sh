@@ -64,9 +64,9 @@ done
 echo "Step 4/5: Running Prisma database migrations in container..."
 docker compose -f "${COMPOSE_FILE}" run --rm --no-deps web npx prisma migrate deploy
 
-# 6. Start web, worker, and caddy HTTPS ingress
-echo "Step 5/5: Starting web, background worker, and Caddy HTTPS ingress..."
-docker compose -f "${COMPOSE_FILE}" up -d web worker caddy
+# 6. Start web, worker, ollama, and caddy HTTPS ingress
+echo "Step 5/5: Starting web, background worker, local Ollama, and Caddy HTTPS ingress..."
+docker compose -f "${COMPOSE_FILE}" up -d web worker ollama caddy
 
 # 7. Post-deployment health verification
 echo "Verifying service health..."

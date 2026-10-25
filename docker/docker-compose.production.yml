@@ -34,6 +34,12 @@ services:
       - NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}
       - TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY}
       - TURNSTILE_REQUIRED=true
+      - AI_PROVIDER=ollama
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen3.5:4b-q4_K_M
+      - OLLAMA_NUM_CTX=8192
+      - OLLAMA_TIMEOUT_MS=120000
+      - AI_MAX_CONCURRENCY=1
     networks:
       - frontend
       - backend
@@ -63,8 +69,12 @@ services:
       - NODE_ENV=production
       - DATABASE_URL=postgresql://vibeshield:${POSTGRES_PASSWORD}@postgres:5432/vibeshield?schema=public
       - REDIS_URL=redis://redis:6379
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-5-5}
+      - AI_PROVIDER=ollama
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen3.5:4b-q4_K_M
+      - OLLAMA_NUM_CTX=8192
+      - OLLAMA_TIMEOUT_MS=120000
+      - AI_MAX_CONCURRENCY=1
       - OSV_OFFLINE=true
     networks:
       - backend
@@ -87,6 +97,31 @@ services:
           cpus: '2.0'
           memory: 1024M
           pids: 200
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4096M
 
   postgres:
     image: postgres:16-alpine
@@ -128,10 +163,11 @@ networks:
     driver: bridge
   backend:
     driver: bridge
-    internal: true # No direct internet routing for database or redis
+    internal: true # No direct internet routing for database, redis, or ollama
 
 volumes:
   pgdata:
   redisdata:
   caddy_data:
   caddy_config:
+  ollama_models:

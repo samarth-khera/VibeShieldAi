@@ -40,3 +40,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local model cache & runtime workspaces
+.ollama/
+models/
+*.gguf
+*.bin

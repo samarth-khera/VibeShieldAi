@@ -16,13 +16,13 @@ export function getScanDeps(): ScanDeps {
   };
 }
 
-import { AnthropicProvider } from "./ai/client";
+import { getLlmProvider } from "./ai/client";
 import type { RemediationDeps } from "./remediation/service";
 
 export function getRemediationDeps(): RemediationDeps {
   return {
     store: prismaJobStore,
-    llmProvider: new AnthropicProvider(),
+    llmProvider: getLlmProvider(),
     fetchImpl: fetch,
   };
 }

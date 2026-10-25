@@ -221,7 +221,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       mockLlm = {
         isConfigured: () => true,
-        getModelName: () => "claude-3-5-sonnet-latest",
+        getModelName: () => "qwen3.5:4b-q4_K_M",
         async generateText() {
           return `\`\`\`diff
 --- a/src/middleware.ts

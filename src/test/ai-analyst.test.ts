@@ -4,7 +4,7 @@ import type { FindingRecord } from "../server/job-store";
 import type { NormalizedFinding } from "../server/scanners/types";
 import { explainFinding } from "../server/ai/service";
 import { explainScanFinding, type ScanDeps } from "../server/scans-service";
-import type { LlmProvider, LlmMessageParams } from "../server/ai/client";
+import { type LlmProvider, type LlmMessageParams, OllamaProvider } from "../server/ai/client";
 import { buildUserPrompt } from "../server/ai/prompts";
 
 class MockJobStore implements JobStore {
@@ -134,12 +134,14 @@ class MockJobStore implements JobStore {
 
 class MockLlmProvider implements LlmProvider {
   public configured = true;
-  public model = "claude-3-5-sonnet-latest";
+  public model = "qwen3.5:4b-q4_K_M";
   public callCount = 0;
   public lastParams: LlmMessageParams | null = null;
   public responseText: string | null = null;
   public shouldTimeout = false;
   public shouldFail = false;
+  public shouldBeMissingModel = false;
+  public shouldBeServiceUnavailable = false;
 
   isConfigured(): boolean {
     return this.configured;
@@ -154,10 +156,16 @@ class MockLlmProvider implements LlmProvider {
     this.lastParams = params;
 
     if (this.shouldTimeout) {
-      throw new Error("AI provider request timed out.");
+      throw new Error("Local AI inference request timed out after 25000ms.");
+    }
+    if (this.shouldBeMissingModel) {
+      throw new Error(`Local model '${this.model}' is not installed in Ollama. Pull it using: ollama pull ${this.model}`);
+    }
+    if (this.shouldBeServiceUnavailable) {
+      throw new Error("Local Ollama service is unavailable at http://localhost:11434. Ensure the Ollama service is running. (connect ECONNREFUSED 127.0.0.1:11434)");
     }
     if (this.shouldFail) {
-      throw new Error("Anthropic API rate limit exceeded");
+      throw new Error("Local Ollama inference failed unexpectedly");
     }
 
     if (this.responseText !== null) {
@@ -350,8 +358,8 @@ describe("AI Security Analyst (Phase 4)", () => {
       await explainFinding(testJobId, "find-eval", { store, provider });
       expect(provider.callCount).toBe(1);
 
-      // Now change the provider model
-      provider.model = "claude-3-5-haiku-latest";
+      // Now change the provider model (e.g. to smaller Qwen 2B model)
+      provider.model = "qwen3.5:2b-q4_K_M";
 
       const refreshed = await explainFinding(testJobId, "find-eval", { store, provider });
       expect(refreshed.available).toBe(true);
@@ -404,9 +412,32 @@ describe("AI Security Analyst (Phase 4)", () => {
       expect(result.available).toBe(false);
       if (!result.available) {
         expect(result.code).toBe("ai_not_configured");
-        expect(result.message).toContain("ANTHROPIC_API_KEY");
+        expect(result.message).toContain("Local AI Security Analyst is currently unavailable");
       }
       expect(provider.callCount).toBe(0);
+    });
+
+    it("handles local model missing gracefully with actionable instructions", async () => {
+      provider.shouldBeMissingModel = true;
+
+      const result = await explainFinding(testJobId, "find-eval", { store, provider });
+      expect(result.available).toBe(false);
+      if (!result.available) {
+        expect(result.code).toBe("model_missing");
+        expect(result.message).toContain("is not installed in Ollama");
+        expect(result.message).toContain("qwen3.5:4b-q4_K_M");
+      }
+    });
+
+    it("handles local Ollama service offline or unreachable gracefully", async () => {
+      provider.shouldBeServiceUnavailable = true;
+
+      const result = await explainFinding(testJobId, "find-eval", { store, provider });
+      expect(result.available).toBe(false);
+      if (!result.available) {
+        expect(result.code).toBe("service_unavailable");
+        expect(result.message).toContain("offline or unreachable");
+      }
     });
 
     it("handles provider timeout gracefully", async () => {
@@ -481,6 +512,188 @@ describe("AI Security Analyst (Phase 4)", () => {
 
       const json = await res.json();
       expect(json.error.code).toBe("rate_limited");
+    });
+  });
+
+  describe("OllamaProvider Local Client & Concurrency (Phase 9)", () => {
+    it("initializes with default local configuration and models", () => {
+      const provider = new OllamaProvider();
+      expect(provider.getModelName()).toBe("qwen3.5:4b-q4_K_M");
+      expect(provider.getBaseUrl()).toBe("http://localhost:11434");
+      expect(provider.isConfigured()).toBe(true);
+    });
+
+    it("respects custom options and environment variables", () => {
+      const provider = new OllamaProvider({
+        baseUrl: "http://ollama:11434/",
+        modelName: "qwen3.5:2b-q4_K_M",
+        numCtx: 4096,
+        timeoutMs: 30000,
+      });
+      expect(provider.getModelName()).toBe("qwen3.5:2b-q4_K_M");
+      expect(provider.getBaseUrl()).toBe("http://ollama:11434");
+    });
+
+    it("sends structured POST request to /api/chat with format json when specified", async () => {
+      let capturedUrl = "";
+      let capturedBody: {
+        model?: string;
+        format?: string;
+        stream?: boolean;
+        options?: { temperature?: number };
+      } | null = null;
+
+      const mockFetch: typeof fetch = async (input, init) => {
+        capturedUrl = String(input);
+        capturedBody = JSON.parse(String(init?.body));
+        return new Response(
+          JSON.stringify({
+            message: { role: "assistant", content: "{\"summary\": \"Test summary\"}" },
+            done: true,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      };
+
+      const provider = new OllamaProvider({
+        baseUrl: "http://localhost:11434",
+        modelName: "qwen3.5:4b-q4_K_M",
+        fetchImpl: mockFetch,
+      });
+
+      const output = await provider.generateText({
+        system: "System prompt",
+        userPrompt: "User prompt",
+        format: "json",
+        maxTokens: 500,
+      });
+
+      expect(capturedUrl).toBe("http://localhost:11434/api/chat");
+      expect(capturedBody).not.toBeNull();
+      const body = capturedBody!;
+      expect(body.model).toBe("qwen3.5:4b-q4_K_M");
+      expect(body.format).toBe("json");
+      expect(body.stream).toBe(false);
+      expect(body.options?.temperature).toBe(0.1);
+      expect(output).toContain("Test summary");
+    });
+
+    it("omits format parameter when format is not specified (e.g. diff generation)", async () => {
+      let capturedBody: { format?: string } | null = null;
+
+      const mockFetch: typeof fetch = async (_input, init) => {
+        capturedBody = JSON.parse(String(init?.body));
+        return new Response(
+          JSON.stringify({
+            message: { role: "assistant", content: "--- a/file\n+++ b/file\n" },
+            done: true,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      };
+
+      const provider = new OllamaProvider({ fetchImpl: mockFetch });
+      await provider.generateText({
+        system: "System diff",
+        userPrompt: "User diff",
+      });
+
+      expect(capturedBody).not.toBeNull();
+      expect(capturedBody!.format).toBeUndefined();
+    });
+
+    it("throws helpful error with pull command when model is not found in Ollama", async () => {
+      const mockFetch: typeof fetch = async () => {
+        return new Response(
+          JSON.stringify({ error: "model 'qwen3.5:4b-q4_K_M' not found" }),
+          { status: 404, headers: { "Content-Type": "application/json" } }
+        );
+      };
+
+      const provider = new OllamaProvider({ fetchImpl: mockFetch });
+      await expect(
+        provider.generateText({ system: "sys", userPrompt: "prompt" })
+      ).rejects.toThrow("Local model 'qwen3.5:4b-q4_K_M' is not installed in Ollama. Pull it using: ollama pull qwen3.5:4b-q4_K_M");
+    });
+
+    it("throws helpful offline error when Ollama service is unreachable", async () => {
+      const mockFetch: typeof fetch = async () => {
+        throw new Error("connect ECONNREFUSED 127.0.0.1:11434");
+      };
+
+      const provider = new OllamaProvider({ fetchImpl: mockFetch });
+      await expect(
+        provider.generateText({ system: "sys", userPrompt: "prompt" })
+      ).rejects.toThrow("Local Ollama service is unavailable at http://localhost:11434. Ensure the Ollama service is running.");
+    });
+
+    it("enforces request timeout when inference takes too long", async () => {
+      const mockFetch: typeof fetch = async (_input, init) => {
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const err = new Error("The operation was aborted");
+            err.name = "AbortError";
+            reject(err);
+          });
+        });
+      };
+
+      const provider = new OllamaProvider({ fetchImpl: mockFetch, timeoutMs: 50 });
+      await expect(
+        provider.generateText({ system: "sys", userPrompt: "prompt" })
+      ).rejects.toThrow("Local AI inference request timed out after 50ms.");
+    });
+
+    it("serializes concurrent inference requests to preserve memory on constrained VM", async () => {
+      let activeRequests = 0;
+      let maxSimultaneousRequests = 0;
+
+      const mockFetch: typeof fetch = async () => {
+        activeRequests++;
+        maxSimultaneousRequests = Math.max(maxSimultaneousRequests, activeRequests);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        activeRequests--;
+        return new Response(
+          JSON.stringify({
+            message: { role: "assistant", content: "{\"done\": true}" },
+          }),
+          { status: 200 }
+        );
+      };
+
+      const provider = new OllamaProvider({
+        fetchImpl: mockFetch,
+        maxConcurrency: 1,
+      });
+
+      // Launch 3 requests concurrently
+      await Promise.all([
+        provider.generateText({ system: "1", userPrompt: "1" }),
+        provider.generateText({ system: "2", userPrompt: "2" }),
+        provider.generateText({ system: "3", userPrompt: "3" }),
+      ]);
+
+      expect(maxSimultaneousRequests).toBe(1);
+    });
+
+    it("strictly verifies zero external cloud requests are made", async () => {
+      const calledUrls: string[] = [];
+      const mockFetch: typeof fetch = async (input) => {
+        calledUrls.push(String(input));
+        return new Response(
+          JSON.stringify({ message: { content: "{}" } }),
+          { status: 200 }
+        );
+      };
+
+      const provider = new OllamaProvider({ fetchImpl: mockFetch });
+      await provider.generateText({ system: "sys", userPrompt: "prompt" });
+
+      expect(calledUrls).toHaveLength(1);
+      expect(calledUrls[0]).toContain("http://localhost:11434");
+      expect(calledUrls[0]).not.toContain("anthropic.com");
+      expect(calledUrls[0]).not.toContain("openai.com");
+      expect(calledUrls[0]).not.toContain("ollama.com");
     });
   });
 });

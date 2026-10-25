@@ -313,12 +313,14 @@ describe("Security Hardening & Production Readiness Audit", () => {
   });
 
   describe("5. Launch Gates & Production Readiness (Phase 6)", () => {
-    it("configures active non-deprecated Anthropic model identifier", async () => {
-      const { AnthropicProvider } = await import("@/server/ai/client");
-      const provider = new AnthropicProvider();
+    it("configures local Ollama model identifier and zero paid cloud API dependencies", async () => {
+      const { OllamaProvider } = await import("@/server/ai/client");
+      const provider = new OllamaProvider();
       const model = provider.getModelName();
-      expect(model).toBe("claude-sonnet-5-5");
-      expect(model).not.toContain("claude-3-5-sonnet");
+      expect(model).toBe("qwen3.5:4b-q4_K_M");
+      expect(model).not.toContain("claude");
+      expect(model).not.toContain("gpt");
+      expect(provider.getBaseUrl()).toBe("http://localhost:11434");
     });
 
     it("creates isolated sandbox home and tmp directories with mode 0700", async () => {
