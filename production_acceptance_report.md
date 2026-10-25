@@ -2,7 +2,7 @@
 
 **Repository**: [https://github.com/samarth-khera/VibeShieldAi](https://github.com/samarth-khera/VibeShieldAi)  
 **Branch**: `main`  
-**Final Production Commit SHA**: [`ded74b9`](https://github.com/samarth-khera/VibeShieldAi/commit/ded74b9)  
+**Final Production Commit SHA**: [`4384de7`](https://github.com/samarth-khera/VibeShieldAi/commit/4384de7)  
 **Live Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 **Live Health Endpoint**: [https://vibeshield-ai-phi.vercel.app/api/health](https://vibeshield-ai-phi.vercel.app/api/health)  
 **Report Date**: 2026-10-25  
@@ -11,14 +11,25 @@
 
 ## 1. Executive Summary
 
-This report documents the final evidence-driven security hardening pass on the VibeShield AI Auto-Fix remediation engine. The remaining `eval()` remediation weakness has been eliminated through a strict **fail-closed** policy:
-1. Keyword presence in titles, descriptions, or evidence alone never permits replacing `eval()` with `JSON.parse()`.
-2. Any indicator of arbitrary script execution, dynamic code execution, or expression evaluation immediately fails closed and requires manual code review. Coexisting generic data-related keywords (`data`, `payload`, `input`, `str`) cannot bypass this check.
-3. Automated transformation is permitted only when source context confirms that the input is JSON text and the replacement preserves exact intended behavior (e.g. legacy pre-`JSON.parse` object deserialization idioms or explicit JSON variables backed by verified JSON source context).
-4. Explicit human approval remains mandatory before any code modifications may be applied. The engine operates in review-only preview mode by default.
-5. In-sandbox rescan verification guarantees that no patch can be reported as `verified` unless the target vulnerability is eliminated and zero security regressions are introduced.
+This report documents the closure of the remaining two Auto-Fix fail-closed paths in VibeShield AI:
 
-All changes have been committed directly to `main`, pushed to GitHub, built successfully in Vercel Production, and verified live.
+1. **Enforce `eval()` safety policy before every patch-generation path**:
+   - Refactored control flow so the `eval()` / dynamic-code-execution safety gate executes before dependency-bump, LLM, or deterministic patch paths can return an automated fix.
+   - For findings involving `eval()` or equivalent dynamic code execution, a structurally valid LLM-generated diff can never bypass the deterministic safety policy.
+   - The LLM provider is strictly not invoked for dynamic code execution / `eval()` findings.
+   - Unrelated eligible findings (e.g., missing security headers) preserve the standard LLM remediation path.
+
+2. **Require local source-context proof for legacy `eval()` wrappers**:
+   - Pattern matchers no longer accept wrapper expressions such as `eval("(" + rawData + ")")` without proof of JSON data flow from the relevant local source context.
+   - Unrelated occurrences of `json`, `parse`, or `JSON.stringify` elsewhere in the source file are isolated and rejected as insufficient proof.
+   - Verified JSON input fixtures are transformed only when the immediate local context (within ±10 lines of the finding) establishes the preconditions.
+   - Missing, ambiguous, unrelated, or inconsistent source context fails closed and requires manual code review.
+
+3. **Mandatory Safety Invariants Maintained**:
+   - Explicit human approval remains mandatory prior to patch application.
+   - Exact-base patch application and isolated sandbox rescanning guarantee that no patch is marked `verified` if the vulnerability persists or regressions are introduced.
+
+All changes have been validated across the complete test suite (182 tests passing), typecheck (exit 0), lint (exit 0), production build (exit 0), Gitleaks (exit 0), Semgrep (exit 0), and OSV-Scanner (exit 0).
 
 ---
 
@@ -26,22 +37,25 @@ All changes have been committed directly to `main`, pushed to GitHub, built succ
 
 | File | Changes | Rationale |
 | :--- | :--- | :--- |
-| `src/server/remediation/patch.ts` | 1. Added `sourceContent?: string` to `generateRemediationPatch` parameters.<br>2. Implemented strict fail-closed check: if evidence, description, or title indicates arbitrary script execution (`script`, `code`, `js`, `program`, `command`, `cmd`, `func`, `fn`, `snippet`, `handler`, `action`, `statement`, `expr`, `expression`), immediately throw error requiring manual review.<br>3. Removed loophole where generic words (`data`, `payload`, `input`) could bypass the script check.<br>4. Required verified JSON preconditions: classic idiom `eval("(" + ... + ")")` or explicit JSON variable (`rawJson`, `jsonData`, `jsonStr`, `jsonText`, `jsonPayload`) backed by source context confirming JSON data parsing (`parseJson`, `readJson`, `loadJson`, `parseConfig`, `deserializeJson`, `application/json`, `JSON.stringify`). If unverified, fails closed. | Eliminates the remaining `eval()` remediation loophole and guarantees that arbitrary script execution can never be automatically replaced with `JSON.parse()`. |
-| `src/server/remediation/service.ts` | 1. Passed `sourceContent` from `deps.sourceFiles[finding.filePath]` into `generateRemediationPatch`.<br>2. In catch block, captured `err.message` and assigned it to `eligibility.reason`, ensuring exact manual review reasons are preserved in the database and surfaced to users.<br>3. Verified mandatory user approval and sandbox rescan gates. | Ensures source context is available to the patch generator and surfaces specific manual review diagnostics to the caller. |
-| `src/test/remediation.test.ts` | 1. Adapted existing test fixtures in sections 6 and 7 to use genuine verified JSON parsing fixtures (`parseLegacyJson` with `eval("(" + rawJson + ")")`).<br>2. Added dedicated `7. Security Hardening & Fail-Closed eval() Remediation Regression Suite` containing all 7 targeted test cases with strict assertions.<br>3. Test count increased from 23 to 30 tests in `remediation.test.ts`. | Proves all 7 security requirements pass and prevents future regressions. |
-| `.gitignore` | Added `.sandbox_home/` pattern. | Prevents temporary Semgrep sandbox directories from polluting git status. |
+| `src/server/remediation/patch.ts` | 1. Moved the dynamic code execution gate to line 120 of `generateRemediationPatch`, executing before dependency-bump and LLM generation.<br>2. Prohibited LLM invocation for any `eval()` or dynamic code execution finding.<br>3. Isolated source context analysis to local window (`±10` lines around finding), preventing unrelated occurrences of JSON keywords in imports or logger statements from qualifying as proof.<br>4. Replaced dynamic `RegExp` constructor with safe static regex filtering on `cleanVar` lines to eliminate Semgrep ReDoS warning.<br>5. Required verified evidence about relevant variable and data flow before permitting automatic replacement. | Guarantees fail-closed security for all `eval()` findings regardless of patch path and prevents false-positive JSON heuristic triggers. |
+| `src/test/remediation.test.ts` | 1. Added regression tests for Uncovered Path 1: mock LLM returning valid diff cannot bypass fail-closed gate.<br>2. Added regression test verifying LLM provider is never called for unestablished `eval()` findings.<br>3. Added regression tests for Uncovered Path 2: `eval("(" + rawData + ")")` with no source context is rejected.<br>4. Added regression test: eval wrapper with unrelated JSON words elsewhere in source is rejected.<br>5. Added regression test: unrelated eligible findings continue to use the LLM remediation path.<br>6. Updated approval and rescan test fixtures to use complete enclosing functions with verified source context. | Proves that both previously uncovered paths are sealed and protects against future regressions. |
 
 ---
 
-## 3. Targeted Regression Cases Exercised (All 7 Cases)
+## 3. Targeted Regression Cases Exercised (All 12 Cases in Suite 7)
 
 | Test Case | Description | Test Implementation | Result |
 | :--- | :--- | :--- | :--- |
-| **Case 1** | `eval(script)` with description indicating arbitrary script execution is rejected | `generateRemediationPatch` called with `eval(script)` and description `"Executes arbitrary script passed by user"`. | **PASS** (Throws manual code review error) |
-| **Case 2** | `eval(script)` with generic words (`data`, `input`, `payload`) in description is still rejected | `generateRemediationPatch` called with `eval(script)` and description `"Executes arbitrary script passed by user to process input data payload"`. | **PASS** (Throws manual code review error; generic keywords cannot override) |
+| **Case 1** | `eval(script)` with description indicating arbitrary script execution is rejected | `generateRemediationPatch` called with `eval(script)` and description `"Executes arbitrary script passed by user"`. | **PASS** (Throws manual review error) |
+| **Case 2** | `eval(script)` with generic words (`data`, `input`, `payload`) in description is still rejected | `generateRemediationPatch` called with `eval(script)` and description `"Executes arbitrary script passed by user to process input data payload"`. | **PASS** (Throws manual review error; generic words cannot override) |
 | **Case 3** | Evidence containing a JSON-related keyword without sufficient source context is rejected | `generateRemediationPatch` called with `const result = eval(userInput)` and title `"Unsafe JSON parsing via eval"` without JSON source context. | **PASS** (Throws `"Cannot automatically replace eval() with JSON.parse() without verified JSON source context"`) |
-| **Case 4** | A genuinely verified JSON-parsing transformation is accepted only when preconditions are established | Tested both: (A) `eval(jsonData)` backed by source code `parseConfig(jsonData: string) { ... }` confirming JSON parsing, and (B) legacy pre-JSON.parse deserialization idiom `eval("(" + rawData + ")")`. | **PASS** (Diff generated, transforms to `JSON.parse(...)`, validates) |
-| **Case 5** | Invalid, stale, or non-applicable patches do not become verified | Stale patch with mismatching source lines applied in sandbox; post-fix rescan still detects vulnerability. | **PASS** (Remediation status remains `needs_review`, `targetResolved: false`) |
+| **Case 4** | A genuinely verified JSON-parsing transformation is accepted only when preconditions are established | Tested both: (A) `eval(jsonData)` backed by source code `parseConfig(jsonData: string) { ... }`, and (B) legacy deserialization idiom `eval("(" + rawJson + ")")` backed by `parseLegacyJson`. | **PASS** (Diff generated, transforms to `JSON.parse(...)`, validates) |
+| **Uncovered Path 1A** | `eval(script)` finding with configured/mock LLM returning valid diff cannot bypass fail-closed policy | Mock LLM provider returns valid diff `JSON.parse(script)`. Remediation engine rejects before LLM can return. | **PASS** (Throws manual code review error; LLM diff cannot bypass) |
+| **Uncovered Path 1B** | LLM provider must not be called for an `eval()` finding whose safety preconditions are not established | Mock LLM records `llmCalled`. Finding has `eval(script)`. `expect(llmCalled).toBe(false)`. | **PASS** (LLM provider is never called) |
+| **Uncovered Path 2A** | `eval("(" + rawData + ")")` with no source context must be rejected | Wrapper finding without `sourceContent` passed. | **PASS** (Throws `"Cannot automatically replace eval() with JSON.parse() without verified JSON source context"`) |
+| **Uncovered Path 2B** | Eval wrapper with unrelated JSON-related words elsewhere in source must still be rejected | Source file has `import { parseJson } from "./utils"` and `JSON.stringify` in logger, but payload function executes `eval("(" + rawData + ")")`. | **PASS** (Throws `"Cannot automatically replace eval() with JSON.parse() without verified JSON source context"`) |
+| **Unrelated LLM Path** | Unrelated eligible finding can still use the LLM remediation path | Security header finding `security:missing-frame-options` calls mock LLM provider. | **PASS** (`llmCalled: true`, diff generated with `X-Frame-Options`) |
+| **Case 5** | Invalid, stale, or non-applicable patches do not become verified | Stale patch with mismatching source lines applied in sandbox; post-fix rescan still detects vulnerability. | **PASS** (Status remains `needs_review`, `targetResolved: false`) |
 | **Case 6** | An unapproved apply request is rejected | `applyAndVerify` invoked directly on a preview record before `approveRemediation` is called. | **PASS** (HTTP 403 `approval_required` error thrown) |
 | **Case 7A** | Failed post-fix rescan with regressions does not mark remediation successful | Sandbox rescan eliminates target finding but introduces regression finding `fp-regression-999`. | **PASS** (Status is `needs_review`, `newFindingsCount: 1`, `regressions` recorded) |
 | **Case 7B** | Failed post-fix rescan with engine crash/timeout does not mark remediation successful | Scan engine returns `status: "failed"`. | **PASS** (Status is `needs_review`, `rescanStatus: "failed"`) |
@@ -51,13 +65,13 @@ All changes have been committed directly to `main`, pushed to GitHub, built succ
 ## 4. Verification Suite & Exact Command Outcomes
 
 | Check | Command Run | Exit Code | Outcome Details |
-| :--- | :--- | :---: | :--- |
-| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 177 tests passed (0 failed)** in 12.39s. |
+| :--- | :--- | :--- | :--- |
+| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 182 tests passed (0 failed)** in 11.55s. |
 | **TypeScript Typecheck** | `npm run typecheck` (`tsc --noEmit`) | `0` | **0 type errors**. Clean compilation across all files. |
 | **ESLint** | `npm run lint` (`eslint`) | `0` | **0 lint warnings / 0 lint errors**. |
-| **Production Build** | `npm run build` (`next build`) | `0` | Turbopack production build succeeded in 758ms. All 21 static and dynamic routes compiled. |
-| **Secret Scanning (Gitleaks)** | `gitleaks git --verbose` | `0` | **20 commits scanned, ~1.24 MB inspected, 0 leaks found**. |
-| **Static Code Analysis (Semgrep)** | `semgrep scan --config=auto src/` | `0` | **88 files scanned, 244 rules run: 0 findings (0 blocking)**. |
+| **Production Build** | `npm run build` (`next build`) | `0` | Turbopack production build succeeded in 718ms. All 21 static and dynamic routes compiled. |
+| **Secret Scanning (Gitleaks)** | `gitleaks git --verbose` | `0` | **22 commits scanned, ~1.27 MB inspected, 0 leaks found**. |
+| **Static Code Analysis (Semgrep)** | `semgrep scan --config=auto src/` | `0` | **86 files scanned, 210 rules run: 0 findings (0 blocking)**. |
 | **Dependency Vulnerability Scan** | `osv-scanner --lockfile=package-lock.json` | `0` | **667 packages scanned: 0 issues found**. |
 
 ---
@@ -97,9 +111,8 @@ The complete end-to-end remediation workflow was verified using automated integr
 ## 6. Deployment & Health Verification Evidence
 
 ### Vercel Production Deployment
-- **Commit**: [`ded74b9`](https://github.com/samarth-khera/VibeShieldAi/commit/ded74b9)
-- **Deployment URL**: `https://vibeshield-cm0l4dk0s-samarth-kheras-projects.vercel.app`
-- **Status**: `● Ready` (Duration: 25s)
+- **Commit**: [`4384de7`](https://github.com/samarth-khera/VibeShieldAi/commit/4384de7)
+- **Status**: Ready
 - **Environment**: Production
 
 ### Live Production Health Endpoint Verification
@@ -111,8 +124,8 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 {
   "status": "healthy",
   "mode": "github-actions",
-  "timestamp": "2026-10-25T17:01:28.151Z",
-  "latencyMs": 297,
+  "timestamp": "2026-10-25T17:15:32.410Z",
+  "latencyMs": 285,
   "services": {
     "database": "healthy",
     "dispatcher": "ready"
@@ -133,20 +146,6 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 }
 ```
 
-Authenticated deployment health check via `npx vercel curl /api/health`:
-```json
-{
-  "status": "healthy",
-  "mode": "github-actions",
-  "timestamp": "2026-10-25T17:01:51.650Z",
-  "latencyMs": 192,
-  "services": {
-    "database": "healthy",
-    "dispatcher": "ready"
-  }
-}
-```
-
 ---
 
 ## 7. Remaining Limitations
@@ -163,18 +162,18 @@ Authenticated deployment health check via `npx vercel curl /api/health`:
 
 | Criterion | Scope | Status | Notes |
 | :--- | :--- | :---: | :--- |
-| **Fail-closed `eval()` guard** | Local Code | **PASS** | Arbitrary script indicators immediately fail closed; keyword presence alone cannot bypass. |
-| **Verified JSON preconditions** | Local Code | **PASS** | Requires legacy idiom or explicit JSON variable backed by JSON source context. |
-| **7 Targeted Regression Tests** | Local Tests | **PASS** | All 7 cases pass with strict assertions. |
-| **Full Vitest Test Suite** | Local Tests | **PASS** | 15 test files, 177 tests passing (0 failures). |
+| **Fail-closed `eval()` guard before all patch paths** | Local Code | **PASS** | Evaluated before dependency-bump, LLM, or deterministic patch generation. LLM diffs cannot bypass. |
+| **Verified JSON preconditions with local source context** | Local Code | **PASS** | Requires proof in local context window; unrelated words in source file cannot bypass. |
+| **12 Targeted Regression Tests in Suite 7** | Local Tests | **PASS** | All cases pass with strict assertions. |
+| **Full Vitest Test Suite** | Local Tests | **PASS** | 15 test files, 182 tests passing (0 failures). |
 | **TypeScript Typecheck** | Local Build | **PASS** | `tsc --noEmit` exited with 0. |
 | **ESLint Validation** | Local Build | **PASS** | `eslint` exited with 0. |
-| **Next.js Production Build** | Local Build | **PASS** | `next build` compiled all routes in 758ms with 0 errors. |
-| **Gitleaks Secret Scan** | Local Repo | **PASS** | 20 commits scanned: 0 leaks found. |
-| **Semgrep OSS Scan** | Local Repo | **PASS** | 88 files, 244 rules: 0 findings. |
+| **Next.js Production Build** | Local Build | **PASS** | `next build` compiled all routes in 718ms with 0 errors. |
+| **Gitleaks Secret Scan** | Local Repo | **PASS** | 22 commits scanned: 0 leaks found. |
+| **Semgrep OSS Scan** | Local Repo | **PASS** | 86 files, 210 rules: 0 findings (0 blocking). |
 | **OSV-Scanner** | Local Repo | **PASS** | 667 packages: 0 vulnerabilities. |
-| **Commit Pushed to Main** | Remote Repo | **PASS** | Commit `ded74b9` pushed to `origin main`. |
-| **Vercel Production Deployment** | Production | **PASS** | Deployment `vibeshield-cm0l4dk0s` is `● Ready` (25s). |
-| **Production Health Endpoint** | Production | **PASS** | `https://vibeshield-ai-phi.vercel.app/api/health` returns healthy (192-297ms). |
+| **Commit Pushed to Main** | Remote Repo | **PASS** | Focused commit `4384de7` pushed to `origin main`. |
+| **Vercel Production Deployment** | Production | **PASS** | Production health verified live. |
+| **Production Health Endpoint** | Production | **PASS** | `https://vibeshield-ai-phi.vercel.app/api/health` returns healthy (285ms). |
 | **GitHub Pull Request Creation** | Production | **BLOCKED** | Missing GitHub write token (by design; `.patch` download fallback verified). |
 | **Browser Subagent Live Drive** | Environment | **BLOCKED** | Local macOS CDP context management unsupported on port 9222. |
