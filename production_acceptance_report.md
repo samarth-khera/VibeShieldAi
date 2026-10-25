@@ -118,19 +118,22 @@ The complete end-to-end remediation workflow was verified using automated integr
 ## 6. Deployment & Health Verification Evidence
 
 ### Vercel Production Deployment
-- **Commit**: [`649f6ab`](https://github.com/samarth-khera/VibeShieldAi/commit/649f6ab)  
+- **Commit**: [`649f6ab`](https://github.com/samarth-khera/VibeShieldAi/commit/649f6ab) (Security Hardening) / [`7a1cde0`](https://github.com/samarth-khera/VibeShieldAi/commit/7a1cde0)  
+- **Deployment URL**: `https://vibeshield-cyeczb8r1-samarth-kheras-projects.vercel.app`  
+- **Status**: `● Ready` (Duration: 24s)  
 - **Environment**: Production  
-- **Live Health Endpoint Verification**:
-  ```bash
-  $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
-  ```
-  **Response**:
-  ```json
-  {
-    "status": "healthy",
-    "mode": "github-actions",
-    "timestamp": "2026-10-25T17:20:36.610Z",
-    "latencyMs": 189,
+
+### Live Production Health Endpoint Verification
+```bash
+$ curl -s https://vibeshield-ai-phi.vercel.app/api/health
+```
+**Response**:
+```json
+{
+  "status": "healthy",
+  "mode": "github-actions",
+  "timestamp": "2026-10-25T17:32:12.504Z",
+  "latencyMs": 188,
     "services": {
       "database": "healthy",
       "dispatcher": "ready"
