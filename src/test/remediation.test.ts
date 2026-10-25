@@ -1615,6 +1615,121 @@ function process() {
         expect(patch2.unifiedDiff).toContain("-  return eval");
       });
 
+      it("variant 7: rejects locally shadowed or overridden JSON binding whose stringify returns executable JavaScript text", async () => {
+        // Shadowed JSON object with stringify returning executable JavaScript
+        const shadowedJsonSource = `const JSON = {
+  stringify: (_obj: unknown) => "alert('pwned:' + document.cookie)"
+};
+
+export function getShadowedConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(shadowedJsonSource, "data", 8)).toBe(false);
+
+        const shadowedFinding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Shadowed JSON eval wrapper",
+          filePath: "src/shadowed.ts",
+          startLine: 8,
+          endLine: 8,
+          redactedEvidence: '  return eval("(" + data + ")");',
+        });
+
+        await expect(
+          generateRemediationPatch({
+            finding: shadowedFinding,
+            scanJobId: "job-shadowed-json",
+            commitSha: "sha-shadowed",
+            sourceContent: shadowedJsonSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        // Mutated JSON.stringify property
+        const mutatedJsonSource = `JSON.stringify = () => "evil()";
+export function getMutatedConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(mutatedJsonSource, "data", 5)).toBe(false);
+
+        // Imported custom JSON module
+        const importedJsonSource = `import JSON from "custom-json-lib";
+export function getImportedConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(importedJsonSource, "data", 5)).toBe(false);
+
+        // Parameter binding named JSON
+        const paramJsonSource = `export function getParamConfig(JSON: any) {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(paramJsonSource, "data", 4)).toBe(false);
+      });
+
+      it("variant 8: fails closed on TypeScript parse diagnostics for malformed source containing otherwise safe-looking declarations", async () => {
+        // Syntax error: missing expression before semicolon
+        const syntaxErrorSource = `export function getMalformedConfig() {
+  const bad = ;
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(syntaxErrorSource, "data", 5)).toBe(false);
+
+        const malformedFinding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Malformed source containing safe-looking declaration",
+          filePath: "src/malformed.ts",
+          startLine: 5,
+          endLine: 5,
+          redactedEvidence: '  return eval("(" + data + ")");',
+        });
+
+        await expect(
+          generateRemediationPatch({
+            finding: malformedFinding,
+            scanJobId: "job-malformed-syntax",
+            commitSha: "sha-malformed",
+            sourceContent: syntaxErrorSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        // Syntax error: unclosed block and missing paren
+        const unclosedSource = `export function getUnclosedConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")"
+`;
+        expect(verifyJsonSourceProof(unclosedSource, "data", 3)).toBe(false);
+      });
+
+      it("variant 9: fails closed on ambiguous target calls and mismatched lines", async () => {
+        // Multiple matching calls without line specified: ambiguous
+        const multiCallSource = `export function getMultiCallConfig() {
+  const data = JSON.stringify({ safe: true });
+  eval("(" + data + ")");
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(multiCallSource, "data")).toBe(false);
+
+        // Multiple calls on the exact same line: ambiguous
+        const sameLineSource = `export function getSameLineConfig() {
+  const data = JSON.stringify({ safe: true });
+  eval(data); eval(data);
+}`;
+        expect(verifyJsonSourceProof(sameLineSource, "data", 3)).toBe(false);
+
+        // Mismatched line number (single call on line 4, but line 99 requested)
+        const singleCallSource = `export function getSingleConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(singleCallSource, "data", 99)).toBe(false);
+      });
+
       it("end-to-end disposable fixture: reproduced bypass is refused across full preview lifecycle, while proven safe wrapper succeeds and verifies", async () => {
         const store = new InMemoryJobStore();
         const job = await store.create({

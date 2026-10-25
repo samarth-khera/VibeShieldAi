@@ -131,23 +131,186 @@ function getScopeContainer(node: ts.Node): ts.Node | null {
 }
 
 /**
+ * Verifies whether the identifier "JSON" is shadowed, overridden, imported,
+ * or mutated anywhere in the source file.
+ * Returns true if "JSON" is shadowed or overridden (i.e. cannot be proven to be
+ * the genuine built-in global object), and false if it remains unshadowed and clean.
+ */
+function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
+  let shadowedOrOverridden = false;
+
+  function walk(node: ts.Node) {
+    if (shadowedOrOverridden) return;
+
+    // 1. Variable declarations: const JSON = ..., let { JSON } = ...
+    if (ts.isVariableDeclaration(node)) {
+      if (parameterBindsName(node.name, "JSON")) {
+        shadowedOrOverridden = true;
+        return;
+      }
+    }
+
+    // 2. Function, Class, Enum, Module/Namespace, Interface, Type alias declarations
+    if (
+      ts.isFunctionDeclaration(node) ||
+      ts.isClassDeclaration(node) ||
+      ts.isEnumDeclaration(node) ||
+      ts.isModuleDeclaration(node) ||
+      ts.isInterfaceDeclaration(node) ||
+      ts.isTypeAliasDeclaration(node)
+    ) {
+      if (node.name && ts.isIdentifier(node.name) && node.name.text === "JSON") {
+        shadowedOrOverridden = true;
+        return;
+      }
+    }
+
+    // 3. Parameters in functions, arrows, methods, accessors, catch clauses
+    if (ts.isParameter(node)) {
+      if (parameterBindsName(node.name, "JSON")) {
+        shadowedOrOverridden = true;
+        return;
+      }
+    }
+    if (ts.isCatchClause(node) && node.variableDeclaration) {
+      if (parameterBindsName(node.variableDeclaration.name, "JSON")) {
+        shadowedOrOverridden = true;
+        return;
+      }
+    }
+
+    // 4. Imports: default, named, namespace, import equals
+    if (ts.isImportClause(node)) {
+      if (node.name && node.name.text === "JSON") {
+        shadowedOrOverridden = true;
+        return;
+      }
+      if (node.namedBindings) {
+        if (ts.isNamespaceImport(node.namedBindings) && node.namedBindings.name.text === "JSON") {
+          shadowedOrOverridden = true;
+          return;
+        }
+        if (ts.isNamedImports(node.namedBindings)) {
+          for (const spec of node.namedBindings.elements) {
+            if (spec.name.text === "JSON") {
+              shadowedOrOverridden = true;
+              return;
+            }
+          }
+        }
+      }
+    }
+    if (ts.isImportEqualsDeclaration(node)) {
+      if (node.name.text === "JSON") {
+        shadowedOrOverridden = true;
+        return;
+      }
+    }
+
+    // 5. Export specifiers: export { custom as JSON }
+    if (ts.isExportSpecifier(node)) {
+      if (node.name.text === "JSON") {
+        shadowedOrOverridden = true;
+        return;
+      }
+    }
+
+    // 6. Assignments and mutations: JSON = ..., JSON.stringify = ..., JSON["stringify"] = ...
+    if (ts.isBinaryExpression(node)) {
+      const isAssign =
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
+        (node.operatorToken.kind >= ts.SyntaxKind.FirstCompoundAssignment &&
+          node.operatorToken.kind <= ts.SyntaxKind.LastCompoundAssignment);
+      if (isAssign) {
+        if (ts.isIdentifier(node.left) && node.left.text === "JSON") {
+          shadowedOrOverridden = true;
+          return;
+        }
+        if (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left)) {
+          let curr: ts.Expression = node.left.expression;
+          while (ts.isPropertyAccessExpression(curr) || ts.isElementAccessExpression(curr)) {
+            curr = curr.expression;
+          }
+          if (ts.isIdentifier(curr)) {
+            if (curr.text === "JSON") {
+              shadowedOrOverridden = true;
+              return;
+            }
+            if (
+              (curr.text === "globalThis" || curr.text === "window" || curr.text === "global") &&
+              ts.isPropertyAccessExpression(node.left) &&
+              node.left.name.text === "JSON"
+            ) {
+              shadowedOrOverridden = true;
+              return;
+            }
+          }
+        }
+      }
+    }
+
+    // 7. Delete expressions: delete JSON.stringify or delete (window as any).JSON
+    if (ts.isDeleteExpression(node)) {
+      let curr = node.expression;
+      while (ts.isPropertyAccessExpression(curr) || ts.isElementAccessExpression(curr)) {
+        if (ts.isIdentifier(curr.expression) && curr.expression.text === "JSON") {
+          shadowedOrOverridden = true;
+          return;
+        }
+        curr = curr.expression;
+      }
+      if (ts.isIdentifier(curr) && curr.text === "JSON") {
+        shadowedOrOverridden = true;
+        return;
+      }
+    }
+
+    // 8. Object.assign(JSON, ...) / Object.defineProperty(JSON, ...) / Reflect.defineProperty(JSON, ...)
+    if (ts.isCallExpression(node)) {
+      if (ts.isPropertyAccessExpression(node.expression)) {
+        const prop = node.expression.name.text;
+        const obj = node.expression.expression;
+        if (ts.isIdentifier(obj) && (obj.text === "Object" || obj.text === "Reflect")) {
+          if (["defineProperty", "defineProperties", "assign"].includes(prop)) {
+            const firstArg = node.arguments[0];
+            if (firstArg && ts.isIdentifier(firstArg) && firstArg.text === "JSON") {
+              shadowedOrOverridden = true;
+              return;
+            }
+          }
+        }
+      }
+    }
+
+    ts.forEachChild(node, walk);
+  }
+
+  walk(sourceFile);
+  return shadowedOrOverridden;
+}
+
+/**
  * Strictly verifies whether an eval() argument has defensible, proven JSON data flow
  * using TypeScript AST analysis.
  *
  * Requirements:
- * 1. Declaration identity & uniqueness: Exactly one declaration of cleanVar must exist
+ * 1. Parser Diagnostics: Any syntax or parse error in the source file fails closed.
+ * 2. Unambiguous target call: The eval() call referencing cleanVar must be resolved unambiguously
+ *    to findingLine (or be the sole matching call if no line specified). Multiple ambiguous calls fail closed.
+ * 3. Declaration identity & uniqueness: Exactly one declaration of cleanVar must exist
  *    in the source file, and it must be a `const` variable declaration.
- * 2. Lexical scope: The declaration's scope container must be an ancestor scope of the eval() call.
+ * 4. Lexical scope: The declaration's scope container must be an ancestor scope of the eval() call.
  *    Variables declared in sibling/child blocks or outside the enclosing scope are refused.
- * 3. Destructured parameters & inputs: If cleanVar is bound as a parameter (including
+ * 5. Destructured parameters & inputs: If cleanVar is bound as a parameter (including
  *    object/array destructuring patterns) in any enclosing function, it is refused.
- * 4. Data-flow ordering: The declaration must occur strictly before the eval() call in source order.
- * 5. Intervening assignments: Any assignment (`=`, `+=`, etc.) or mutation (`++`, `--`)
+ * 6. Data-flow ordering: The declaration must occur strictly before the eval() call in source order.
+ * 7. Intervening assignments: Any assignment (`=`, `+=`, etc.) or mutation (`++`, `--`)
  *    to cleanVar anywhere in the file disqualifies automatic remediation.
- * 6. Initializer validation: Must be initialized with either:
- *    a) Direct call to `JSON.stringify(...)` with no untrusted references in arguments.
+ * 8. Initializer validation: Must be initialized with either:
+ *    a) Direct call to `JSON.stringify(...)` where the global JSON binding is unshadowed and clean,
+ *       and has no untrusted references in arguments.
  *    b) A static string or no-substitution template literal whose content parses as valid JSON object.
- * 7. Fail-closed: Any syntax error, ambiguous scope, or missing proof routes to manual review.
+ * 9. Fail-closed: Any syntax error, ambiguous scope, shadowed binding, or missing proof routes to manual review.
  */
 export function verifyJsonSourceProof(
   sourceContent: string,
@@ -165,7 +328,13 @@ export function verifyJsonSourceProof(
     return false;
   }
 
-  // 1. Locate all eval(...) calls that reference cleanVar
+  // 1. Explicitly inspect parser diagnostics; fail closed on any syntax or parse errors
+  const parseDiagnostics = (sourceFile as unknown as { parseDiagnostics?: readonly ts.Diagnostic[] }).parseDiagnostics;
+  if (Array.isArray(parseDiagnostics) && parseDiagnostics.length > 0) {
+    return false;
+  }
+
+  // 2. Locate all eval(...) calls that reference cleanVar
   const matchingEvalCalls: ts.CallExpression[] = [];
   function findEvalCalls(node: ts.Node) {
     if (
@@ -196,20 +365,32 @@ export function verifyJsonSourceProof(
     return false;
   }
 
-  let targetEval = matchingEvalCalls[0];
-  if (findingLine != null && matchingEvalCalls.length > 1) {
-    let minDiff = Infinity;
-    for (const call of matchingEvalCalls) {
-      const line = sourceFile.getLineAndCharacterOfPosition(call.getStart(sourceFile)).line + 1;
-      const diff = Math.abs(line - findingLine);
-      if (diff < minDiff) {
-        minDiff = diff;
-        targetEval = call;
+  // Target call resolution: must resolve unambiguously
+  let targetEval: ts.CallExpression;
+  if (matchingEvalCalls.length === 1) {
+    targetEval = matchingEvalCalls[0];
+    if (findingLine != null) {
+      const line = sourceFile.getLineAndCharacterOfPosition(targetEval.getStart(sourceFile)).line + 1;
+      if (line !== findingLine) {
+        return false;
       }
     }
+  } else {
+    // Multiple matching calls: findingLine must be specified and must resolve to exactly one call on that line
+    if (findingLine == null) {
+      return false;
+    }
+    const matchingOnLine = matchingEvalCalls.filter((call) => {
+      const line = sourceFile.getLineAndCharacterOfPosition(call.getStart(sourceFile)).line + 1;
+      return line === findingLine;
+    });
+    if (matchingOnLine.length !== 1) {
+      return false;
+    }
+    targetEval = matchingOnLine[0];
   }
 
-  // 2. Reject if cleanVar is a parameter in any enclosing function (including destructuring)
+  // 3. Reject if cleanVar is a parameter in any enclosing function (including destructuring)
   let curr: ts.Node | undefined = targetEval.parent;
   while (curr) {
     if (
@@ -230,7 +411,7 @@ export function verifyJsonSourceProof(
     curr = curr.parent;
   }
 
-  // 3. Find declarations of cleanVar across the entire file
+  // 4. Find declarations of cleanVar across the entire file
   const declarations: ts.Node[] = [];
   function findDecls(node: ts.Node) {
     if (ts.isVariableDeclaration(node)) {
@@ -238,14 +419,36 @@ export function verifyJsonSourceProof(
         declarations.push(node);
       }
     } else if (
-      (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) &&
+      (ts.isFunctionDeclaration(node) ||
+        ts.isClassDeclaration(node) ||
+        ts.isEnumDeclaration(node) ||
+        ts.isInterfaceDeclaration(node) ||
+        ts.isTypeAliasDeclaration(node) ||
+        ts.isModuleDeclaration(node)) &&
       node.name &&
+      ts.isIdentifier(node.name) &&
       node.name.text === cleanVar
     ) {
       declarations.push(node);
     } else if (ts.isParameter(node)) {
       if (parameterBindsName(node.name, cleanVar)) {
         declarations.push(node);
+      }
+    } else if (ts.isImportClause(node)) {
+      if (node.name && node.name.text === cleanVar) {
+        declarations.push(node);
+      }
+      if (node.namedBindings) {
+        if (ts.isNamespaceImport(node.namedBindings) && node.namedBindings.name.text === cleanVar) {
+          declarations.push(node);
+        }
+        if (ts.isNamedImports(node.namedBindings)) {
+          for (const spec of node.namedBindings.elements) {
+            if (spec.name.text === cleanVar) {
+              declarations.push(spec);
+            }
+          }
+        }
       }
     }
     ts.forEachChild(node, findDecls);
@@ -271,12 +474,12 @@ export function verifyJsonSourceProof(
     return false;
   }
 
-  // 4. Source ordering: declaration must precede targetEval
+  // 5. Source ordering: declaration must precede targetEval
   if (decl.getStart(sourceFile) >= targetEval.getStart(sourceFile)) {
     return false;
   }
 
-  // 5. Scope check: declaration scope container must be an ancestor of targetEval
+  // 6. Scope check: declaration scope container must be an ancestor of targetEval
   const declScope = getScopeContainer(decl);
   if (!declScope) {
     return false;
@@ -295,7 +498,7 @@ export function verifyJsonSourceProof(
     return false;
   }
 
-  // 6. Check for any assignments or mutations to cleanVar anywhere in the source
+  // 7. Check for any assignments or mutations to cleanVar anywhere in the source
   let hasAssignmentOrMutation = false;
   function checkAssignments(node: ts.Node) {
     if (ts.isBinaryExpression(node)) {
@@ -321,7 +524,7 @@ export function verifyJsonSourceProof(
     return false;
   }
 
-  // 7. Verify initializer: JSON.stringify(...) or valid JSON string literal
+  // 8. Verify initializer: JSON.stringify(...) or valid JSON string literal
   const init = decl.initializer;
   if (!init) {
     return false;
@@ -338,6 +541,11 @@ export function verifyJsonSourceProof(
     ts.isIdentifier(init.expression.name) &&
     init.expression.name.text === "stringify"
   ) {
+    // Fail closed if JSON identifier is shadowed or overridden anywhere in the file
+    if (hasJsonShadowOrOverride(sourceFile)) {
+      return false;
+    }
+
     let hasUntrusted = false;
     function checkUntrusted(node: ts.Node) {
       if (ts.isIdentifier(node) && untrustedWord.test(node.text)) {
