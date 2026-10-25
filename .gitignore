@@ -46,3 +46,7 @@ next-env.d.ts
 models/
 *.gguf
 *.bin
+
+# agent & skills artifacts
+.agents/
+skills-lock.json

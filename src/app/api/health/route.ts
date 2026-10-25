@@ -1,15 +1,20 @@
+import { getConfig } from "@/server/config";
 import { prisma } from "@/server/db";
 import { getRedis, isWorkerOnline } from "@/server/queue";
 import { getPlatformIsolationInfo } from "@/server/scanners/isolation-spec";
 
 export async function GET() {
   const startTime = Date.now();
-  let dbStatus = "healthy";
-  let redisStatus = "healthy";
-  let workerStatus = "offline";
+  const config = getConfig();
+  const isGithubBackend = config.scanDispatchBackend === "github-actions";
+
+  let dbStatus: "healthy" | "unhealthy" = "healthy";
+  let dispatchStatus: "ready" | "unconfigured" = "ready";
+  let redisStatus: "healthy" | "unhealthy" | undefined;
+  let workerStatus: "online" | "offline" | "unknown" | undefined;
   let overallHealthy = true;
 
-  // 1. Database check
+  // 1. Database check (PostgreSQL / Neon)
   try {
     await prisma.$queryRaw`SELECT 1`;
   } catch {
@@ -17,39 +22,55 @@ export async function GET() {
     overallHealthy = false;
   }
 
-  // 2. Redis queue check
-  try {
-    const pong = await getRedis().ping();
-    if (pong !== "PONG") {
-      redisStatus = "degraded";
+  // 2. Execution backend readiness check
+  if (isGithubBackend) {
+    const hasToken = Boolean(config.githubDispatchToken);
+    const hasRepo = Boolean(config.githubRepository);
+    const hasSecret = Boolean(config.scanCallbackSecret);
+
+    if (hasToken && hasRepo && hasSecret) {
+      dispatchStatus = "ready";
+    } else {
+      dispatchStatus = "unconfigured";
       overallHealthy = false;
     }
-  } catch {
-    redisStatus = "unhealthy";
-    overallHealthy = false;
+  } else {
+    try {
+      const pong = await getRedis().ping();
+      redisStatus = pong === "PONG" ? "healthy" : "unhealthy";
+      if (redisStatus !== "healthy") overallHealthy = false;
+    } catch {
+      redisStatus = "unhealthy";
+      overallHealthy = false;
+    }
+
+    try {
+      const online = await isWorkerOnline();
+      workerStatus = online ? "online" : "offline";
+    } catch {
+      workerStatus = "unknown";
+    }
   }
 
-  // 3. Background worker check
-  try {
-    const online = await isWorkerOnline();
-    workerStatus = online ? "online" : "offline";
-  } catch {
-    workerStatus = "unknown";
-  }
-
-  // 4. Isolation specs
+  // 3. Platform isolation specifications
   const isolation = getPlatformIsolationInfo();
 
-  const status = overallHealthy ? (workerStatus === "online" ? "healthy" : "degraded") : "unhealthy";
+  const status = overallHealthy
+    ? isGithubBackend || workerStatus === "online"
+      ? "healthy"
+      : "degraded"
+    : "unhealthy";
   const httpStatus = overallHealthy ? 200 : 503;
 
   return Response.json(
     {
       status,
+      mode: isGithubBackend ? "github-actions" : "bullmq",
       timestamp: new Date().toISOString(),
       latencyMs: Date.now() - startTime,
       services: {
         database: dbStatus,
+        dispatcher: isGithubBackend ? dispatchStatus : undefined,
         redis: redisStatus,
         worker: workerStatus,
       },

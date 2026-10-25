@@ -44,13 +44,13 @@ export function getConfig(): ServerConfig {
         ? "github-actions"
         : "bullmq";
 
-  const appUrl =
+  const rawUrl =
     process.env.APP_URL?.trim() ||
-    (process.env.VERCEL_PROJECT_PRODUCTION_URL
-      ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
-      : process.env.VERCEL_URL
-        ? `https://${process.env.VERCEL_URL}`
-        : "http://localhost:3000");
+    process.env.VERCEL_PROJECT_PRODUCTION_URL?.trim() ||
+    process.env.VERCEL_URL?.trim() ||
+    "http://localhost:3000";
+
+  const appUrl = rawUrl.startsWith("http://") || rawUrl.startsWith("https://") ? rawUrl : `https://${rawUrl}`;
 
   return {
     maxArchiveBytes: int("MAX_ARCHIVE_MB", 25) * MB,
