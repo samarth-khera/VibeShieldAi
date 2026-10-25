@@ -50,3 +50,5 @@ models/
 # agent & skills artifacts
 .agents/
 skills-lock.json
+.sandbox_home/
+

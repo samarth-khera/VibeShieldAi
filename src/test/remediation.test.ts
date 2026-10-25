@@ -437,19 +437,19 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         defaultBranch: "main",
       });
 
-      const originalSource = 'export function calc(expr: string) {\n  return eval(expr);\n}\n';
+      const originalSource = 'export function parseLegacyJson(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n';
       await store.saveFindings(job.id, [
         makeFinding({
           scanner: "semgrep",
-          ruleId: "js-code-execution-eval",
+          ruleId: "semgrep:eval-detected",
           category: "Code Analysis",
-          severity: "critical",
-          title: "Arbitrary code execution via eval",
-          filePath: "src/calc.ts",
+          severity: "high",
+          title: "Legacy JSON deserialization",
+          filePath: "src/parser.ts",
           fingerprint: "fp-eval-1234",
           startLine: 2,
           endLine: 2,
-          redactedEvidence: "  return eval(expr);",
+          redactedEvidence: '  return eval("(" + rawJson + ")");',
         }),
       ]);
 
@@ -458,7 +458,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/calc.ts": originalSource },
+        sourceFiles: { "src/parser.ts": originalSource },
       };
 
       // 1. Generate preview
@@ -469,11 +469,11 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       expect(preview.pullRequestUrl).toBeNull();
 
       // Verify diff transforms eval to JSON.parse
-      expect(preview.unifiedDiff).toContain("-  return eval(expr);");
-      expect(preview.unifiedDiff).toContain("+  return JSON.parse(expr);");
+      expect(preview.unifiedDiff).toContain('-  return eval("(" + rawJson + ")");');
+      expect(preview.unifiedDiff).toContain("+  return JSON.parse(rawJson);");
 
       // Verify target source is completely untouched
-      expect(deps.sourceFiles!["src/calc.ts"]).toBe(originalSource);
+      expect(deps.sourceFiles!["src/parser.ts"]).toBe(originalSource);
     });
 
     it("explicit user approval is strictly mandatory before patch application", async () => {
@@ -493,15 +493,15 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       await store.saveFindings(job.id, [
         makeFinding({
           scanner: "semgrep",
-          ruleId: "js-code-execution-eval",
+          ruleId: "semgrep:eval-detected",
           category: "Code Analysis",
-          severity: "critical",
-          title: "Arbitrary code execution via eval",
-          filePath: "src/calc.ts",
+          severity: "high",
+          title: "Legacy JSON deserialization",
+          filePath: "src/parser.ts",
           fingerprint: "fp-eval-1234",
           startLine: 2,
           endLine: 2,
-          redactedEvidence: "  return eval(expr);",
+          redactedEvidence: '  return eval("(" + rawJson + ")");',
         }),
       ]);
       const { findings } = await store.getFindings(job.id);
@@ -509,7 +509,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/calc.ts": "return eval(expr);" },
+        sourceFiles: { "src/parser.ts": 'return eval("(" + rawJson + ")");' },
       };
 
       const preview = await createPreview(job.id, evalFinding.id, deps);
@@ -539,18 +539,18 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         defaultBranch: "main",
       });
 
-      const vulnerableSource = 'export function calc(expr: string) {\n  return eval(expr);\n}\n';
+      const vulnerableSource = 'export function parseLegacyJson(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n';
       const evalFinding = makeFinding({
         scanner: "semgrep",
-        ruleId: "js-code-execution-eval",
+        ruleId: "semgrep:eval-detected",
         category: "Code Analysis",
-        severity: "critical",
-        title: "Arbitrary code execution via eval",
-        filePath: "src/calc.ts",
+        severity: "high",
+        title: "Legacy JSON deserialization",
+        filePath: "src/parser.ts",
         fingerprint: "fp-eval-verified-99",
         startLine: 2,
         endLine: 2,
-        redactedEvidence: "  return eval(expr);",
+        redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
 
       await store.saveFindings(job.id, [evalFinding]);
@@ -562,7 +562,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       const mockScanEngine = async (dir: string) => {
         const fs = await import("node:fs/promises");
         const path = await import("node:path");
-        const content = await fs.readFile(path.join(dir, "src/calc.ts"), "utf8").catch(() => "");
+        const content = await fs.readFile(path.join(dir, "src/parser.ts"), "utf8").catch(() => "");
         const hasEval = /\beval\s*\(/.test(content);
         return {
           status: "completed" as const,
@@ -588,7 +588,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/calc.ts": vulnerableSource },
+        sourceFiles: { "src/parser.ts": vulnerableSource },
         scanEngine: mockScanEngine,
       };
 
@@ -665,15 +665,15 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       const evalFinding = makeFinding({
         scanner: "semgrep",
-        ruleId: "js-code-execution-eval",
+        ruleId: "semgrep:eval-detected",
         category: "Code Analysis",
-        severity: "critical",
-        title: "Arbitrary code execution via eval",
-        filePath: "src/calc.ts",
+        severity: "high",
+        title: "Legacy JSON deserialization",
+        filePath: "src/parser.ts",
         fingerprint: "fp-eval-incomplete",
         startLine: 2,
         endLine: 2,
-        redactedEvidence: "  return eval(expr);",
+        redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
 
       await store.saveFindings(job.id, [evalFinding]);
@@ -703,7 +703,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/calc.ts": "return eval(expr);" },
+        sourceFiles: { "src/parser.ts": 'return eval("(" + rawJson + ")");' },
         scanEngine: mockFailingScanEngine,
       };
 
@@ -716,6 +716,335 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       expect(result.status).toBe("needs_review");
       expect(result.rescanStatus).toBe("needs_review");
       expect(result.rescanSummary?.targetResolved).toBe(false);
+    });
+  });
+
+  describe("7. Security Hardening & Fail-Closed eval() Remediation Regression Suite", () => {
+    it("case 1: eval(script) with a description indicating arbitrary script execution is rejected", async () => {
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "js-code-execution-eval",
+        title: "Dynamic code execution",
+        description: "Executes arbitrary script passed by user",
+        filePath: "src/runner.ts",
+        redactedEvidence: "  return eval(script);",
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-reg-1",
+          commitSha: "sha-1",
+        })
+      ).rejects.toThrow(
+        /Cannot safely replace eval\(\) with JSON\.parse\(\) where arbitrary JavaScript execution semantics must be preserved/
+      );
+    });
+
+    it("case 2: eval(script) with additional generic words such as data, input, or payload is still rejected", async () => {
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "js-code-execution-eval",
+        title: "Dynamic code execution with input data payload",
+        description: "Executes arbitrary script passed by user to process input data payload",
+        filePath: "src/runner.ts",
+        redactedEvidence: "  return eval(script);",
+        remediation: "Avoid dynamic execution of arbitrary script even for data payload parsing.",
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-reg-2",
+          commitSha: "sha-1",
+        })
+      ).rejects.toThrow(
+        /Cannot safely replace eval\(\) with JSON\.parse\(\) where arbitrary JavaScript execution semantics must be preserved/
+      );
+    });
+
+    it("case 3: evidence containing a JSON-related keyword without sufficient source context is rejected for automatic remediation", async () => {
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "js-code-execution-eval",
+        title: "Unsafe JSON parsing via eval",
+        description: "Uses eval to parse JSON data",
+        filePath: "src/handler.ts",
+        redactedEvidence: "  const result = eval(userInput);",
+      });
+
+      // Without sourceContent or with generic variable name without JSON proof
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-reg-3",
+          commitSha: "sha-1",
+        })
+      ).rejects.toThrow(
+        /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+      );
+    });
+
+    it("case 4: a genuinely verified JSON-parsing transformation is accepted only when its preconditions are established", async () => {
+      // Precondition A: surrounding source context confirms JSON parsing + explicit JSON-named variable
+      const verifiedFinding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        title: "Unsafe eval usage",
+        description: "Evaluates JSON string dynamically",
+        filePath: "src/config.ts",
+        startLine: 3,
+        endLine: 3,
+        redactedEvidence: "  return eval(jsonData);",
+      });
+
+      const sourceContent = `export function parseConfig(jsonData: string) {
+  // Parse incoming JSON configuration
+  return eval(jsonData);
+}`;
+
+      const patchResult = await generateRemediationPatch({
+        finding: verifiedFinding,
+        scanJobId: "job-reg-4",
+        commitSha: "sha-1",
+        sourceContent,
+      });
+
+      expect(patchResult.unifiedDiff).toContain("-  return eval(jsonData);");
+      expect(patchResult.unifiedDiff).toContain("+  return JSON.parse(jsonData);");
+      expect(patchResult.patchSummary).toMatch(/Replace unsafe dynamic eval\(\) with safe JSON\.parse\(\)/);
+
+      // Precondition B: classic pre-JSON.parse deserialization idiom
+      const idiomFinding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        title: "Legacy JSON deserialization",
+        description: "Legacy pre-JSON.parse deserialization idiom",
+        filePath: "src/parser.ts",
+        startLine: 2,
+        endLine: 2,
+        redactedEvidence: '  return eval("(" + rawData + ")");',
+      });
+
+      const idiomPatchResult = await generateRemediationPatch({
+        finding: idiomFinding,
+        scanJobId: "job-reg-4",
+        commitSha: "sha-1",
+      });
+
+      expect(idiomPatchResult.unifiedDiff).toContain('-  return eval("(" + rawData + ")");');
+      expect(idiomPatchResult.unifiedDiff).toContain("+  return JSON.parse(rawData);");
+    });
+
+    it("case 5: invalid, stale, or non-applicable patches do not become verified", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-user",
+        repo: "vulnerable-app",
+        repositoryUrl: "https://github.com/test-user/vulnerable-app",
+        expiresAt: new Date(Date.now() + 3600000),
+      });
+      await store.update(job.id, {
+        status: "completed",
+        commitSha: "sha-stale-001",
+        defaultBranch: "main",
+      });
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        title: "Unsafe eval",
+        filePath: "src/config.ts",
+        fingerprint: "fp-eval-stale",
+        startLine: 3,
+        endLine: 3,
+        redactedEvidence: "  return eval(jsonData);",
+      });
+      await store.saveFindings(job.id, [finding]);
+
+      // Stale patch: targets code lines that do not exist or mismatch
+      const staleRem = await store.createRemediation({
+        id: "rem-stale-001",
+        scanJobId: job.id,
+        findingFingerprints: ["fp-eval-stale"],
+        affectedFiles: ["src/config.ts"],
+        commitSha: "sha-stale-001",
+        eligibility: "safe",
+        eligibilityReason: "Localized safe fix",
+        requiresRotation: false,
+        patchSummary: "Stale patch",
+        unifiedDiff: `--- a/src/config.ts\n+++ b/src/config.ts\n@@ -10,1 +10,1 @@\n-nonExistentCodeOldLine();\n+replacementCode();\n`,
+        status: "approved",
+        approvedAt: new Date(),
+        rescanStatus: null,
+        branchName: null,
+        pullRequestUrl: null,
+      });
+
+      // Scan engine still detects the vulnerability post-patch because stale patch didn't fix it
+      const mockEngine = async () => ({
+        status: "completed" as const,
+        findings: [finding],
+        counts: { critical: 1, high: 0, medium: 0, low: 0, info: 0, total: 1 },
+        gitleaksStatus: "completed" as const,
+        gitleaksDurationMs: 10,
+        gitleaksError: null,
+        semgrepStatus: "completed" as const,
+        semgrepDurationMs: 50,
+        semgrepError: null,
+        osvStatus: "completed" as const,
+        osvDurationMs: 10,
+        osvError: null,
+        scannerVersions: { gitleaks: "8.18", semgrep: "1.60", osvScanner: "2.7" },
+        scanCoverage: { lockfilesFound: [], scannersRun: ["semgrep"], limitations: [] },
+      });
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles: { "src/config.ts": "export function parseConfig(jsonData: string) {\n  return eval(jsonData);\n}\n" },
+        scanEngine: mockEngine,
+      };
+
+      const result = await applyAndVerify(job.id, staleRem.id, deps);
+      expect(result.status).toBe("needs_review");
+      expect(result.rescanStatus).toBe("needs_review");
+      expect(result.rescanSummary?.targetResolved).toBe(false);
+    });
+
+    it("case 6: an unapproved apply request is rejected", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-user",
+        repo: "vulnerable-app",
+        repositoryUrl: "https://github.com/test-user/vulnerable-app",
+        expiresAt: new Date(Date.now() + 3600000),
+      });
+      await store.update(job.id, {
+        status: "completed",
+        commitSha: "sha-001",
+        defaultBranch: "main",
+      });
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        filePath: "src/config.ts",
+        fingerprint: "fp-unapproved",
+        redactedEvidence: '  return eval("(" + rawData + ")");',
+      });
+      await store.saveFindings(job.id, [finding]);
+      const { findings: savedFindings6 } = await store.getFindings(job.id);
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles: { "src/config.ts": 'return eval("(" + rawData + ")");' },
+      };
+
+      const preview = await createPreview(job.id, savedFindings6[0].id, deps);
+      expect(preview.status).toBe("preview");
+      expect(preview.approvedAt).toBeNull();
+
+      // Attempting to apply without explicit user approval must throw 403
+      await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toThrow(
+        /Explicit user approval is required/
+      );
+    });
+
+    it("case 7: a failed post-fix rescan or regression check does not mark remediation successful", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-user",
+        repo: "vulnerable-app",
+        repositoryUrl: "https://github.com/test-user/vulnerable-app",
+        expiresAt: new Date(Date.now() + 3600000),
+      });
+      await store.update(job.id, {
+        status: "completed",
+        commitSha: "sha-001",
+        defaultBranch: "main",
+      });
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        filePath: "src/config.ts",
+        fingerprint: "fp-target",
+        redactedEvidence: '  return eval("(" + rawData + ")");',
+      });
+      await store.saveFindings(job.id, [finding]);
+      const { findings: savedFindings7 } = await store.getFindings(job.id);
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles: { "src/config.ts": 'return eval("(" + rawData + ")");' },
+      };
+
+      const preview = await createPreview(job.id, savedFindings7[0].id, deps);
+      await approveRemediation(job.id, preview.id, deps, "admin");
+
+      // Subcase 7A: Rescan introduces a new regression finding
+      const regressionFinding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:regression-detected",
+        fingerprint: "fp-regression-999",
+      });
+
+      const engineWithRegression = async () => ({
+        status: "completed" as const,
+        findings: [regressionFinding], // target is resolved, but new regression was introduced!
+        counts: { critical: 0, high: 1, medium: 0, low: 0, info: 0, total: 1 },
+        gitleaksStatus: "completed" as const,
+        gitleaksDurationMs: 10,
+        gitleaksError: null,
+        semgrepStatus: "completed" as const,
+        semgrepDurationMs: 50,
+        semgrepError: null,
+        osvStatus: "completed" as const,
+        osvDurationMs: 10,
+        osvError: null,
+        scannerVersions: { gitleaks: "8.18", semgrep: "1.60", osvScanner: "2.7" },
+        scanCoverage: { lockfilesFound: [], scannersRun: ["semgrep"], limitations: [] },
+      });
+
+      const regressionResult = await applyAndVerify(job.id, preview.id, {
+        ...deps,
+        scanEngine: engineWithRegression,
+      });
+
+      expect(regressionResult.status).toBe("needs_review");
+      expect(regressionResult.rescanStatus).toBe("needs_review");
+      expect(regressionResult.rescanSummary?.newFindingsCount).toBe(1);
+      expect(regressionResult.rescanSummary?.regressions).toContain("fp-regression-999");
+
+      // Subcase 7B: Rescan engine itself fails
+      const failingEngine = async () => ({
+        status: "failed" as const,
+        findings: [],
+        counts: { critical: 0, high: 0, medium: 0, low: 0, info: 0, total: 0 },
+        gitleaksStatus: "failed" as const,
+        gitleaksDurationMs: 10,
+        gitleaksError: "Engine timeout",
+        semgrepStatus: "failed" as const,
+        semgrepDurationMs: 10,
+        semgrepError: "Engine crashed",
+        osvStatus: "failed" as const,
+        osvDurationMs: 10,
+        osvError: "Engine error",
+        scannerVersions: { gitleaks: "8.18", semgrep: "1.60", osvScanner: "2.7" },
+        scanCoverage: { lockfilesFound: [], scannersRun: [], limitations: ["Failed scan"] },
+      });
+
+      // Create fresh preview for Subcase 7B to test engine failure on approved patch
+      const preview2 = await createPreview(job.id, savedFindings7[0].id, deps);
+      await approveRemediation(job.id, preview2.id, deps, "admin");
+
+      const failedRescanResult = await applyAndVerify(job.id, preview2.id, {
+        ...deps,
+        scanEngine: failingEngine,
+      });
+
+      expect(failedRescanResult.status).toBe("needs_review");
+      expect(failedRescanResult.rescanStatus).toBe("failed");
     });
   });
 });

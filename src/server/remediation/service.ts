@@ -58,17 +58,19 @@ export async function createPreview(
         scanJobId,
         commitSha,
         llmProvider: deps.llmProvider,
+        sourceContent: deps.sourceFiles ? deps.sourceFiles[finding.filePath] : undefined,
       });
       unifiedDiff = patchResult.unifiedDiff;
       patchSummary = patchResult.patchSummary;
       affectedFiles = patchResult.affectedFiles;
-    } catch {
+    } catch (err: unknown) {
+      const message = err instanceof Error && err.message ? err.message : "Manual review required.";
       patchSummary = `Manual review required for ${finding.ruleId}`;
       affectedFiles = [finding.filePath];
       unifiedDiff = "";
       eligibility.canAutoFix = false;
       eligibility.eligibility = "unsuitable";
-      eligibility.reason = "Automated patch generation cannot safely transform this code pattern without AI. Manual review required.";
+      eligibility.reason = message;
       eligibility.warnings.push("No automated fix could be safely generated. Please review and apply changes manually.");
     }
   } else {

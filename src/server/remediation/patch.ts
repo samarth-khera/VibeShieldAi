@@ -96,13 +96,14 @@ export async function generateRemediationPatch(params: {
   scanJobId: string;
   commitSha: string;
   llmProvider?: LlmProvider;
+  sourceContent?: string;
 }): Promise<{
   unifiedDiff: string;
   patchSummary: string;
   affectedFiles: string[];
   eligibility: ReturnType<typeof classifyRemediationEligibility>;
 }> {
-  const { finding, llmProvider } = params;
+  const { finding, llmProvider, sourceContent } = params;
   const eligibility = classifyRemediationEligibility(finding);
 
   if (!eligibility.canAutoFix) {
@@ -193,27 +194,65 @@ Generate a minimal, exact unified diff applying the fix for ${cleanFile}.`;
   const evidence = (finding.redactedEvidence || "").trimEnd();
   const rule = (finding.ruleId || "").toLowerCase();
 
-  // Pattern A: eval() to JSON.parse() ONLY when evidence/remediation/context confirms data parsing
+  // Pattern A: eval() to JSON.parse() ONLY when verified JSON preconditions are established
   if (evidence && (rule.includes("eval") || rule.includes("code-execution"))) {
     if (/\beval\s*\(/.test(evidence)) {
-      // Reject generic replacement where arbitrary JavaScript execution semantics must be preserved
-      const isArbitraryScriptExecution =
-        /\beval\s*\(\s*(?:script|code|js|program|command|func|snippet)\b/i.test(evidence) ||
-        /\b(?:script|runtime|function|arbitrary code)\b/i.test(finding.description || "");
+      // 1. Strict Fail-Closed Policy: Any indicator of arbitrary script / dynamic code execution
+      // immediately requires manual review. Generic keywords (data, payload, input) CANNOT override this.
+      const indicatesArbitraryScriptExecution =
+        /\beval\s*\(\s*(?:script|code|js|program|command|cmd|func|fn|snippet|handler|action|statement|expr|expression)\b/i.test(evidence) ||
+        /\b(?:script|runtime|function|expression|arbitrary code|code execution|command execution|dynamic execution|shell)\b/i.test(finding.description || "") ||
+        /\b(?:script|arbitrary code|code execution|command execution|expression)\b/i.test(finding.title || "");
 
-      const hasExplicitDataParsingContext =
-        /json|parse|payload|body|data|input|expr|value|str/i.test(evidence) ||
-        /json|parse/i.test(finding.title || "") ||
-        /json\.parse/i.test(finding.remediation || "");
-
-      if (isArbitraryScriptExecution && !hasExplicitDataParsingContext) {
+      if (indicatesArbitraryScriptExecution) {
         throw new Error(
           `Cannot safely replace eval() with JSON.parse() where arbitrary JavaScript execution semantics must be preserved for ${finding.ruleId}. Manual code review is required.`
         );
       }
 
-      const securedEvidence = evidence.replace(/\beval\s*\(([^)]+)\)/g, "JSON.parse($1)");
-      if (securedEvidence !== evidence) {
+      // 2. Verified Preconditions: Keyword presence in title/description alone NEVER establishes that
+      // replacing eval() with JSON.parse() is semantically correct.
+      // Automatic transformation is permitted ONLY when actual source context proves input is JSON text.
+
+      // Precondition Check A: Classic pre-JSON.parse deserialization idiom:
+      // e.g. eval("(" + str + ")") or eval('(' + data + ')') or eval(`(${str})`)
+      const classicIdiomMatch = evidence.match(
+        /\beval\s*\(\s*(?:["']\(["']\s*\+\s*([^)]+?)\s*\+\s*["']\)["']|`\(\$\{(.+?)\}\)`)\s*\)/
+      );
+
+      // Precondition Check B: Surrounding source context + explicit JSON-named variable:
+      // The argument must be explicitly named as JSON text (e.g., jsonData, jsonStr, rawJson, jsonText)
+      // AND sourceContent must be provided and confirm JSON parsing context.
+      const evalArgMatch = evidence.match(/\beval\s*\(([^)]+)\)/);
+      const evalArg = evalArgMatch ? evalArgMatch[1].trim() : "";
+      const isExplicitJsonVariable = /^(?:raw_?json|json_?(?:str(?:ing)?|data|text|payload|content)?)$/i.test(evalArg);
+
+      const sourceContextConfirmsJson = Boolean(
+        sourceContent &&
+        (
+          /\b(?:parseJson|readJson|loadJson|parseConfig|deserializeJson|application\/json|JSON\.stringify)\b/i.test(sourceContent) ||
+          /\b(?:json|parse)\b/i.test(sourceContent)
+        )
+      );
+
+      let securedEvidence: string | null = null;
+
+      if (classicIdiomMatch) {
+        const innerArg = (classicIdiomMatch[1] || classicIdiomMatch[2] || "").trim();
+        securedEvidence = evidence.replace(
+          /\beval\s*\(\s*(?:["']\(["']\s*\+\s*[^)]+?\s*\+\s*["']\)["']|`\(\$\{[^}]+\}\)`)\s*\)/g,
+          `JSON.parse(${innerArg})`
+        );
+      } else if (isExplicitJsonVariable && sourceContextConfirmsJson) {
+        securedEvidence = evidence.replace(/\beval\s*\(([^)]+)\)/g, "JSON.parse($1)");
+      } else {
+        // Insufficient source context, generic keywords only, or missing source verification
+        throw new Error(
+          `Cannot automatically replace eval() with JSON.parse() without verified JSON source context for ${finding.ruleId}. Manual code review is required.`
+        );
+      }
+
+      if (securedEvidence && securedEvidence !== evidence) {
         const start = finding.startLine ?? 1;
         const diffLines = [
           `--- a/${cleanFile}`,
