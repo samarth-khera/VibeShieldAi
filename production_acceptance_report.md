@@ -2,40 +2,42 @@
 
 **Repository**: [https://github.com/samarth-khera/VibeShieldAi](https://github.com/samarth-khera/VibeShieldAi)  
 **Branch**: `main`  
-**Final Production Commit SHA**: [`18c365c`](https://github.com/samarth-khera/VibeShieldAi/commit/18c365c)  
+**Final Production Commit SHA**: [`36fbcad`](https://github.com/samarth-khera/VibeShieldAi/commit/36fbcad)  
 **Live Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 **Live Health Endpoint**: [https://vibeshield-ai-phi.vercel.app/api/health](https://vibeshield-ai-phi.vercel.app/api/health)  
-**Report Date**: 2026-10-25  
+**Report Date**: 2026-10-26  
 
 ---
 
 ## 1. Executive Summary
 
-This report documents the resolution of the final acceptance gate for source-proof ordering, lexical scope, and parameter destructuring in `eval()` remediation in VibeShield AI:
+This report documents the resolution of the final AST verifier acceptance check closing the two remaining verification gaps for `eval()` remediation in VibeShield AI:
 
-1. **Elimination of Text-Based Heuristics**:
-   - Replaced all text-based / regex scanning with TypeScript Abstract Syntax Tree (AST) analysis using `ts.createSourceFile`.
-   - The verifier strictly enforces **declaration identity**, **lexical scope containment**, **source-code ordering**, **parameter destructuring rejection**, and **absence of intervening assignments/mutations**.
+1. **Verification of `JSON.stringify` Binding Identity**:
+   - Does not accept an AST call merely because its syntax is `JSON.stringify(...)`.
+   - Implemented `hasJsonShadowOrOverride(sourceFile)` which rigorously inspects all declarations, bindings, imports, and mutations across the AST:
+     - Variable declarations (`const JSON`, `let JSON`, `var JSON`, destructured `{ JSON }`).
+     - Function, class, enum, namespace/module, interface, and type alias declarations named `JSON`.
+     - Parameter bindings and catch clauses binding `JSON`.
+     - Imports (`import JSON`, `import { JSON }`, `import * as JSON`, `import JSON = require`).
+     - Export specifiers (`export { custom as JSON }`).
+     - Assignments and mutations (`JSON = ...`, `JSON.stringify = ...`, `JSON["stringify"] = ...`, `globalThis.JSON = ...`).
+     - Delete expressions (`delete JSON.stringify`).
+     - Property definition or object mutation (`Object.assign(JSON, ...)`, `Object.defineProperty(JSON, ...)`).
+   - If the `JSON` identifier cannot be proven to resolve strictly to the genuine built-in global object, automatic remediation is rejected and routed to manual review.
 
-2. **Resolution of Destructured Parameter & Reordering Bypass**:
-   - Identified and resolved the regression:
-     `function process({ data }) { eval(data); data = JSON.stringify({ safe: true }); }`
-   - The AST verifier recursively inspects parameter binding elements (`ObjectBindingPattern`, `ArrayBindingPattern`, renamed properties, nested destructuring, default values, and rest parameters) across all enclosing functions. Any parameter binding immediately disqualifies automatic remediation.
-   - Enforces strict source-order data-flow: the single `const` declaration must appear *strictly before* the `eval()` call (`decl.getStart() < targetEval.getStart()`).
-   - Rejects any subsequent assignments, reassignments, or mutations (`=`, compound assignments, `++`, `--`) anywhere in the source file.
+2. **Fail-Closed on TypeScript Parse Diagnostics & Ambiguous Resolution**:
+   - Explicitly inspects `sourceFile.parseDiagnostics` immediately after `ts.createSourceFile`. Any syntax error or malformed source code fails closed without attempting AST proof.
+   - Strictly enforces unambiguous target call resolution: if multiple matching calls exist in a source file, a valid `findingLine` must be provided and must match *exactly one* call on that line (rejecting multiple calls on the same line or ambiguous line references).
 
-3. **Strict Lexical Scope Enforcement**:
-   - The declaration's scope container (nearest `Block` or `SourceFile`) must be an ancestor of the `eval()` call. Safe-looking declarations in sibling blocks, inner closed blocks, or external functions are strictly refused.
-   - Variables shadowed in nested blocks or functions fail closed.
-   - Files with multiple declarations of the target variable fail closed to eliminate any scope ambiguity.
-
-4. **Preservation of Core Security Invariants**:
+3. **Preservation of Core Security Invariants**:
+   - AST-based parameter destructuring, scope hierarchy, single declaration identity, source ordering, and mutation prevention checks are 100% preserved.
    - The LLM provider is strictly never called for `eval()` or dynamic code execution findings.
    - Human approval remains mandatory for applying any patch.
    - Patch application is verified in an isolated sandbox with a security rescan ensuring zero regressions.
-   - Unrelated eligible findings retain their automated remediation capabilities.
+   - Unrelated eligible findings (security headers, dependencies) retain their automated remediation capabilities.
 
-All changes have been validated across the complete test suite (**194 tests passing, 0 failures across 15 test files**), typecheck (exit 0), lint (exit 0), production build (exit 0), Gitleaks (exit 0), Semgrep (exit 0), and OSV-Scanner (exit 0).
+All changes have been validated across the complete test suite (**197 tests passing, 0 failures across 15 test files**), typecheck (exit 0), lint (exit 0), production build (exit 0), Gitleaks (exit 0), Semgrep (exit 0), and OSV-Scanner (exit 0).
 
 ---
 
@@ -50,7 +52,7 @@ All changes have been validated across the complete test suite (**194 tests pass
 
 ---
 
-## 3. Targeted Regression Cases Exercised (All 24 Cases in Suite 7)
+## 3. Targeted Regression Cases Exercised (All 27 Cases in Suite 7 & AST Acceptance)
 
 | Test Case | Description | Test Implementation | Result |
 | :--- | :--- | :--- | :--- |
@@ -71,6 +73,15 @@ All changes have been validated across the complete test suite (**194 tests pass
 | **Variant 5B** | Declaration in closed sibling block | `function processSibling() { if (true) { const data = JSON.stringify(...); } eval(data); }` | **PASS** (Refused: sibling scope container not ancestor of eval) |
 | **Variant 6A** | Valid JSON data initialized before call (`JSON.stringify`) | `export function getValidConfig() { const data = JSON.stringify({ safe: true }); return eval("(" + data + ")"); }` | **PASS** (Accepted: diff generated replacing eval with `JSON.parse(data)`) |
 | **Variant 6B** | Valid JSON data initialized before call (static literal) | `export function getStaticData() { const data = '{"safe": true, "version": 2}'; return eval("(" + data + ")"); }` | **PASS** (Accepted: diff generated replacing eval with `JSON.parse(data)`) |
+| **Variant 7A** | Locally shadowed JSON object returning executable JavaScript | `const JSON = { stringify: () => "alert('pwned:' + ...)" }; eval("(" + data + ")");` | **PASS** (Refused in both `verifyJsonSourceProof` and `generateRemediationPatch`) |
+| **Variant 7B** | Mutated JSON.stringify property | `JSON.stringify = () => "evil()"; ... eval("(" + data + ")");` | **PASS** (Refused: mutation to JSON object detected) |
+| **Variant 7C** | Imported custom JSON module | `import JSON from "custom-json-lib"; ... eval("(" + data + ")");` | **PASS** (Refused: imported JSON module detected) |
+| **Variant 7D** | Parameter binding named JSON | `function getParamConfig(JSON: any) { ... eval("(" + data + ")"); }` | **PASS** (Refused: JSON parameter binding detected) |
+| **Variant 8A** | Malformed source: missing expression syntax error | `const bad = ; const data = JSON.stringify(...); eval("(" + data + ")");` | **PASS** (Refused: parse diagnostics detected) |
+| **Variant 8B** | Malformed source: unclosed block / delimiter | `function getUnclosedConfig() { ... eval("(" + data + ")"` | **PASS** (Refused: parse diagnostics detected) |
+| **Variant 9A** | Ambiguous target calls: multiple calls without finding line | Multiple eval calls referencing data with no line number passed. | **PASS** (Refused: ambiguous target call resolution) |
+| **Variant 9B** | Ambiguous target calls: multiple calls on the same line | `eval(data); eval(data);` on same line. | **PASS** (Refused: ambiguous target call resolution) |
+| **Variant 9C** | Target call line mismatch | Single eval call on line 4, but line 99 requested. | **PASS** (Refused: call not found on requested line) |
 | **E2E Fixture** | Full lifecycle contrast: reproduced bypass vs legitimate wrapper | Contrast `process({ data })` with `getSafeConfig()`. Verify unsuitable status on bypass, mandatory approval, sandbox apply, and 0 regressions on legitimate config. | **PASS** (Bypass creates unsuitable preview with empty diff; safe config successfully approved and verified) |
 | **Case 1** | `eval(script)` with arbitrary execution description | `generateRemediationPatch` with `eval(script)` and arbitrary execution description. | **PASS** (Throws manual review error) |
 | **Case 2** | `eval(script)` with generic words (`data`, `input`, `payload`) | Generic keywords cannot override arbitrary script indicators. | **PASS** (Throws manual review error) |
@@ -85,7 +96,7 @@ All changes have been validated across the complete test suite (**194 tests pass
 
 | Check | Command Run | Exit Code | Outcome Details |
 | :--- | :--- | :---: | :--- |
-| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 194 tests passed (0 failed)** in 11.94s. |
+| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 197 tests passed (0 failed)** in 12.95s. |
 | **TypeScript Typecheck** | `npm run typecheck` (`tsc --noEmit`) | `0` | **0 type errors**. Clean compilation across all files. |
 | **ESLint** | `npm run lint` (`eslint`) | `0` | **0 lint warnings / 0 lint errors**. |
 | **Production Build** | `npm run build` (`next build`) | `0` | Turbopack production build succeeded in 2.0s. All 21 static and dynamic routes compiled. |
@@ -130,7 +141,7 @@ The complete end-to-end remediation workflow was verified using automated integr
 ## 6. Deployment & Health Verification Evidence
 
 ### Vercel Production Deployment
-- **Commit**: [`18c365c`](https://github.com/samarth-khera/VibeShieldAi/commit/18c365c)  
+- **Commit**: [`36fbcad`](https://github.com/samarth-khera/VibeShieldAi/commit/36fbcad)  
 - **Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 - **Environment**: Production  
 
@@ -143,8 +154,8 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 {
   "status": "healthy",
   "mode": "github-actions",
-  "timestamp": "2026-10-25T19:48:49.000Z",
-  "latencyMs": 185,
+  "timestamp": "2026-10-25T20:04:55.551Z",
+  "latencyMs": 244,
   "services": {
     "database": "healthy",
     "dispatcher": "ready"
@@ -183,17 +194,20 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 | :--- | :--- | :---: | :--- |
 | **Elimination of Heuristic Function/Variable Name Proof** | Local Code | **PASS** | Function names, variable names, comments, and imports are completely ignored as proof. |
 | **AST-Based Lexical Scope & Data-Flow Proof** | Local Code | **PASS** | Evaluated via `ts.createSourceFile` AST analysis enforcing single `const` declaration, ancestor scope containment, and lack of mutations. |
+| **JSON.stringify Binding Identity Verification** | Local Code | **PASS** | Evaluated via `hasJsonShadowOrOverride` verifying JSON identifier is the authentic unshadowed built-in global object. |
+| **TypeScript Parser Diagnostics Fail-Closed Gate** | Local Code | **PASS** | Explicitly checks `sourceFile.parseDiagnostics`; any syntax error or malformed code fails closed. |
+| **Unambiguous Target Call Resolution** | Local Code | **PASS** | Evaluates 1:1 matching between finding line and AST target call; multiple ambiguous calls fail closed. |
 | **Destructured Parameter Rejection** | Local Code | **PASS** | Detected and refused for object (`{ data }`), renamed (`{ p: data }`), array (`[ data ]`), nested, default, and rest parameters. |
 | **Data-Flow Ordering Enforcement** | Local Code | **PASS** | Declaration must appear strictly prior to `eval()` call; subsequent assignments/mutations are refused. |
-| **24 Targeted Regression Tests in Suite 7** | Local Tests | **PASS** | All 24 cases pass with strict assertions. |
-| **Full Vitest Test Suite** | Local Tests | **PASS** | 15 test files, 194 tests passing (0 failures). |
+| **27 Targeted Regression Tests in Suite 7 & AST Acceptance** | Local Tests | **PASS** | All 27 cases pass with strict assertions. |
+| **Full Vitest Test Suite** | Local Tests | **PASS** | 15 test files, 197 tests passing (0 failures). |
 | **TypeScript Typecheck** | Local Build | **PASS** | `tsc --noEmit` exited with 0. |
 | **ESLint Validation** | Local Build | **PASS** | `eslint` exited with 0. |
 | **Next.js Production Build** | Local Build | **PASS** | `next build` compiled all routes in 2.0s with 0 errors. |
-| **Gitleaks Secret Scan** | Local Repo | **PASS** | 28 commits scanned: 0 leaks found. |
+| **Gitleaks Secret Scan** | Local Repo | **PASS** | 30 commits scanned: 0 leaks found. |
 | **Semgrep OSS Scan** | Local Repo | **PASS** | 86 files, 210 rules: 0 findings (0 blocking). |
 | **OSV-Scanner** | Local Repo | **PASS** | 667 packages: 0 vulnerabilities. |
-| **Commit Pushed to Main** | Remote Repo | **PASS** | Focused commit `18c365c` pushed to `origin main`. |
+| **Commit Pushed to Main** | Remote Repo | **PASS** | Focused commit `36fbcad` pushed to `origin main`. |
 | **Vercel Production Deployment** | Production | **PASS** | Production health verified live. |
 | **Production Health Endpoint** | Production | **PASS** | `https://vibeshield-ai-phi.vercel.app/api/health` returns healthy. |
 | **GitHub Pull Request Creation** | Production | **BLOCKED** | Missing GitHub write token (by design; `.patch` download fallback verified). |
