@@ -2,7 +2,8 @@
 
 **Repository**: [https://github.com/samarth-khera/VibeShieldAi](https://github.com/samarth-khera/VibeShieldAi)  
 **Branch**: `main`  
-**Final Production Commit SHA**: [`4384de7`](https://github.com/samarth-khera/VibeShieldAi/commit/4384de7)  
+**Final Production Commit SHA**: [`e895932`](https://github.com/samarth-khera/VibeShieldAi/commit/e895932)  
+**Security-Hardening Commit**: [`4384de7`](https://github.com/samarth-khera/VibeShieldAi/commit/4384de7)  
 **Live Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 **Live Health Endpoint**: [https://vibeshield-ai-phi.vercel.app/api/health](https://vibeshield-ai-phi.vercel.app/api/health)  
 **Report Date**: 2026-10-25  
@@ -111,9 +112,10 @@ The complete end-to-end remediation workflow was verified using automated integr
 ## 6. Deployment & Health Verification Evidence
 
 ### Vercel Production Deployment
-- **Commit**: [`4384de7`](https://github.com/samarth-khera/VibeShieldAi/commit/4384de7)
-- **Status**: Ready
-- **Environment**: Production
+- **Commit**: [`4384de7`](https://github.com/samarth-khera/VibeShieldAi/commit/4384de7) (Security-Hardening) / [`e895932`](https://github.com/samarth-khera/VibeShieldAi/commit/e895932)  
+- **Deployment URL**: `https://vibeshield-khztqmey7-samarth-kheras-projects.vercel.app`  
+- **Status**: `● Ready` (Duration: 24s)  
+- **Environment**: Production  
 
 ### Live Production Health Endpoint Verification
 ```bash
@@ -124,8 +126,8 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 {
   "status": "healthy",
   "mode": "github-actions",
-  "timestamp": "2026-10-25T17:15:32.410Z",
-  "latencyMs": 285,
+  "timestamp": "2026-10-25T17:19:06.089Z",
+  "latencyMs": 191,
   "services": {
     "database": "healthy",
     "dispatcher": "ready"
