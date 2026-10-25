@@ -27,6 +27,7 @@
     "react-dom": "19.3.0",
     "tailwind-merge": "^3.7.0",
     "tar": "^7.5.22",
+    "typescript": "^5",
     "zod": "^4.6.7"
   },
   "devDependencies": {
@@ -44,7 +45,6 @@
     "prisma": "^6.19.3",
     "tailwindcss": "^4",
     "tsx": "^4.23.15",
-    "typescript": "^5",
     "vitest": "^5.0.5"
   },
   "overrides": {

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { validateUnifiedDiff, generateRemediationPatch } from "@/server/remediation/patch";
+import { validateUnifiedDiff, generateRemediationPatch, verifyJsonSourceProof } from "@/server/remediation/patch";
 import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
 import { InMemoryJobStore } from "@/test/mock-store";
 import {
@@ -1314,6 +1314,433 @@ export function executeUserPayload(rawData: string) {
       ).rejects.toThrow(
         /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
       );
+    });
+
+    describe("AST-Based Source-Proof Ordering, Scope, and Destructuring Regression Tests", () => {
+      it("reproduces and refuses the false-acceptance bypass: function process({ data }) { eval(data); data = JSON.stringify({ safe: true }); }", async () => {
+        const reproducedSource = `function process({ data }: any) {
+  eval(data);
+  data = JSON.stringify({ safe: true });
+}`;
+
+        const finding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Dangerous eval of destructured parameter",
+          filePath: "src/process.ts",
+          startLine: 2,
+          endLine: 2,
+          redactedEvidence: "  eval(data);",
+        });
+
+        // 1. Direct unit verification via AST verifyJsonSourceProof
+        expect(verifyJsonSourceProof(reproducedSource, "data", 2)).toBe(false);
+
+        // 2. Public generateRemediationPatch interface must refuse automatic remediation
+        await expect(
+          generateRemediationPatch({
+            finding,
+            scanJobId: "job-reproduced-bypass",
+            commitSha: "sha-repro-1",
+            sourceContent: reproducedSource,
+          })
+        ).rejects.toThrow(
+          /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+        );
+      });
+
+      it("variant 1: refuses destructured function parameters (object, array, nested, renamed, and rest)", async () => {
+        // Variant 1A: Object destructuring
+        const objDestructSource = `function handleObj({ data }: any) {
+  return eval(data);
+}`;
+        expect(verifyJsonSourceProof(objDestructSource, "data", 2)).toBe(false);
+
+        // Variant 1B: Renamed object destructuring
+        const renamedObjSource = `function handleRenamed({ payload: data }: any) {
+  return eval(data);
+}`;
+        expect(verifyJsonSourceProof(renamedObjSource, "data", 2)).toBe(false);
+
+        // Variant 1C: Nested object destructuring
+        const nestedObjSource = `function handleNested({ config: { data } }: any) {
+  return eval(data);
+}`;
+        expect(verifyJsonSourceProof(nestedObjSource, "data", 2)).toBe(false);
+
+        // Variant 1D: Array destructuring
+        const arrayDestructSource = `const handleArray = ([ data ]: any) => {
+  return eval(data);
+};`;
+        expect(verifyJsonSourceProof(arrayDestructSource, "data", 2)).toBe(false);
+
+        // Variant 1E: Rest parameter
+        const restParamSource = `function handleRest(...data: any[]) {
+  return eval(data[0]);
+}`;
+        expect(verifyJsonSourceProof(restParamSource, "data", 2)).toBe(false);
+
+        // All must throw in generateRemediationPatch
+        const finding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Unsafe eval of destructured param",
+          filePath: "src/params.ts",
+          startLine: 2,
+          endLine: 2,
+          redactedEvidence: "  return eval(data);",
+        });
+
+        await expect(
+          generateRemediationPatch({
+            finding,
+            scanJobId: "job-destruct-param",
+            commitSha: "sha-1",
+            sourceContent: objDestructSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+      });
+
+      it("variant 2: refuses assignments occurring after the eval() call", async () => {
+        const postEvalAssignSource = `function handlePostAssign() {
+  let data: any;
+  eval(data);
+  data = JSON.stringify({ safe: true });
+}`;
+        expect(verifyJsonSourceProof(postEvalAssignSource, "data", 3)).toBe(false);
+
+        const postEvalConstSource = `function handlePostConst() {
+  eval(data);
+  const data = JSON.stringify({ safe: true });
+}`;
+        expect(verifyJsonSourceProof(postEvalConstSource, "data", 2)).toBe(false);
+
+        const finding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Eval executed before safe assignment",
+          filePath: "src/order.ts",
+          startLine: 3,
+          endLine: 3,
+          redactedEvidence: "  eval(data);",
+        });
+
+        await expect(
+          generateRemediationPatch({
+            finding,
+            scanJobId: "job-post-assign",
+            commitSha: "sha-1",
+            sourceContent: postEvalAssignSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+      });
+
+      it("variant 3: refuses variables shadowed in nested blocks or functions", async () => {
+        // Outer safe const is shadowed in inner block by untrusted variable
+        const shadowedBlockSource = `function handleShadow() {
+  const data = JSON.stringify({ safe: true });
+  {
+    const data = req.body;
+    eval(data);
+  }
+}`;
+        expect(verifyJsonSourceProof(shadowedBlockSource, "data", 5)).toBe(false);
+
+        // Outer safe const is shadowed by inner function parameter
+        const shadowedFnSource = `function outer() {
+  const data = JSON.stringify({ safe: true });
+  function inner(data: any) {
+    eval(data);
+  }
+}`;
+        expect(verifyJsonSourceProof(shadowedFnSource, "data", 4)).toBe(false);
+
+        const finding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Shadowed eval finding",
+          filePath: "src/shadow.ts",
+          startLine: 5,
+          endLine: 5,
+          redactedEvidence: "    eval(data);",
+        });
+
+        await expect(
+          generateRemediationPatch({
+            finding,
+            scanJobId: "job-shadowed",
+            commitSha: "sha-1",
+            sourceContent: shadowedBlockSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+      });
+
+      it("variant 4: refuses multiple declarations, reassignments, and ambiguous scope", async () => {
+        // Multiple declarations of the same variable
+        const multiDeclSource = `function processMulti() {
+  const data = JSON.stringify({ a: 1 });
+  const data = JSON.stringify({ b: 2 });
+  eval(data);
+}`;
+        expect(verifyJsonSourceProof(multiDeclSource, "data", 4)).toBe(false);
+
+        // Intervening reassignment
+        const reassignSource = `function processReassign(input: string) {
+  let data = JSON.stringify({ safe: true });
+  data = input;
+  eval(data);
+}`;
+        expect(verifyJsonSourceProof(reassignSource, "data", 4)).toBe(false);
+
+        // Compound assignment
+        const compoundAssignSource = `function processCompound(input: string) {
+  let data = JSON.stringify({ safe: true });
+  data += input;
+  eval(data);
+}`;
+        expect(verifyJsonSourceProof(compoundAssignSource, "data", 4)).toBe(false);
+
+        const finding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Ambiguous / reassigned variable",
+          filePath: "src/reassign.ts",
+          startLine: 4,
+          endLine: 4,
+          redactedEvidence: "  eval(data);",
+        });
+
+        await expect(
+          generateRemediationPatch({
+            finding,
+            scanJobId: "job-multi-decl",
+            commitSha: "sha-1",
+            sourceContent: reassignSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+      });
+
+      it("variant 5: refuses a safe-looking assignment outside the scope containing the eval() call", async () => {
+        // Declared in helper function, but evaluated in unrelated function
+        const externalScopeSource = `function helper() {
+  const data = JSON.stringify({ safe: true });
+  return data;
+}
+
+function process() {
+  eval(data);
+}`;
+        expect(verifyJsonSourceProof(externalScopeSource, "data", 7)).toBe(false);
+
+        // Declared in sibling closed block
+        const siblingBlockSource = `function processSibling() {
+  if (true) {
+    const data = JSON.stringify({ safe: true });
+  }
+  eval(data);
+}`;
+        expect(verifyJsonSourceProof(siblingBlockSource, "data", 5)).toBe(false);
+
+        const finding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Out-of-scope assignment",
+          filePath: "src/scope.ts",
+          startLine: 7,
+          endLine: 7,
+          redactedEvidence: "  eval(data);",
+        });
+
+        await expect(
+          generateRemediationPatch({
+            finding,
+            scanJobId: "job-external-scope",
+            commitSha: "sha-1",
+            sourceContent: externalScopeSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+      });
+
+      it("variant 6: accepts valid JSON data initialized before the call without intervening reassignment", async () => {
+        // Valid JSON.stringify
+        const validStringifySource = `export function getValidConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(validStringifySource, "data", 3)).toBe(true);
+
+        const stringifyFinding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Safe JSON stringify wrapper",
+          filePath: "src/valid.ts",
+          startLine: 3,
+          endLine: 3,
+          redactedEvidence: '  return eval("(" + data + ")");',
+        });
+
+        const patch1 = await generateRemediationPatch({
+          finding: stringifyFinding,
+          scanJobId: "job-valid-stringify",
+          commitSha: "sha-1",
+          sourceContent: validStringifySource,
+        });
+        expect(patch1.unifiedDiff).toContain("+  return JSON.parse(data);");
+        expect(patch1.unifiedDiff).toContain("-  return eval");
+
+        // Valid static JSON string literal
+        const validLiteralSource = `export function getStaticData() {
+  const data = '{"safe": true, "version": 2}';
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(validLiteralSource, "data", 3)).toBe(true);
+
+        const literalFinding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Safe static JSON literal wrapper",
+          filePath: "src/literal.ts",
+          startLine: 3,
+          endLine: 3,
+          redactedEvidence: '  return eval("(" + data + ")");',
+        });
+
+        const patch2 = await generateRemediationPatch({
+          finding: literalFinding,
+          scanJobId: "job-valid-literal",
+          commitSha: "sha-1",
+          sourceContent: validLiteralSource,
+        });
+        expect(patch2.unifiedDiff).toContain("+  return JSON.parse(data);");
+        expect(patch2.unifiedDiff).toContain("-  return eval");
+      });
+
+      it("end-to-end disposable fixture: reproduced bypass is refused across full preview lifecycle, while proven safe wrapper succeeds and verifies", async () => {
+        const store = new InMemoryJobStore();
+        const job = await store.create({
+          owner: "test-user",
+          repo: "vulnerable-app",
+          repositoryUrl: "https://github.com/test-user/vulnerable-app",
+          expiresAt: new Date(Date.now() + 3600000),
+        });
+        await store.update(job.id, {
+          status: "completed",
+          commitSha: "sha-e2e-fixture",
+          defaultBranch: "main",
+        });
+
+        const bypassSource = `function process({ data }: any) {
+  eval(data);
+  data = JSON.stringify({ safe: true });
+}`;
+        const bypassFinding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Reproduced bypass finding",
+          filePath: "src/bypass.ts",
+          fingerprint: "fp-bypass-e2e",
+          startLine: 2,
+          endLine: 2,
+          redactedEvidence: "  eval(data);",
+        });
+
+        const safeSource = `export function getSafeConfig() {
+  const safeData = JSON.stringify({ active: true, env: "prod" });
+  return eval("(" + safeData + ")");
+}`;
+        const safeFinding = makeFinding({
+          scanner: "semgrep",
+          ruleId: "semgrep:eval-detected",
+          title: "Legitimate safe config finding",
+          filePath: "src/config.ts",
+          fingerprint: "fp-safe-e2e",
+          startLine: 3,
+          endLine: 3,
+          redactedEvidence: '  return eval("(" + safeData + ")");',
+        });
+
+        await store.saveFindings(job.id, [bypassFinding, safeFinding]);
+        const { findings } = await store.getFindings(job.id);
+        const persistedBypass = findings.find((f) => f.fingerprint === "fp-bypass-e2e")!;
+        const persistedSafe = findings.find((f) => f.fingerprint === "fp-safe-e2e")!;
+
+        const deps: RemediationDeps = {
+          store,
+          sourceFiles: {
+            "src/bypass.ts": bypassSource,
+            "src/config.ts": safeSource,
+          },
+          scanEngine: async (dir: string) => {
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            const configContent = await fs.readFile(path.join(dir, "src/config.ts"), "utf8").catch(() => "");
+            const hasEval = /\beval\s*\(/.test(configContent);
+            return {
+              status: "completed" as const,
+              findings: hasEval ? [safeFinding] : [],
+              counts: { critical: hasEval ? 1 : 0, high: 0, medium: 0, low: 0, info: 0, total: hasEval ? 1 : 0 },
+              gitleaksStatus: "completed" as const,
+              gitleaksDurationMs: 5,
+              gitleaksError: null,
+              semgrepStatus: "completed" as const,
+              semgrepDurationMs: 20,
+              semgrepError: null,
+              osvStatus: "completed" as const,
+              osvDurationMs: 5,
+              osvError: null,
+              scannerVersions: { gitleaks: "8.18", semgrep: "1.60", osvScanner: "2.7" },
+              scanCoverage: { lockfilesFound: [], scannersRun: ["gitleaks", "semgrep", "osv-scanner"], limitations: [] },
+            };
+          },
+        };
+
+        // 1. Direct generation on reproduced bypass throws
+        await expect(
+          generateRemediationPatch({
+            finding: persistedBypass,
+            scanJobId: job.id,
+            commitSha: "sha-e2e-fixture",
+            sourceContent: bypassSource,
+          })
+        ).rejects.toThrow(
+          /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+        );
+
+        // 2. createPreview returns an empty diff with unsuitable eligibility requiring manual review
+        const bypassPreview = await createPreview(job.id, persistedBypass.id, deps);
+        expect(bypassPreview.unifiedDiff).toBe("");
+        expect(bypassPreview.eligibility).toBe("unsuitable");
+        expect(bypassPreview.eligibilityReason).toMatch(
+          /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+        );
+        expect(bypassPreview.warnings).toContain(
+          "No automated fix could be safely generated. Please review and apply changes manually."
+        );
+
+        // 3. Attempting to approve an unsuitable finding must fail
+        await expect(approveRemediation(job.id, bypassPreview.id, deps, "user-auditor")).rejects.toThrow(
+          /requires manual intervention and cannot be auto-approved/
+        );
+
+        // 4. Attempting to apply unapproved preview must fail
+        await expect(applyAndVerify(job.id, bypassPreview.id, deps)).rejects.toThrow(
+          /Explicit user approval is required/
+        );
+
+        // 5. Contrasting legitimate safe finding: createPreview succeeds
+        const safePreview = await createPreview(job.id, persistedSafe.id, deps);
+        expect(safePreview.unifiedDiff).toContain("JSON.parse(safeData)");
+        expect(safePreview.status).toBe("preview");
+
+        // 3. User approval is mandatory
+        const approved = await approveRemediation(job.id, safePreview.id, deps, "user-auditor");
+        expect(approved.status).toBe("approved");
+
+        // 4. Sandboxed verification applies patch and confirms 0 regressions
+        const verified = await applyAndVerify(job.id, safePreview.id, deps);
+        expect(verified.status).toBe("verified");
+        expect(verified.rescanStatus).toBe("verified");
+      });
     });
   });
 });

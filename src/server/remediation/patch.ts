@@ -1,4 +1,5 @@
 import path from "node:path";
+import ts from "typescript";
 import type { LlmProvider } from "../ai/client";
 import { redactText } from "../scanners/redact";
 import type { FindingRecord } from "../job-store";
@@ -89,95 +90,269 @@ export function validateUnifiedDiff(diff: string): PatchValidationResult {
 }
 
 /**
- * Strictly verifies whether an eval() argument has defensible, proven JSON data flow.
+ * Recursively checks if an AST binding pattern or identifier binds targetName.
+ * Handles:
+ * - Simple identifier: (data)
+ * - Object destructuring: ({ data }), renamed ({ d: data }), nested ({ a: { data } }), default ({ data = "{}" })
+ * - Array destructuring: ([ data ]), nested ([[ data ]]), rest (...data)
+ */
+function parameterBindsName(nameNode: ts.Node | undefined, target: string): boolean {
+  if (!nameNode) return false;
+  if (ts.isIdentifier(nameNode)) {
+    return nameNode.text === target;
+  }
+  if (ts.isObjectBindingPattern(nameNode) || ts.isArrayBindingPattern(nameNode)) {
+    for (const elem of nameNode.elements) {
+      if (ts.isOmittedExpression(elem)) continue;
+      if (parameterBindsName(elem.name, target)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Returns the nearest block-like scope container for a node.
+ */
+function getScopeContainer(node: ts.Node): ts.Node | null {
+  let p: ts.Node | undefined = node.parent;
+  while (p) {
+    if (
+      ts.isBlock(p) ||
+      ts.isSourceFile(p) ||
+      ts.isModuleBlock(p) ||
+      ts.isCaseClause(p) ||
+      ts.isDefaultClause(p)
+    ) {
+      return p;
+    }
+    p = p.parent;
+  }
+  return null;
+}
+
+/**
+ * Strictly verifies whether an eval() argument has defensible, proven JSON data flow
+ * using TypeScript AST analysis.
  *
  * Requirements:
- * 1. Do NOT treat function names (parseJson, parseConfig, deserializeJson),
- *    variable names (rawJson, jsonData), comments, imports, or isolated keywords
- *    as sufficient proof that an eval() argument contains JSON text.
- * 2. Parameters, external inputs (req, query, body, input, process, etc.), and reassignments
- *    must fail closed.
- * 3. Only locally defined, unpolluted constants assigned from a statically verified JSON literal
- *    (validated with JSON.parse) or JSON.stringify() qualify as proven JSON data flow.
+ * 1. Declaration identity & uniqueness: Exactly one declaration of cleanVar must exist
+ *    in the source file, and it must be a `const` variable declaration.
+ * 2. Lexical scope: The declaration's scope container must be an ancestor scope of the eval() call.
+ *    Variables declared in sibling/child blocks or outside the enclosing scope are refused.
+ * 3. Destructured parameters & inputs: If cleanVar is bound as a parameter (including
+ *    object/array destructuring patterns) in any enclosing function, it is refused.
+ * 4. Data-flow ordering: The declaration must occur strictly before the eval() call in source order.
+ * 5. Intervening assignments: Any assignment (`=`, `+=`, etc.) or mutation (`++`, `--`)
+ *    to cleanVar anywhere in the file disqualifies automatic remediation.
+ * 6. Initializer validation: Must be initialized with either:
+ *    a) Direct call to `JSON.stringify(...)` with no untrusted references in arguments.
+ *    b) A static string or no-substitution template literal whose content parses as valid JSON object.
+ * 7. Fail-closed: Any syntax error, ambiguous scope, or missing proof routes to manual review.
  */
-function verifyJsonSourceProof(localContext: string, cleanVar: string): boolean {
-  if (!cleanVar || !localContext) return false;
+export function verifyJsonSourceProof(
+  sourceContent: string,
+  cleanVar: string,
+  findingLine?: number | null
+): boolean {
+  if (!cleanVar || !sourceContent || typeof sourceContent !== "string" || !sourceContent.trim()) {
+    return false;
+  }
 
-  const lines = localContext.split("\n");
+  let sourceFile: ts.SourceFile;
+  try {
+    sourceFile = ts.createSourceFile("source.ts", sourceContent, ts.ScriptTarget.Latest, true);
+  } catch {
+    return false;
+  }
 
-  // 1. cleanVar cannot be a function parameter in any line of localContext
-  for (const line of lines) {
+  // 1. Locate all eval(...) calls that reference cleanVar
+  const matchingEvalCalls: ts.CallExpression[] = [];
+  function findEvalCalls(node: ts.Node) {
     if (
-      (line.includes("function") && line.includes(cleanVar) && line.includes("(") && line.includes(")")) ||
-      (line.includes("=>") && line.includes(cleanVar)) ||
-      (line.includes(`${cleanVar}:`) || line.includes(`${cleanVar} :`))
+      (ts.isCallExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === "eval") ||
+      (ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.name.text === "eval")
     ) {
-      const openParen = line.indexOf("(");
-      const closeParen = line.lastIndexOf(")");
-      if (openParen !== -1 && closeParen > openParen) {
-        const insideParens = line.slice(openParen + 1, closeParen);
-        const tokens = insideParens.split(/[\s,:]+/);
-        if (tokens.includes(cleanVar)) {
+      let refsCleanVar = false;
+      function checkArg(argNode: ts.Node) {
+        if (ts.isIdentifier(argNode) && argNode.text === cleanVar) {
+          refsCleanVar = true;
+        }
+        ts.forEachChild(argNode, checkArg);
+      }
+      node.arguments.forEach(checkArg);
+      if (refsCleanVar) {
+        matchingEvalCalls.push(node);
+      }
+    }
+    ts.forEachChild(node, findEvalCalls);
+  }
+  findEvalCalls(sourceFile);
+
+  if (matchingEvalCalls.length === 0) {
+    return false;
+  }
+
+  let targetEval = matchingEvalCalls[0];
+  if (findingLine != null && matchingEvalCalls.length > 1) {
+    let minDiff = Infinity;
+    for (const call of matchingEvalCalls) {
+      const line = sourceFile.getLineAndCharacterOfPosition(call.getStart(sourceFile)).line + 1;
+      const diff = Math.abs(line - findingLine);
+      if (diff < minDiff) {
+        minDiff = diff;
+        targetEval = call;
+      }
+    }
+  }
+
+  // 2. Reject if cleanVar is a parameter in any enclosing function (including destructuring)
+  let curr: ts.Node | undefined = targetEval.parent;
+  while (curr) {
+    if (
+      ts.isFunctionDeclaration(curr) ||
+      ts.isFunctionExpression(curr) ||
+      ts.isArrowFunction(curr) ||
+      ts.isMethodDeclaration(curr) ||
+      ts.isConstructorDeclaration(curr) ||
+      ts.isGetAccessorDeclaration(curr) ||
+      ts.isSetAccessorDeclaration(curr)
+    ) {
+      for (const param of curr.parameters) {
+        if (parameterBindsName(param.name, cleanVar)) {
           return false;
         }
       }
     }
+    curr = curr.parent;
   }
 
-  // 2. Find declarations and assignments of cleanVar in localContext
-  const assignmentRHSList: string[] = [];
-  for (const line of lines) {
-    const trimmed = line.trim();
-    let rhs: string | null = null;
-
-    if (trimmed.startsWith("const ") || trimmed.startsWith("let ") || trimmed.startsWith("var ")) {
-      const parts = trimmed.slice(trimmed.indexOf(" ") + 1).split("=");
-      if (parts.length >= 2 && parts[0].trim() === cleanVar) {
-        rhs = parts.slice(1).join("=").trim().replace(/;$/, "");
+  // 3. Find declarations of cleanVar across the entire file
+  const declarations: ts.Node[] = [];
+  function findDecls(node: ts.Node) {
+    if (ts.isVariableDeclaration(node)) {
+      if (parameterBindsName(node.name, cleanVar)) {
+        declarations.push(node);
       }
-    } else if (trimmed.startsWith(`${cleanVar} =`) || trimmed.startsWith(`${cleanVar}=`)) {
-      const parts = trimmed.split("=");
-      if (parts.length >= 2 && parts[0].trim() === cleanVar) {
-        rhs = parts.slice(1).join("=").trim().replace(/;$/, "");
+    } else if (
+      (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) &&
+      node.name &&
+      node.name.text === cleanVar
+    ) {
+      declarations.push(node);
+    } else if (ts.isParameter(node)) {
+      if (parameterBindsName(node.name, cleanVar)) {
+        declarations.push(node);
       }
     }
-
-    if (rhs !== null) {
-      assignmentRHSList.push(rhs);
-    }
+    ts.forEachChild(node, findDecls);
   }
+  findDecls(sourceFile);
 
-  // If there are zero assignments, or more than one (reassignment / conflicting data flow), reject!
-  if (assignmentRHSList.length !== 1) {
+  // Exactly one declaration must exist (rejects 0, multiple, shadowed, or ambiguous declarations)
+  if (declarations.length !== 1) {
     return false;
   }
 
-  const rhs = assignmentRHSList[0];
-
-  // 3. Reject any RHS that references untrusted sources, parameters, or external state
-  const untrustedRef = /\b(?:req|request|res|response|params|query|body|input|payload|script|code|cmd|command|user|process|window|document|fetch|argv|eval)\b/i;
-  if (untrustedRef.test(rhs)) {
+  const decl = declarations[0];
+  if (!ts.isVariableDeclaration(decl)) {
     return false;
   }
 
-  // 4. Case A: Direct call to JSON.stringify(...)
-  if (/^JSON\.stringify\s*\(/.test(rhs)) {
-    return true;
+  // Must be declared with `const`
+  const varDeclList = decl.parent;
+  if (
+    !ts.isVariableDeclarationList(varDeclList) ||
+    (varDeclList.flags & ts.NodeFlags.Const) === 0
+  ) {
+    return false;
   }
 
-  // 5. Case B: Static string literal containing valid JSON
-  const singleQuoteMatch = rhs.match(/^'([\s\S]*)'$/);
-  const doubleQuoteMatch = rhs.match(/^"([\s\S]*)"$/);
-  const backtickMatch = rhs.match(/^`([\s\S]*)`$/);
+  // 4. Source ordering: declaration must precede targetEval
+  if (decl.getStart(sourceFile) >= targetEval.getStart(sourceFile)) {
+    return false;
+  }
 
-  const rawLiteral = (singleQuoteMatch || doubleQuoteMatch || backtickMatch)?.[1];
-  if (rawLiteral !== undefined) {
-    if (rawLiteral.includes("${")) {
-      return false;
+  // 5. Scope check: declaration scope container must be an ancestor of targetEval
+  const declScope = getScopeContainer(decl);
+  if (!declScope) {
+    return false;
+  }
+
+  let isAncestorScope = false;
+  let walk: ts.Node | undefined = targetEval.parent;
+  while (walk) {
+    if (walk === declScope) {
+      isAncestorScope = true;
+      break;
     }
+    walk = walk.parent;
+  }
+  if (!isAncestorScope) {
+    return false;
+  }
+
+  // 6. Check for any assignments or mutations to cleanVar anywhere in the source
+  let hasAssignmentOrMutation = false;
+  function checkAssignments(node: ts.Node) {
+    if (ts.isBinaryExpression(node)) {
+      const isAssign =
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
+        (node.operatorToken.kind >= ts.SyntaxKind.FirstCompoundAssignment &&
+          node.operatorToken.kind <= ts.SyntaxKind.LastCompoundAssignment);
+      if (isAssign && parameterBindsName(node.left, cleanVar)) {
+        hasAssignmentOrMutation = true;
+      }
+    } else if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)
+    ) {
+      if (ts.isIdentifier(node.operand) && node.operand.text === cleanVar) {
+        hasAssignmentOrMutation = true;
+      }
+    }
+    ts.forEachChild(node, checkAssignments);
+  }
+  checkAssignments(sourceFile);
+  if (hasAssignmentOrMutation) {
+    return false;
+  }
+
+  // 7. Verify initializer: JSON.stringify(...) or valid JSON string literal
+  const init = decl.initializer;
+  if (!init) {
+    return false;
+  }
+
+  const untrustedWord = /^(?:req|request|res|response|params|query|body|input|payload|script|code|cmd|command|user|process|window|document|fetch|argv|eval)$/i;
+
+  // Case A: JSON.stringify(...)
+  if (
+    ts.isCallExpression(init) &&
+    ts.isPropertyAccessExpression(init.expression) &&
+    ts.isIdentifier(init.expression.expression) &&
+    init.expression.expression.text === "JSON" &&
+    ts.isIdentifier(init.expression.name) &&
+    init.expression.name.text === "stringify"
+  ) {
+    let hasUntrusted = false;
+    function checkUntrusted(node: ts.Node) {
+      if (ts.isIdentifier(node) && untrustedWord.test(node.text)) {
+        hasUntrusted = true;
+      }
+      ts.forEachChild(node, checkUntrusted);
+    }
+    init.arguments.forEach(checkUntrusted);
+    return !hasUntrusted;
+  }
+
+  // Case B: Static string literal or template literal that parses as valid JSON object
+  if (ts.isStringLiteral(init) || ts.isNoSubstitutionTemplateLiteral(init)) {
     try {
-      const unescaped = rawLiteral.replace(/\\"/g, '"').replace(/\\'/g, "'");
-      const parsed = JSON.parse(unescaped);
+      const parsed = JSON.parse(init.text);
       return typeof parsed === "object" && parsed !== null;
     } catch {
       return false;
@@ -277,28 +452,9 @@ export async function generateRemediationPatch(params: {
       );
     }
 
-    // Locate local context lines around the finding in sourceContent
-    const sourceLines = sourceContent.split("\n");
-    const startLine = finding.startLine ?? 1;
-    let actualLineIdx = Math.max(0, Math.min(sourceLines.length - 1, startLine - 1));
-
-    if (!sourceLines[actualLineIdx]?.includes("eval")) {
-      const foundIdx = sourceLines.findIndex((line) => line.includes("eval"));
-      if (foundIdx !== -1) {
-        actualLineIdx = foundIdx;
-      }
-    }
-
-    // Isolate immediate local function/block context (max 10 lines before/after).
-    // This strictly prevents unrelated occurrences of json or parse elsewhere in the file from being treated as proof.
-    const localStart = Math.max(0, actualLineIdx - 10);
-    const localEnd = Math.min(sourceLines.length, actualLineIdx + 11);
-    const localContext = sourceLines.slice(localStart, localEnd).join("\n");
-
-    // Do NOT treat function names (parseJson, parseConfig, deserializeJson),
-    // variable names (rawJson, jsonData), comments, imports, or isolated keywords
-    // as proof. Require verified local data-flow proof that the input is valid JSON text.
-    const isVerifiedJsonInput = verifyJsonSourceProof(localContext, cleanVar);
+    // Strictly verify declaration identity, lexical scope, data-flow ordering,
+    // and absence of intervening assignments via TypeScript AST analysis.
+    const isVerifiedJsonInput = verifyJsonSourceProof(sourceContent, cleanVar, finding.startLine);
 
     if (!isVerifiedJsonInput) {
       throw new Error(
