@@ -2,9 +2,9 @@ import { Reveal } from "@/components/ui/reveal";
 import { SectionHeading } from "./features";
 
 const steps = [
-  { n: "01", title: "Submit a repository", body: "Submit a public GitHub repository URL.", status: "Input validation available today" },
-  { n: "02", title: "Analyze", body: "Analyze the repository with security scanners.", status: "Planned — not connected yet" },
-  { n: "03", title: "Review & fix", body: "Review prioritized findings and recommended fixes.", status: "Explore via the sample report" },
+  { n: "01", title: "Submit a repository", body: "Submit a public GitHub repository URL.", status: "Active — Live submission & validation" },
+  { n: "02", title: "Analyze", body: "Analyze the repository with security scanners.", status: "Active — Gitleaks, Semgrep, OSV" },
+  { n: "03", title: "Review & fix", body: "Review prioritized findings and recommended fixes.", status: "Active — AI triage & remediation" },
 ];
 
 export function HowItWorks() {
