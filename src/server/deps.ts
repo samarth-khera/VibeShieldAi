@@ -7,6 +7,7 @@ import { fetchRepoMetadata } from "./github";
 import { RetrievalError } from "./errors";
 import type { ScanDeps } from "./scans-service";
 import { getLlmProvider } from "./ai/client";
+import { checkAiQuotaAndCircuitBreaker } from "./ai/circuit-breaker";
 import type { RemediationDeps } from "./remediation/service";
 
 /** Production wiring for the route handlers. */
@@ -15,6 +16,10 @@ export function getScanDeps(): ScanDeps {
   const isGithubBackend = config.scanDispatchBackend === "github-actions";
 
   const rateLimitFn = async (headers: Headers) => {
+    // AI analysis requests have their own dedicated circuit breaker and per-IP/global quota checks.
+    if (headers.get("x-vibeshield-context") === "ai") {
+      return { allowed: true, retryAfterSeconds: 0 };
+    }
     const key = clientKey(headers);
     if (isGithubBackend) {
       return checkDatabaseQuotas(prisma, key, config);
@@ -76,6 +81,7 @@ export function getScanDeps(): ScanDeps {
     rateLimit: rateLimitFn,
     workerOnline: workerOnlineFn,
     verifyRepo: verifyRepoFn,
+    checkAiQuota: (clientIpHash: string) => checkAiQuotaAndCircuitBreaker(clientIpHash),
   };
 }
 

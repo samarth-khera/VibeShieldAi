@@ -282,7 +282,9 @@ export async function explainScanFinding(
   if (!job) return fail(404, "not_found", "Scan job not found.");
 
   // Rate limit check for AI requests
-  const limit = await deps.rateLimit(req.headers).catch(() => ({ allowed: true, retryAfterSeconds: 0 }));
+  const aiHeaders = new Headers(req.headers);
+  aiHeaders.set("x-vibeshield-context", "ai");
+  const limit = await deps.rateLimit(aiHeaders).catch(() => ({ allowed: true, retryAfterSeconds: 0 }));
   if (!limit.allowed) {
     return fail(429, "rate_limited", "Too many AI analysis requests. Please wait before trying again.", {
       "Retry-After": String(limit.retryAfterSeconds),
