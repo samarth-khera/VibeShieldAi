@@ -111,8 +111,161 @@ export async function generateRemediationPatch(params: {
   }
 
   const cleanFile = path.normalize(finding.filePath || "src/index.ts").replace(/\\/g, "/");
+  const evidence = (finding.redactedEvidence || "").trimEnd();
+  const rule = (finding.ruleId || "").toLowerCase();
 
-  // 1. Dependency advisory automated bump
+  // 1. Mandatory Security Policy Gate for Dynamic Code Execution / eval()
+  // This gate MUST execute before dependency bump, LLM, or other patch generation paths.
+  // A structurally valid LLM-generated diff or generic keyword presence CANNOT bypass this gate.
+  const isDynamicCodeExecution =
+    rule.includes("eval") ||
+    rule.includes("code-execution") ||
+    rule.includes("dynamic-code") ||
+    rule.includes("script-execution") ||
+    /\beval\s*\(/.test(evidence) ||
+    /\beval\b/i.test(finding.title || "") ||
+    /\beval\b/i.test(finding.description || "") ||
+    /\barbitrary code execution\b/i.test(finding.title || "") ||
+    /\barbitrary code execution\b/i.test(finding.description || "") ||
+    /\bdynamic code execution\b/i.test(finding.title || "") ||
+    /\bdynamic code execution\b/i.test(finding.description || "");
+
+  if (isDynamicCodeExecution) {
+    if (!/\beval\s*\(/.test(evidence)) {
+      throw new Error(
+        `Cannot generate automated patch for dynamic code execution finding ${finding.ruleId} without exact source evidence. Manual code review is required.`
+      );
+    }
+
+    // 1A. Strict Fail-Closed Check: Any indicator of arbitrary script / dynamic code execution
+    // immediately requires manual review. Generic keywords (data, payload, input) CANNOT override this.
+    const indicatesArbitraryScriptExecution =
+      /\beval\s*\(\s*(?:script|code|js|program|command|cmd|func|fn|snippet|handler|action|statement)\b/i.test(evidence) ||
+      /\b(?:arbitrary (?:code|script)|code execution|command execution|dynamic execution|shell|untrusted script)\b/i.test(finding.description || "") ||
+      /\b(?:arbitrary (?:code|script)|code execution|command execution|dynamic execution|untrusted script)\b/i.test(finding.title || "");
+
+    if (indicatesArbitraryScriptExecution) {
+      throw new Error(
+        `Cannot safely replace eval() with JSON.parse() where arbitrary JavaScript execution semantics must be preserved for ${finding.ruleId}. Manual code review is required.`
+      );
+    }
+
+    // 1B. Require source-context proof: Wrapper expressions alone are NOT proof of JSON semantics.
+    // If source context is missing, ambiguous, or inconsistent, refuse automatic remediation.
+    if (!sourceContent || typeof sourceContent !== "string" || !sourceContent.trim()) {
+      throw new Error(
+        `Cannot automatically replace eval() with JSON.parse() without verified JSON source context for ${finding.ruleId}. Manual code review is required.`
+      );
+    }
+
+    const classicIdiomMatch = evidence.match(
+      /\beval\s*\(\s*(?:["']\(["']\s*\+\s*([^)]+?)\s*\+\s*["']\)["']|`\(\$\{(.+?)\}\)`)\s*\)/
+    );
+    const directEvalMatch = evidence.match(/\beval\s*\(([^)]+)\)/);
+
+    const rawArg = (classicIdiomMatch ? (classicIdiomMatch[1] || classicIdiomMatch[2]) : directEvalMatch?.[1])?.trim() || "";
+    const cleanVar = rawArg.replace(/^[(\s]+|[)\s]+$/g, "").trim();
+
+    if (!cleanVar || !/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(cleanVar)) {
+      throw new Error(
+        `Cannot automatically replace eval() with JSON.parse() without verified JSON source context for ${finding.ruleId}. Manual code review is required.`
+      );
+    }
+
+    if (/\b(?:script|code|js|program|command|cmd|func|fn|snippet|handler|action|statement|expr|expression)\b/i.test(cleanVar)) {
+      throw new Error(
+        `Cannot safely replace eval() with JSON.parse() where arbitrary JavaScript execution semantics must be preserved for ${finding.ruleId}. Manual code review is required.`
+      );
+    }
+
+    // Locate local context lines around the finding in sourceContent
+    const sourceLines = sourceContent.split("\n");
+    const startLine = finding.startLine ?? 1;
+    let actualLineIdx = Math.max(0, Math.min(sourceLines.length - 1, startLine - 1));
+
+    if (!sourceLines[actualLineIdx]?.includes("eval")) {
+      const foundIdx = sourceLines.findIndex((line) => line.includes("eval"));
+      if (foundIdx !== -1) {
+        actualLineIdx = foundIdx;
+      }
+    }
+
+    // Isolate immediate local function/block context (max 10 lines before/after).
+    // This strictly prevents unrelated occurrences of json or parse elsewhere in the file from being treated as proof.
+    const localStart = Math.max(0, actualLineIdx - 10);
+    const localEnd = Math.min(sourceLines.length, actualLineIdx + 11);
+    const localContext = sourceLines.slice(localStart, localEnd).join("\n");
+
+    const isExplicitJsonVar = /^(?:raw_?json|json_?(?:str(?:ing)?|data|text|payload|content)?)$/i.test(cleanVar);
+
+    // Verify evidence about the relevant input variable and its data flow
+    const localFunctionDenotesJson =
+      /\bfunction\s+[a-zA-Z0-9_]*(?:json|config)[a-zA-Z0-9_]*\s*\(/i.test(localContext) ||
+      /\b(?:parseJson|readJson|loadJson|parseConfig|deserializeJson|parseLegacyJson)\b/i.test(localContext);
+
+    const cleanVarLines = localContext
+      .split("\n")
+      .filter((line) => line.includes(cleanVar));
+
+    const localDataFlowShowsJson =
+      cleanVarLines.some((line) => /\b(?:json|config|application\/json)\b/i.test(line)) ||
+      /\bapplication\/json\b/i.test(localContext) ||
+      /\/\/\s*(?:parse|incoming|verify|read)\s+(?:incoming\s+)?json/i.test(localContext) ||
+      /\/\*[\s\S]*?(?:json text|json payload|json string|json data)[\s\S]*?\*\//i.test(localContext);
+
+    const localShowsArbitraryExecution =
+      /\bfunction\s+(?:run|execute|eval|exec|do|handle)[A-Za-z0-9_]*(?:payload|code|script|action|command)/i.test(localContext);
+
+    const isVerifiedJsonInput =
+      !localShowsArbitraryExecution &&
+      ((isExplicitJsonVar && (localFunctionDenotesJson || localDataFlowShowsJson)) ||
+       (!isExplicitJsonVar && localFunctionDenotesJson && localDataFlowShowsJson));
+
+    if (!isVerifiedJsonInput) {
+      throw new Error(
+        `Cannot automatically replace eval() with JSON.parse() without verified JSON source context for ${finding.ruleId}. Manual code review is required.`
+      );
+    }
+
+    // Build the deterministic replacement
+    let securedEvidence: string | null = null;
+    if (classicIdiomMatch) {
+      securedEvidence = evidence.replace(
+        /\beval\s*\(\s*(?:["']\(["']\s*\+\s*[^)]+?\s*\+\s*["']\)["']|`\(\$\{[^}]+\}\)`)\s*\)/g,
+        `JSON.parse(${cleanVar})`
+      );
+    } else {
+      securedEvidence = evidence.replace(/\beval\s*\(([^)]+)\)/g, `JSON.parse(${cleanVar})`);
+    }
+
+    if (securedEvidence && securedEvidence !== evidence) {
+      const start = finding.startLine ?? 1;
+      const diffLines = [
+        `--- a/${cleanFile}`,
+        `+++ b/${cleanFile}`,
+        `@@ -${start},1 +${start},1 @@`,
+        `-${evidence}`,
+        `+${securedEvidence}`,
+        "",
+      ].join("\n");
+
+      const validation = validateUnifiedDiff(diffLines);
+      if (validation.valid) {
+        return {
+          unifiedDiff: diffLines,
+          patchSummary: `Replace unsafe dynamic eval() with safe JSON.parse() in ${cleanFile}`,
+          affectedFiles: validation.affectedFiles,
+          eligibility,
+        };
+      }
+    }
+
+    throw new Error(
+      `Cannot automatically replace eval() with JSON.parse() without verified JSON source context for ${finding.ruleId}. Manual code review is required.`
+    );
+  }
+
+  // 2. Dependency advisory automated bump (for non-eval findings)
   if (finding.packageInfo != null) {
     const pkg = finding.packageInfo as { name?: string; fixedVersion?: string; version?: string } | null;
     const pkgName = pkg?.name || "dependency";
@@ -139,7 +292,7 @@ export async function generateRemediationPatch(params: {
     };
   }
 
-  // 2. If an LLM provider is configured, prompt for a surgical unified diff
+  // 3. If an LLM provider is configured, prompt for a surgical unified diff (for non-eval findings)
   if (llmProvider && llmProvider.isConfigured()) {
     const sanitizedEvidence = redactText((finding.redactedEvidence || "").slice(0, 1000));
     const systemPrompt = `You are an expert security engineer generating a surgical, minimal unified git diff to resolve a security vulnerability.
@@ -190,92 +343,7 @@ Generate a minimal, exact unified diff applying the fix for ${cleanFile}.`;
     }
   }
 
-  // 3. Deterministic code transformation for known localized patterns with actual source evidence
-  const evidence = (finding.redactedEvidence || "").trimEnd();
-  const rule = (finding.ruleId || "").toLowerCase();
-
-  // Pattern A: eval() to JSON.parse() ONLY when verified JSON preconditions are established
-  if (evidence && (rule.includes("eval") || rule.includes("code-execution"))) {
-    if (/\beval\s*\(/.test(evidence)) {
-      // 1. Strict Fail-Closed Policy: Any indicator of arbitrary script / dynamic code execution
-      // immediately requires manual review. Generic keywords (data, payload, input) CANNOT override this.
-      const indicatesArbitraryScriptExecution =
-        /\beval\s*\(\s*(?:script|code|js|program|command|cmd|func|fn|snippet|handler|action|statement|expr|expression)\b/i.test(evidence) ||
-        /\b(?:script|runtime|function|expression|arbitrary code|code execution|command execution|dynamic execution|shell)\b/i.test(finding.description || "") ||
-        /\b(?:script|arbitrary code|code execution|command execution|expression)\b/i.test(finding.title || "");
-
-      if (indicatesArbitraryScriptExecution) {
-        throw new Error(
-          `Cannot safely replace eval() with JSON.parse() where arbitrary JavaScript execution semantics must be preserved for ${finding.ruleId}. Manual code review is required.`
-        );
-      }
-
-      // 2. Verified Preconditions: Keyword presence in title/description alone NEVER establishes that
-      // replacing eval() with JSON.parse() is semantically correct.
-      // Automatic transformation is permitted ONLY when actual source context proves input is JSON text.
-
-      // Precondition Check A: Classic pre-JSON.parse deserialization idiom:
-      // e.g. eval("(" + str + ")") or eval('(' + data + ')') or eval(`(${str})`)
-      const classicIdiomMatch = evidence.match(
-        /\beval\s*\(\s*(?:["']\(["']\s*\+\s*([^)]+?)\s*\+\s*["']\)["']|`\(\$\{(.+?)\}\)`)\s*\)/
-      );
-
-      // Precondition Check B: Surrounding source context + explicit JSON-named variable:
-      // The argument must be explicitly named as JSON text (e.g., jsonData, jsonStr, rawJson, jsonText)
-      // AND sourceContent must be provided and confirm JSON parsing context.
-      const evalArgMatch = evidence.match(/\beval\s*\(([^)]+)\)/);
-      const evalArg = evalArgMatch ? evalArgMatch[1].trim() : "";
-      const isExplicitJsonVariable = /^(?:raw_?json|json_?(?:str(?:ing)?|data|text|payload|content)?)$/i.test(evalArg);
-
-      const sourceContextConfirmsJson = Boolean(
-        sourceContent &&
-        (
-          /\b(?:parseJson|readJson|loadJson|parseConfig|deserializeJson|application\/json|JSON\.stringify)\b/i.test(sourceContent) ||
-          /\b(?:json|parse)\b/i.test(sourceContent)
-        )
-      );
-
-      let securedEvidence: string | null = null;
-
-      if (classicIdiomMatch) {
-        const innerArg = (classicIdiomMatch[1] || classicIdiomMatch[2] || "").trim();
-        securedEvidence = evidence.replace(
-          /\beval\s*\(\s*(?:["']\(["']\s*\+\s*[^)]+?\s*\+\s*["']\)["']|`\(\$\{[^}]+\}\)`)\s*\)/g,
-          `JSON.parse(${innerArg})`
-        );
-      } else if (isExplicitJsonVariable && sourceContextConfirmsJson) {
-        securedEvidence = evidence.replace(/\beval\s*\(([^)]+)\)/g, "JSON.parse($1)");
-      } else {
-        // Insufficient source context, generic keywords only, or missing source verification
-        throw new Error(
-          `Cannot automatically replace eval() with JSON.parse() without verified JSON source context for ${finding.ruleId}. Manual code review is required.`
-        );
-      }
-
-      if (securedEvidence && securedEvidence !== evidence) {
-        const start = finding.startLine ?? 1;
-        const diffLines = [
-          `--- a/${cleanFile}`,
-          `+++ b/${cleanFile}`,
-          `@@ -${start},1 +${start},1 @@`,
-          `-${evidence}`,
-          `+${securedEvidence}`,
-          "",
-        ].join("\n");
-
-        const validation = validateUnifiedDiff(diffLines);
-        if (validation.valid) {
-          return {
-            unifiedDiff: diffLines,
-            patchSummary: `Replace unsafe dynamic eval() with safe JSON.parse() in ${cleanFile}`,
-            affectedFiles: validation.affectedFiles,
-            eligibility,
-          };
-        }
-      }
-    }
-  }
-
+  // 4. Deterministic code transformation for known localized patterns with actual source evidence
   // Pattern B: Missing Security Headers
   if (evidence && (rule.includes("header") || rule.includes("nosniff"))) {
     const start = finding.startLine ?? 1;

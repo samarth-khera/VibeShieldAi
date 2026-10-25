@@ -509,7 +509,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/parser.ts": 'return eval("(" + rawJson + ")");' },
+        sourceFiles: { "src/parser.ts": 'export function parseLegacyJson(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n' },
       };
 
       const preview = await createPreview(job.id, evalFinding.id, deps);
@@ -703,7 +703,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/parser.ts": 'return eval("(" + rawJson + ")");' },
+        sourceFiles: { "src/parser.ts": 'export function parseLegacyJson(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n' },
         scanEngine: mockFailingScanEngine,
       };
 
@@ -814,7 +814,10 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       expect(patchResult.unifiedDiff).toContain("+  return JSON.parse(jsonData);");
       expect(patchResult.patchSummary).toMatch(/Replace unsafe dynamic eval\(\) with safe JSON\.parse\(\)/);
 
-      // Precondition B: classic pre-JSON.parse deserialization idiom
+      // Precondition B: classic pre-JSON.parse deserialization idiom with verified source context
+      const idiomSource = `export function parseLegacyJson(rawJson: string) {
+  return eval("(" + rawJson + ")");
+}`;
       const idiomFinding = makeFinding({
         scanner: "semgrep",
         ruleId: "semgrep:eval-detected",
@@ -823,17 +826,162 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         filePath: "src/parser.ts",
         startLine: 2,
         endLine: 2,
-        redactedEvidence: '  return eval("(" + rawData + ")");',
+        redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
 
       const idiomPatchResult = await generateRemediationPatch({
         finding: idiomFinding,
         scanJobId: "job-reg-4",
         commitSha: "sha-1",
+        sourceContent: idiomSource,
       });
 
-      expect(idiomPatchResult.unifiedDiff).toContain('-  return eval("(" + rawData + ")");');
-      expect(idiomPatchResult.unifiedDiff).toContain("+  return JSON.parse(rawData);");
+      expect(idiomPatchResult.unifiedDiff).toContain('-  return eval("(" + rawJson + ")");');
+      expect(idiomPatchResult.unifiedDiff).toContain("+  return JSON.parse(rawJson);");
+    });
+
+    it("uncovered path 1: eval(script) finding with a configured/mock LLM that returns a syntactically valid diff must not bypass the fail-closed policy", async () => {
+      const mockLlm: LlmProvider = {
+        getModelName: () => "mock-llm",
+        isConfigured: () => true,
+        generateText: async () => `--- a/src/runner.ts\n+++ b/src/runner.ts\n@@ -2,1 +2,1 @@\n-  return eval(script);\n+  return JSON.parse(script);\n`,
+      };
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "js-code-execution-eval",
+        title: "Dynamic code execution",
+        description: "Executes arbitrary script passed by user",
+        filePath: "src/runner.ts",
+        redactedEvidence: "  return eval(script);",
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-bypass-1",
+          commitSha: "sha-1",
+          llmProvider: mockLlm,
+        })
+      ).rejects.toThrow(
+        /Cannot safely replace eval\(\) with JSON\.parse\(\) where arbitrary JavaScript execution semantics must be preserved/
+      );
+    });
+
+    it("uncovered path 1: the LLM provider must not be called for an eval() finding whose safety preconditions are not established", async () => {
+      let llmCalled = false;
+      const mockLlm: LlmProvider = {
+        getModelName: () => "mock-llm",
+        isConfigured: () => true,
+        generateText: async () => {
+          llmCalled = true;
+          return "diff";
+        },
+      };
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "js-code-execution-eval",
+        title: "Dynamic code execution",
+        description: "Executes arbitrary script passed by user",
+        filePath: "src/runner.ts",
+        redactedEvidence: "  return eval(script);",
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-llm-call-1",
+          commitSha: "sha-1",
+          llmProvider: mockLlm,
+        })
+      ).rejects.toThrow();
+
+      expect(llmCalled).toBe(false);
+    });
+
+    it('uncovered path 2: eval("(" + rawData + ")") with no source context must be rejected', async () => {
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        title: "Legacy wrapper expression",
+        filePath: "src/wrapper.ts",
+        redactedEvidence: '  return eval("(" + rawData + ")");',
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-no-ctx",
+          commitSha: "sha-1",
+        })
+      ).rejects.toThrow(
+        /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+      );
+    });
+
+    it("uncovered path 2: eval wrapper with unrelated JSON-related words elsewhere in the source must still be rejected", async () => {
+      const unrelatedSource = `// Unrelated JSON utility elsewhere in file
+import { parseJson } from "./utils";
+const logger = { log: (x: any) => console.log(JSON.stringify(x)) };
+
+export function executeUserPayload(rawData: string) {
+  return eval("(" + rawData + ")");
+}
+`;
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "semgrep:eval-detected",
+        title: "Legacy wrapper expression",
+        filePath: "src/payload.ts",
+        startLine: 6,
+        endLine: 6,
+        redactedEvidence: '  return eval("(" + rawData + ")");',
+      });
+
+      await expect(
+        generateRemediationPatch({
+          finding,
+          scanJobId: "job-unrelated-ctx",
+          commitSha: "sha-1",
+          sourceContent: unrelatedSource,
+        })
+      ).rejects.toThrow(
+        /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
+      );
+    });
+
+    it("an unrelated eligible finding can still use the LLM remediation path", async () => {
+      let llmCalled = false;
+      const mockLlm: LlmProvider = {
+        getModelName: () => "mock-llm",
+        isConfigured: () => true,
+        generateText: async () => {
+          llmCalled = true;
+          return `--- a/src/server.ts\n+++ b/src/server.ts\n@@ -10,1 +10,2 @@\n res.send("ok");\n+  res.setHeader("X-Frame-Options", "DENY");\n`;
+        },
+      };
+
+      const finding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "security:missing-frame-options",
+        title: "Missing X-Frame-Options header",
+        description: "Response does not include anti-clickjacking header",
+        filePath: "src/server.ts",
+        redactedEvidence: 'res.send("ok");',
+      });
+
+      const patch = await generateRemediationPatch({
+        finding,
+        scanJobId: "job-unrelated-llm",
+        commitSha: "sha-1",
+        llmProvider: mockLlm,
+      });
+
+      expect(llmCalled).toBe(true);
+      expect(patch.unifiedDiff).toContain('+  res.setHeader("X-Frame-Options", "DENY");');
+      expect(patch.patchSummary).toContain("Surgical security patch for security:missing-frame-options");
     });
 
     it("case 5: invalid, stale, or non-applicable patches do not become verified", async () => {
@@ -930,14 +1078,16 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         ruleId: "semgrep:eval-detected",
         filePath: "src/config.ts",
         fingerprint: "fp-unapproved",
-        redactedEvidence: '  return eval("(" + rawData + ")");',
+        startLine: 2,
+        endLine: 2,
+        redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
       await store.saveFindings(job.id, [finding]);
       const { findings: savedFindings6 } = await store.getFindings(job.id);
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/config.ts": 'return eval("(" + rawData + ")");' },
+        sourceFiles: { "src/config.ts": 'export function parseConfig(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n' },
       };
 
       const preview = await createPreview(job.id, savedFindings6[0].id, deps);
@@ -969,14 +1119,16 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         ruleId: "semgrep:eval-detected",
         filePath: "src/config.ts",
         fingerprint: "fp-target",
-        redactedEvidence: '  return eval("(" + rawData + ")");',
+        startLine: 2,
+        endLine: 2,
+        redactedEvidence: '  return eval("(" + rawJson + ")");',
       });
       await store.saveFindings(job.id, [finding]);
       const { findings: savedFindings7 } = await store.getFindings(job.id);
 
       const deps: RemediationDeps = {
         store,
-        sourceFiles: { "src/config.ts": 'return eval("(" + rawData + ")");' },
+        sourceFiles: { "src/config.ts": 'export function parseConfig(rawJson: string) {\n  return eval("(" + rawJson + ")");\n}\n' },
       };
 
       const preview = await createPreview(job.id, savedFindings7[0].id, deps);
