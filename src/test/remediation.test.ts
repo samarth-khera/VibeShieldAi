@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { validateUnifiedDiff } from "@/server/remediation/patch";
+import { validateUnifiedDiff, generateRemediationPatch } from "@/server/remediation/patch";
 import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
 import { InMemoryJobStore } from "@/test/mock-store";
 import {
@@ -419,6 +419,281 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       expect(result.branchName).not.toBe("main");
       expect(result.branchName).not.toBe(job.defaultBranch);
       expect(result.message).toMatch(/GitHub write authorization is not configured/);
+    });
+  });
+
+  describe("6. Phase 5: Permission-Gated Auto-Fix & E2E Rescan Verification", () => {
+    it("Review Only mode: generates proposed patch preview without mutating target code or creating branches", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-user",
+        repo: "vulnerable-app",
+        repositoryUrl: "https://github.com/test-user/vulnerable-app",
+        expiresAt: new Date(Date.now() + 3600000),
+      });
+      await store.update(job.id, {
+        status: "completed",
+        commitSha: "sha-eval-001",
+        defaultBranch: "main",
+      });
+
+      const originalSource = 'export function calc(expr: string) {\n  return eval(expr);\n}\n';
+      await store.saveFindings(job.id, [
+        makeFinding({
+          scanner: "semgrep",
+          ruleId: "js-code-execution-eval",
+          category: "Code Analysis",
+          severity: "critical",
+          title: "Arbitrary code execution via eval",
+          filePath: "src/calc.ts",
+          fingerprint: "fp-eval-1234",
+          startLine: 2,
+          endLine: 2,
+          redactedEvidence: "  return eval(expr);",
+        }),
+      ]);
+
+      const { findings } = await store.getFindings(job.id);
+      const evalFinding = findings[0];
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles: { "src/calc.ts": originalSource },
+      };
+
+      // 1. Generate preview
+      const preview = await createPreview(job.id, evalFinding.id, deps);
+      expect(preview.status).toBe("preview");
+      expect(preview.approvedAt).toBeNull();
+      expect(preview.branchName).toBeNull();
+      expect(preview.pullRequestUrl).toBeNull();
+
+      // Verify diff transforms eval to JSON.parse
+      expect(preview.unifiedDiff).toContain("-  return eval(expr);");
+      expect(preview.unifiedDiff).toContain("+  return JSON.parse(expr);");
+
+      // Verify target source is completely untouched
+      expect(deps.sourceFiles!["src/calc.ts"]).toBe(originalSource);
+    });
+
+    it("explicit user approval is strictly mandatory before patch application", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-user",
+        repo: "vulnerable-app",
+        repositoryUrl: "https://github.com/test-user/vulnerable-app",
+        expiresAt: new Date(Date.now() + 3600000),
+      });
+      await store.update(job.id, {
+        status: "completed",
+        commitSha: "sha-eval-001",
+        defaultBranch: "main",
+      });
+
+      await store.saveFindings(job.id, [
+        makeFinding({
+          scanner: "semgrep",
+          ruleId: "js-code-execution-eval",
+          category: "Code Analysis",
+          severity: "critical",
+          title: "Arbitrary code execution via eval",
+          filePath: "src/calc.ts",
+          fingerprint: "fp-eval-1234",
+          startLine: 2,
+          endLine: 2,
+          redactedEvidence: "  return eval(expr);",
+        }),
+      ]);
+      const { findings } = await store.getFindings(job.id);
+      const evalFinding = findings[0];
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles: { "src/calc.ts": "return eval(expr);" },
+      };
+
+      const preview = await createPreview(job.id, evalFinding.id, deps);
+
+      // Attempting apply without approval must fail with 403
+      await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toThrow(
+        /Explicit user approval is required/
+      );
+
+      // Explicit user approval
+      const approved = await approveRemediation(job.id, preview.id, deps, "session-user-999");
+      expect(approved.status).toBe("approved");
+      expect(approved.approvedAt).toBeInstanceOf(Date);
+    });
+
+    it("applies approved patch in isolated sandbox, verifies resolution, and proves 0 regressions", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-user",
+        repo: "vulnerable-app",
+        repositoryUrl: "https://github.com/test-user/vulnerable-app",
+        expiresAt: new Date(Date.now() + 3600000),
+      });
+      await store.update(job.id, {
+        status: "completed",
+        commitSha: "sha-eval-001",
+        defaultBranch: "main",
+      });
+
+      const vulnerableSource = 'export function calc(expr: string) {\n  return eval(expr);\n}\n';
+      const evalFinding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "js-code-execution-eval",
+        category: "Code Analysis",
+        severity: "critical",
+        title: "Arbitrary code execution via eval",
+        filePath: "src/calc.ts",
+        fingerprint: "fp-eval-verified-99",
+        startLine: 2,
+        endLine: 2,
+        redactedEvidence: "  return eval(expr);",
+      });
+
+      await store.saveFindings(job.id, [evalFinding]);
+      const { findings } = await store.getFindings(job.id);
+
+      // Mock scan engine simulating Semgrep behavior:
+      // Before fix (has eval): detects finding
+      // After fix (eval replaced with JSON.parse): detects 0 findings
+      const mockScanEngine = async (dir: string) => {
+        const fs = await import("node:fs/promises");
+        const path = await import("node:path");
+        const content = await fs.readFile(path.join(dir, "src/calc.ts"), "utf8").catch(() => "");
+        const hasEval = /\beval\s*\(/.test(content);
+        return {
+          status: "completed" as const,
+          findings: hasEval ? [evalFinding] : [],
+          counts: { critical: hasEval ? 1 : 0, high: 0, medium: 0, low: 0, info: 0, total: hasEval ? 1 : 0 },
+          gitleaksStatus: "completed" as const,
+          gitleaksDurationMs: 10,
+          gitleaksError: null,
+          semgrepStatus: "completed" as const,
+          semgrepDurationMs: 50,
+          semgrepError: null,
+          osvStatus: "completed" as const,
+          osvDurationMs: 10,
+          osvError: null,
+          scannerVersions: { gitleaks: "8.18", semgrep: "1.60", osvScanner: "2.7" },
+          scanCoverage: {
+            lockfilesFound: [],
+            scannersRun: ["gitleaks", "semgrep", "osv-scanner"],
+            limitations: [],
+          },
+        };
+      };
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles: { "src/calc.ts": vulnerableSource },
+        scanEngine: mockScanEngine,
+      };
+
+      const preview = await createPreview(job.id, findings[0].id, deps);
+      await approveRemediation(job.id, preview.id, deps, "user-verifier");
+
+      const verified = await applyAndVerify(job.id, preview.id, deps);
+
+      expect(verified.status).toBe("verified");
+      expect(verified.rescanStatus).toBe("verified");
+      expect(verified.rescanSummary?.targetResolved).toBe(true);
+      expect(verified.rescanSummary?.newFindingsCount).toBe(0);
+      expect(verified.rescanSummary?.regressions).toHaveLength(0);
+      expect(verified.rescanSummary?.resolvedFingerprints).toContain("fp-eval-verified-99");
+    });
+
+    it("rejects generic placeholder comments like [SECURED] or [REMOVED VULNERABLE CODE]", async () => {
+      // Finding with no source evidence and no matching rule template
+      const unknownFinding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "unknown-exotic-rule",
+        category: "Code Analysis",
+        severity: "medium",
+        title: "Exotic issue",
+        filePath: "src/unknown.ts",
+        redactedEvidence: "",
+      });
+
+      // generateRemediationPatch must throw rather than produce fake comment placeholders
+      await expect(
+        generateRemediationPatch({
+          finding: unknownFinding,
+          scanJobId: "job-1",
+          commitSha: "sha-1",
+        })
+      ).rejects.toThrow(/Cannot generate automated patch.*Manual code review is required/);
+    });
+
+    it("marks remediation as needs_review if rescan still detects the targeted finding", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-user",
+        repo: "vulnerable-app",
+        repositoryUrl: "https://github.com/test-user/vulnerable-app",
+        expiresAt: new Date(Date.now() + 3600000),
+      });
+      await store.update(job.id, {
+        status: "completed",
+        commitSha: "sha-eval-001",
+        defaultBranch: "main",
+      });
+
+      const evalFinding = makeFinding({
+        scanner: "semgrep",
+        ruleId: "js-code-execution-eval",
+        category: "Code Analysis",
+        severity: "critical",
+        title: "Arbitrary code execution via eval",
+        filePath: "src/calc.ts",
+        fingerprint: "fp-eval-incomplete",
+        startLine: 2,
+        endLine: 2,
+        redactedEvidence: "  return eval(expr);",
+      });
+
+      await store.saveFindings(job.id, [evalFinding]);
+      const { findings } = await store.getFindings(job.id);
+
+      // Mock scan engine that always returns the finding (simulating failed/incomplete fix)
+      const mockFailingScanEngine = async () => ({
+        status: "completed" as const,
+        findings: [evalFinding],
+        counts: { critical: 1, high: 0, medium: 0, low: 0, info: 0, total: 1 },
+        gitleaksStatus: "completed" as const,
+        gitleaksDurationMs: 10,
+        gitleaksError: null,
+        semgrepStatus: "completed" as const,
+        semgrepDurationMs: 50,
+        semgrepError: null,
+        osvStatus: "completed" as const,
+        osvDurationMs: 10,
+        osvError: null,
+        scannerVersions: { gitleaks: "8.18", semgrep: "1.60", osvScanner: "2.7" },
+        scanCoverage: {
+          lockfilesFound: [],
+          scannersRun: ["gitleaks", "semgrep", "osv-scanner"],
+          limitations: [],
+        },
+      });
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles: { "src/calc.ts": "return eval(expr);" },
+        scanEngine: mockFailingScanEngine,
+      };
+
+      const preview = await createPreview(job.id, findings[0].id, deps);
+      await approveRemediation(job.id, preview.id, deps, "user-verifier");
+
+      const result = await applyAndVerify(job.id, preview.id, deps);
+
+      // Must be needs_review, NEVER verified
+      expect(result.status).toBe("needs_review");
+      expect(result.rescanStatus).toBe("needs_review");
+      expect(result.rescanSummary?.targetResolved).toBe(false);
     });
   });
 });

@@ -189,21 +189,64 @@ Generate a minimal, exact unified diff applying the fix for ${cleanFile}.`;
     }
   }
 
-  // 3. Deterministic fallback patch for localized findings
-  const diffLines = [
-    `--- a/${cleanFile}`,
-    `+++ b/${cleanFile}`,
-    `@@ -${finding.startLine ?? 1},1 +${finding.startLine ?? 1},1 @@`,
-    `-// [REMOVED VULNERABLE CODE: ${finding.ruleId}]`,
-    `+// [SECURED: Sanitized and parameterized input validation applied]`,
-    "",
-  ].join("\n");
+  // 3. Deterministic code transformation for known localized patterns with actual source evidence
+  const evidence = (finding.redactedEvidence || "").trimEnd();
+  const rule = (finding.ruleId || "").toLowerCase();
 
-  const validation = validateUnifiedDiff(diffLines);
-  return {
-    unifiedDiff: diffLines,
-    patchSummary: `Apply secure replacement for ${finding.ruleId} in ${cleanFile}`,
-    affectedFiles: validation.affectedFiles,
-    eligibility,
-  };
+  // Pattern A: eval() to JSON.parse()
+  if (evidence && (rule.includes("eval") || rule.includes("code-execution"))) {
+    if (/\beval\s*\(/.test(evidence)) {
+      const securedEvidence = evidence.replace(/\beval\s*\(([^)]+)\)/g, "JSON.parse($1)");
+      if (securedEvidence !== evidence) {
+        const start = finding.startLine ?? 1;
+        const diffLines = [
+          `--- a/${cleanFile}`,
+          `+++ b/${cleanFile}`,
+          `@@ -${start},1 +${start},1 @@`,
+          `-${evidence}`,
+          `+${securedEvidence}`,
+          "",
+        ].join("\n");
+
+        const validation = validateUnifiedDiff(diffLines);
+        if (validation.valid) {
+          return {
+            unifiedDiff: diffLines,
+            patchSummary: `Replace unsafe dynamic eval() with safe JSON.parse() in ${cleanFile}`,
+            affectedFiles: validation.affectedFiles,
+            eligibility,
+          };
+        }
+      }
+    }
+  }
+
+  // Pattern B: Missing Security Headers
+  if (evidence && (rule.includes("header") || rule.includes("nosniff"))) {
+    const start = finding.startLine ?? 1;
+    const diffLines = [
+      `--- a/${cleanFile}`,
+      `+++ b/${cleanFile}`,
+      `@@ -${start},1 +${start},2 @@`,
+      ` ${evidence}`,
+      `+  res.headers.set('X-Content-Type-Options', 'nosniff');`,
+      "",
+    ].join("\n");
+
+    const validation = validateUnifiedDiff(diffLines);
+    if (validation.valid) {
+      return {
+        unifiedDiff: diffLines,
+        patchSummary: `Add X-Content-Type-Options: nosniff header in ${cleanFile}`,
+        affectedFiles: validation.affectedFiles,
+        eligibility,
+      };
+    }
+  }
+
+  // If no safe deterministic rule exists and no LLM generated a valid diff,
+  // we MUST NOT generate comment-only or fabricated placeholders.
+  throw new Error(
+    `Cannot generate automated patch for ${finding.ruleId} without active AI assistance or exact source evidence. Manual code review is required.`
+  );
 }

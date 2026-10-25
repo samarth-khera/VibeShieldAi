@@ -13,6 +13,7 @@ export type RemediationDeps = {
   llmProvider?: LlmProvider;
   fetchImpl?: FetchLike;
   scanEngine?: (dir: string) => Promise<import("../scanners/types").ScanEngineResult>;
+  sourceFiles?: Record<string, string>;
 };
 
 export class RemediationError extends Error {
@@ -51,15 +52,25 @@ export async function createPreview(
   let affectedFiles: string[] = [];
 
   if (eligibility.canAutoFix) {
-    const patchResult = await generateRemediationPatch({
-      finding,
-      scanJobId,
-      commitSha,
-      llmProvider: deps.llmProvider,
-    });
-    unifiedDiff = patchResult.unifiedDiff;
-    patchSummary = patchResult.patchSummary;
-    affectedFiles = patchResult.affectedFiles;
+    try {
+      const patchResult = await generateRemediationPatch({
+        finding,
+        scanJobId,
+        commitSha,
+        llmProvider: deps.llmProvider,
+      });
+      unifiedDiff = patchResult.unifiedDiff;
+      patchSummary = patchResult.patchSummary;
+      affectedFiles = patchResult.affectedFiles;
+    } catch {
+      patchSummary = `Manual review required for ${finding.ruleId}`;
+      affectedFiles = [finding.filePath];
+      unifiedDiff = "";
+      eligibility.canAutoFix = false;
+      eligibility.eligibility = "unsuitable";
+      eligibility.reason = "Automated patch generation cannot safely transform this code pattern without AI. Manual review required.";
+      eligibility.warnings.push("No automated fix could be safely generated. Please review and apply changes manually.");
+    }
   } else {
     patchSummary = `Manual review required for ${finding.ruleId}`;
     affectedFiles = [finding.filePath];
@@ -107,7 +118,7 @@ export async function approveRemediation(
     throw new RemediationError("invalid_status", "Rejected remediation cannot be approved.", 400);
   }
 
-  if (remediation.requiresRotation || remediation.eligibility === "unsuitable") {
+  if (remediation.requiresRotation || remediation.eligibility === "unsuitable" || !remediation.unifiedDiff) {
     throw new RemediationError(
       "unsuitable_for_autofix",
       "This finding requires manual intervention and cannot be auto-approved.",
@@ -138,7 +149,7 @@ export async function applyAndVerify(
   const remediation = await deps.store.getRemediation(scanJobId, remediationId);
   if (!remediation) throw new RemediationError("remediation_not_found", "Remediation preview not found.", 404);
 
-  if (!remediation.approvedAt || (remediation.status !== "approved" && remediation.status !== "applied")) {
+  if (!remediation.unifiedDiff || !remediation.approvedAt || (remediation.status !== "approved" && remediation.status !== "applied")) {
     throw new RemediationError(
       "approval_required",
       "Explicit user approval is required before applying this patch.",
@@ -153,6 +164,7 @@ export async function applyAndVerify(
     originalFindings: findings as never[],
     targetedFingerprints: remediation.findingFingerprints,
     unifiedDiff: remediation.unifiedDiff,
+    sourceFiles: deps.sourceFiles,
     scanEngine: deps.scanEngine,
   });
 
