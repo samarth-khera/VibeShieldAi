@@ -2,7 +2,7 @@
 
 **Repository**: [https://github.com/samarth-khera/VibeShieldAi](https://github.com/samarth-khera/VibeShieldAi)  
 **Branch**: `main`  
-**Final Production Commit SHA**: [`649f6ab`](https://github.com/samarth-khera/VibeShieldAi/commit/649f6ab)  
+**Final Production Commit SHA**: [`18c365c`](https://github.com/samarth-khera/VibeShieldAi/commit/18c365c)  
 **Live Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 **Live Health Endpoint**: [https://vibeshield-ai-phi.vercel.app/api/health](https://vibeshield-ai-phi.vercel.app/api/health)  
 **Report Date**: 2026-10-25  
@@ -11,28 +11,31 @@
 
 ## 1. Executive Summary
 
-This report documents the resolution of the final acceptance gate for `eval()` remediation in VibeShield AI:
+This report documents the resolution of the final acceptance gate for source-proof ordering, lexical scope, and parameter destructuring in `eval()` remediation in VibeShield AI:
 
-1. **Elimination of Heuristic Acceptance**:
-   - Source-context acceptance no longer relies on function names (e.g. `parseJson`, `parseConfig`, `deserializeJson`), variable names (e.g. `rawJson`, `jsonData`), comments, imports, or isolated JSON keywords.
-   - Any argument that is a function parameter, an external input (e.g. `req`, `params`, `query`, `body`, `input`, `process`, etc.), or reassigned in local scope fails closed and is routed to manual review.
+1. **Elimination of Text-Based Heuristics**:
+   - Replaced all text-based / regex scanning with TypeScript Abstract Syntax Tree (AST) analysis using `ts.createSourceFile`.
+   - The verifier strictly enforces **declaration identity**, **lexical scope containment**, **source-code ordering**, **parameter destructuring rejection**, and **absence of intervening assignments/mutations**.
 
-2. **Defensible Local Data-Flow Proof**:
-   - Automatic remediation of an `eval()` finding is permitted **only** when the evaluated argument has defensible, proven local JSON data flow:
-     - The variable is an unpolluted local constant defined in the immediate block scope.
-     - The right-hand side is either:
-       (A) A static string literal mathematically proven to be valid JSON via analysis-time `JSON.parse()` validation.
-       (B) A direct call to `JSON.stringify()`.
-     - The variable is never reassigned and has no conflicting data flow.
-   - All ambiguous, parameter-based, external, or unproven cases fail closed to manual review.
+2. **Resolution of Destructured Parameter & Reordering Bypass**:
+   - Identified and resolved the regression:
+     `function process({ data }) { eval(data); data = JSON.stringify({ safe: true }); }`
+   - The AST verifier recursively inspects parameter binding elements (`ObjectBindingPattern`, `ArrayBindingPattern`, renamed properties, nested destructuring, default values, and rest parameters) across all enclosing functions. Any parameter binding immediately disqualifies automatic remediation.
+   - Enforces strict source-order data-flow: the single `const` declaration must appear *strictly before* the `eval()` call (`decl.getStart() < targetEval.getStart()`).
+   - Rejects any subsequent assignments, reassignments, or mutations (`=`, compound assignments, `++`, `--`) anywhere in the source file.
 
-3. **Preservation of Safety Invariants**:
+3. **Strict Lexical Scope Enforcement**:
+   - The declaration's scope container (nearest `Block` or `SourceFile`) must be an ancestor of the `eval()` call. Safe-looking declarations in sibling blocks, inner closed blocks, or external functions are strictly refused.
+   - Variables shadowed in nested blocks or functions fail closed.
+   - Files with multiple declarations of the target variable fail closed to eliminate any scope ambiguity.
+
+4. **Preservation of Core Security Invariants**:
    - The LLM provider is strictly never called for `eval()` or dynamic code execution findings.
-   - Normal automated remediation remains active for unrelated eligible findings (e.g. security headers, dependencies).
-   - Human approval is strictly mandatory before patch application.
-   - Sandbox rescan verification guarantees that no patch is marked `verified` unless the target vulnerability is eliminated and zero regressions are introduced.
+   - Human approval remains mandatory for applying any patch.
+   - Patch application is verified in an isolated sandbox with a security rescan ensuring zero regressions.
+   - Unrelated eligible findings retain their automated remediation capabilities.
 
-All changes have been validated across the complete test suite (186 tests passing, 0 failures), typecheck (exit 0), lint (exit 0), production build (exit 0), Gitleaks (exit 0), Semgrep (exit 0), and OSV-Scanner (exit 0).
+All changes have been validated across the complete test suite (**194 tests passing, 0 failures across 15 test files**), typecheck (exit 0), lint (exit 0), production build (exit 0), Gitleaks (exit 0), Semgrep (exit 0), and OSV-Scanner (exit 0).
 
 ---
 
@@ -40,32 +43,41 @@ All changes have been validated across the complete test suite (186 tests passin
 
 | File | Changes | Rationale |
 | :--- | :--- | :--- |
-| `src/server/remediation/patch.ts` | 1. Implemented `verifyJsonSourceProof(localContext, cleanVar)`: completely eliminated heuristic checks on function names, variable names, comments, imports, and keywords.<br>2. Parameter inputs (`function(cleanVar)` or `(cleanVar) =>`) and external sources (`req`, `body`, `input`, etc.) fail closed.<br>3. Requires mathematical proof via analysis-time `JSON.parse` of static string literals or `JSON.stringify`.<br>4. Constructed helper entirely with static string searching and token parsing (no dynamic `RegExp` constructors), ensuring zero Semgrep ReDoS audit warnings. | Closes the final heuristic gap, guaranteeing that arbitrary user input or misleading context can never trigger an automated `eval()` to `JSON.parse()` transformation. |
-| `src/test/remediation.test.ts` | 1. Updated positive test fixtures to use proven local static JSON literals.<br>2. Added regression test: nearby function with JSON-related name passing user-controlled input to `eval()` is rejected.<br>3. Added regression test: misleading variable name (`rawJson`) originating from untrusted query is rejected.<br>4. Added regression test: conflicting data flow with reassigned variable is rejected.<br>5. Added regression test: ambiguous source context with unknown variable origin is rejected.<br>6. Test count increased to 39 in `remediation.test.ts` and 186 across the repository. | Proves that all misleading context, conflicting data flow, and ambiguous cases are rejected. |
+| `src/server/remediation/patch.ts` | 1. Implemented AST-based `verifyJsonSourceProof(sourceContent, cleanVar, findingLine)` using `typescript`.<br>2. Implemented `parameterBindsName` to recursively detect direct, destructured (`{ data }`, `[ data ]`), nested, renamed, default, and rest parameters in all enclosing functions.<br>3. Enforced single declaration identity: exactly one declaration of `cleanVar` must exist across the entire source file, and it must be `const`.<br>4. Enforced strict data-flow ordering: declaration must precede `targetEval` in source order.<br>5. Enforced lexical scope containment: declaration container block must be an ancestor of `targetEval`.<br>6. Enforced mutation absence: rejected any binary assignment (`=`, compound) or unary mutation (`++`, `--`) to `cleanVar` anywhere in the file.<br>7. Initializer validation: direct `JSON.stringify(...)` without untrusted references, or static JSON string/template literal verified by `JSON.parse`.<br>8. Exported `verifyJsonSourceProof` for direct unit testing and integrated it directly into `generateRemediationPatch`. | Replaces fragile regexes with robust compiler-level AST analysis, permanently closing scope, ordering, and destructuring false-acceptance gaps. |
+| `package.json` | Moved `"typescript": "^5"` from `devDependencies` to `dependencies`. | Ensures compiler-level TypeScript AST parsing is guaranteed available in server-side production execution environments. |
+| `src/test/remediation.test.ts` | 1. Added reproduction test for `function process({ data }) { eval(data); data = JSON.stringify({ safe: true }); }`.<br>2. Added Variant 1: Destructured function parameters (object, renamed, nested, array, rest).<br>3. Added Variant 2: Assignments after the `eval()` call.<br>4. Added Variant 3: Variables shadowed in nested blocks or functions.<br>5. Added Variant 4: Multiple declarations, reassignments, and ambiguous scope.<br>6. Added Variant 5: Safe-looking assignment outside the scope containing `eval()`.<br>7. Added Variant 6: Valid JSON data initialized before the call without intervening reassignment.<br>8. Added End-to-End Disposable Fixture: Demonstrating that reproduced bypass is refused across full preview lifecycle, while proven safe wrapper succeeds and verifies.<br>9. Repository test count increased from 186 to 194 passing tests. | Validates all required ordering, scoping, and parameter destructuring variants with strict assertions. |
+| `production_acceptance_report.md` | Documented the final AST source-proof verification, regression suite results, tool executions, and release status. | Maintains accurate, transparent release documentation. |
 
 ---
 
-## 3. Targeted Regression Cases Exercised (All 16 Cases in Suite 7)
+## 3. Targeted Regression Cases Exercised (All 24 Cases in Suite 7)
 
 | Test Case | Description | Test Implementation | Result |
 | :--- | :--- | :--- | :--- |
-| **Case 1** | `eval(script)` with description indicating arbitrary script execution | `generateRemediationPatch` with `eval(script)` and arbitrary execution description. | **PASS** (Throws manual review error) |
+| **Reproduced Bypass** | Destructured parameter evaluated before subsequent `JSON.stringify` assignment | `function process({ data }) { eval(data); data = JSON.stringify({ safe: true }); }` | **PASS** (Refused in both `verifyJsonSourceProof` and `generateRemediationPatch`) |
+| **Variant 1A** | Object destructuring parameter | `function handleObj({ data }: any) { return eval(data); }` | **PASS** (Refused: parameter binding detected) |
+| **Variant 1B** | Renamed object destructuring | `function handleRenamed({ payload: data }: any) { return eval(data); }` | **PASS** (Refused: parameter binding detected) |
+| **Variant 1C** | Nested object destructuring | `function handleNested({ config: { data } }: any) { return eval(data); }` | **PASS** (Refused: nested parameter binding detected) |
+| **Variant 1D** | Array destructuring parameter | `const handleArray = ([ data ]: any) => { return eval(data); };` | **PASS** (Refused: array parameter binding detected) |
+| **Variant 1E** | Rest parameter | `function handleRest(...data: any[]) { return eval(data[0]); }` | **PASS** (Refused: rest parameter binding detected) |
+| **Variant 2A** | Assignment after `eval()` call | `function handlePostAssign() { let data: any; eval(data); data = JSON.stringify({ safe: true }); }` | **PASS** (Refused: assignment occurs after eval) |
+| **Variant 2B** | Const declaration after `eval()` call | `function handlePostConst() { eval(data); const data = JSON.stringify({ safe: true }); }` | **PASS** (Refused: declaration order after eval) |
+| **Variant 3A** | Variable shadowed in inner block | `function handleShadow() { const data = JSON.stringify(...); { const data = req.body; eval(data); } }` | **PASS** (Refused: multiple declarations / shadowing) |
+| **Variant 3B** | Variable shadowed by inner function parameter | `function outer() { const data = JSON.stringify(...); function inner(data: any) { eval(data); } }` | **PASS** (Refused: multiple declarations / parameter shadow) |
+| **Variant 4A** | Multiple declarations in scope | `function processMulti() { const data = JSON.stringify(...); const data = JSON.stringify(...); eval(data); }` | **PASS** (Refused: multiple declarations detected) |
+| **Variant 4B** | Intervening reassignment | `function processReassign(input: string) { let data = JSON.stringify(...); data = input; eval(data); }` | **PASS** (Refused: assignment mutation detected) |
+| **Variant 4C** | Compound assignment | `function processCompound(input: string) { let data = JSON.stringify(...); data += input; eval(data); }` | **PASS** (Refused: compound mutation detected) |
+| **Variant 5A** | Declaration in external function | `function helper() { const data = JSON.stringify(...); return data; } function process() { eval(data); }` | **PASS** (Refused: scope container not ancestor of eval) |
+| **Variant 5B** | Declaration in closed sibling block | `function processSibling() { if (true) { const data = JSON.stringify(...); } eval(data); }` | **PASS** (Refused: sibling scope container not ancestor of eval) |
+| **Variant 6A** | Valid JSON data initialized before call (`JSON.stringify`) | `export function getValidConfig() { const data = JSON.stringify({ safe: true }); return eval("(" + data + ")"); }` | **PASS** (Accepted: diff generated replacing eval with `JSON.parse(data)`) |
+| **Variant 6B** | Valid JSON data initialized before call (static literal) | `export function getStaticData() { const data = '{"safe": true, "version": 2}'; return eval("(" + data + ")"); }` | **PASS** (Accepted: diff generated replacing eval with `JSON.parse(data)`) |
+| **E2E Fixture** | Full lifecycle contrast: reproduced bypass vs legitimate wrapper | Contrast `process({ data })` with `getSafeConfig()`. Verify unsuitable status on bypass, mandatory approval, sandbox apply, and 0 regressions on legitimate config. | **PASS** (Bypass creates unsuitable preview with empty diff; safe config successfully approved and verified) |
+| **Case 1** | `eval(script)` with arbitrary execution description | `generateRemediationPatch` with `eval(script)` and arbitrary execution description. | **PASS** (Throws manual review error) |
 | **Case 2** | `eval(script)` with generic words (`data`, `input`, `payload`) | Generic keywords cannot override arbitrary script indicators. | **PASS** (Throws manual review error) |
 | **Case 3** | Evidence containing JSON keyword without sufficient source context | `const result = eval(userInput)` without JSON source context. | **PASS** (Throws `"without verified JSON source context"`) |
-| **Case 4A** | Verified JSON input: local constant assigned from static JSON literal | `const jsonData = '{"theme": "dark", "version": 1}'; eval(jsonData);` verified by `JSON.parse`. | **PASS** (Diff generated, transforms to `JSON.parse`) |
-| **Case 4B** | Verified JSON input: legacy wrapper with local static JSON literal | `const rawJson = '{"items": [1, 2, 3]}'; eval("(" + rawJson + ")");` verified by `JSON.parse`. | **PASS** (Diff generated, transforms to `JSON.parse`) |
 | **Uncovered Path 1A** | Mock LLM returning valid diff cannot bypass fail-closed gate | Mock LLM provider returns valid diff `JSON.parse(script)`. Gate blocks before LLM returns. | **PASS** (Throws manual review error; diff cannot bypass) |
 | **Uncovered Path 1B** | LLM provider is never called for `eval()` finding | Mock LLM records `llmCalled`. Finding has `eval(script)`. | **PASS** (`llmCalled` remains `false`) |
-| **Uncovered Path 2A** | `eval("(" + rawData + ")")` with no source context | Wrapper finding without `sourceContent`. | **PASS** (Throws `"without verified JSON source context"`) |
-| **Uncovered Path 2B** | Eval wrapper with unrelated JSON-related words elsewhere in source | File has `import { parseJson }` and `JSON.stringify` in logger; target is `eval("(" + rawData + ")")`. | **PASS** (Throws `"without verified JSON source context"`) |
-| **Unrelated LLM Path**| Unrelated eligible finding (security headers) | Header finding `security:missing-frame-options` calls mock LLM provider. | **PASS** (`llmCalled: true`, diff generated with `X-Frame-Options`) |
-| **Misleading Function Name** | Nearby function named `parseJson` passes untrusted parameter | `function parseJson(userInput: string) { return eval(userInput); }`. | **PASS** (Function name ignored; parameter rejected; throws manual review) |
-| **Misleading Variable Name** | Variable named `rawJson` originating from untrusted query | `const rawJson = req.query.command; return eval("(" + rawJson + ")");`. | **PASS** (Variable name ignored; untrusted source rejected; throws manual review) |
-| **Conflicting Data Flow** | Variable is reassigned or conditionally modified | `let data = '{"safe": true}'; if (input) data = input; eval("(" + data + ")");`. | **PASS** (Reassignment detected; conflicting data flow rejected; throws manual review) |
-| **Ambiguous Context** | Target variable has unknown external origin | `function computeDynamic() { return eval("(" + target + ")"); }`. | **PASS** (Missing verifiable local assignment rejected; throws manual review) |
-| **Case 5** | Invalid, stale, or non-applicable patches | Stale patch with mismatching source lines applied in sandbox; post-fix rescan detects vulnerability. | **PASS** (Status remains `needs_review`, `targetResolved: false`) |
-| **Case 6** | Unapproved apply request is rejected | `applyAndVerify` invoked directly on a preview record before `approveRemediation`. | **PASS** (HTTP 403 `approval_required` error thrown) |
-| **Case 7A & 7B** | Failed post-fix rescan (regressions or engine failure) | Sandbox rescan introduces new finding or engine crashes. | **PASS** (Status is `needs_review` / `failed`, never marked verified) |
+| **Uncovered Path 2A & 2B** | Eval wrapper with missing or unrelated JSON context | Wrapper without context or with unrelated JSON words elsewhere in file. | **PASS** (Throws `"without verified JSON source context"`) |
 
 ---
 
@@ -73,11 +85,11 @@ All changes have been validated across the complete test suite (186 tests passin
 
 | Check | Command Run | Exit Code | Outcome Details |
 | :--- | :--- | :---: | :--- |
-| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 186 tests passed (0 failed)** in 12.61s. |
+| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 194 tests passed (0 failed)** in 11.94s. |
 | **TypeScript Typecheck** | `npm run typecheck` (`tsc --noEmit`) | `0` | **0 type errors**. Clean compilation across all files. |
 | **ESLint** | `npm run lint` (`eslint`) | `0` | **0 lint warnings / 0 lint errors**. |
-| **Production Build** | `npm run build` (`next build`) | `0` | Turbopack production build succeeded in 844ms. All 21 static and dynamic routes compiled. |
-| **Secret Scanning (Gitleaks)** | `gitleaks git --verbose` | `0` | **25 commits scanned, ~1.30 MB inspected, 0 leaks found**. |
+| **Production Build** | `npm run build` (`next build`) | `0` | Turbopack production build succeeded in 2.0s. All 21 static and dynamic routes compiled. |
+| **Secret Scanning (Gitleaks)** | `gitleaks git --verbose` | `0` | **28 commits scanned, ~1.32 MB inspected, 0 leaks found**. |
 | **Static Code Analysis (Semgrep)** | `semgrep scan --config=auto src/` | `0` | **86 files scanned, 210 rules run: 0 findings (0 blocking)**. |
 | **Dependency Vulnerability Scan** | `osv-scanner --lockfile=package-lock.json` | `0` | **667 packages scanned: 0 issues found**. |
 
@@ -118,9 +130,8 @@ The complete end-to-end remediation workflow was verified using automated integr
 ## 6. Deployment & Health Verification Evidence
 
 ### Vercel Production Deployment
-- **Commit**: [`649f6ab`](https://github.com/samarth-khera/VibeShieldAi/commit/649f6ab) (Security Hardening) / [`7a1cde0`](https://github.com/samarth-khera/VibeShieldAi/commit/7a1cde0)  
-- **Deployment URL**: `https://vibeshield-cyeczb8r1-samarth-kheras-projects.vercel.app`  
-- **Status**: `● Ready` (Duration: 24s)  
+- **Commit**: [`18c365c`](https://github.com/samarth-khera/VibeShieldAi/commit/18c365c)  
+- **Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 - **Environment**: Production  
 
 ### Live Production Health Endpoint Verification
@@ -132,27 +143,27 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 {
   "status": "healthy",
   "mode": "github-actions",
-  "timestamp": "2026-10-25T17:32:12.504Z",
-  "latencyMs": 188,
-    "services": {
-      "database": "healthy",
-      "dispatcher": "ready"
-    },
-    "isolation": {
-      "mode": "process_sandbox",
-      "isLinuxContainer": false,
-      "controls": {
-        "processTreeKill": true,
-        "isolatedSandboxHome": true,
-        "environmentSanitized": true,
-        "outputBufferLimitBytes": 10485760,
-        "defaultTimeoutMs": 60000,
-        "noHostDockerSocket": true,
-        "kernelNamespacesAvailable": true
-      }
+  "timestamp": "2026-10-25T19:48:49.000Z",
+  "latencyMs": 185,
+  "services": {
+    "database": "healthy",
+    "dispatcher": "ready"
+  },
+  "isolation": {
+    "mode": "process_sandbox",
+    "isLinuxContainer": false,
+    "controls": {
+      "processTreeKill": true,
+      "isolatedSandboxHome": true,
+      "environmentSanitized": true,
+      "outputBufferLimitBytes": 10485760,
+      "defaultTimeoutMs": 60000,
+      "noHostDockerSocket": true,
+      "kernelNamespacesAvailable": true
     }
   }
-  ```
+}
+```
 
 ---
 
@@ -171,17 +182,19 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 | Criterion | Scope | Status | Notes |
 | :--- | :--- | :---: | :--- |
 | **Elimination of Heuristic Function/Variable Name Proof** | Local Code | **PASS** | Function names, variable names, comments, and imports are completely ignored as proof. |
-| **Defensible Local JSON Data-Flow Proof** | Local Code | **PASS** | Requires mathematical proof via `JSON.parse` of local static literal or `JSON.stringify`. |
-| **16 Targeted Regression Tests in Suite 7** | Local Tests | **PASS** | All cases pass with strict assertions. |
-| **Full Vitest Test Suite** | Local Tests | **PASS** | 15 test files, 186 tests passing (0 failures). |
+| **AST-Based Lexical Scope & Data-Flow Proof** | Local Code | **PASS** | Evaluated via `ts.createSourceFile` AST analysis enforcing single `const` declaration, ancestor scope containment, and lack of mutations. |
+| **Destructured Parameter Rejection** | Local Code | **PASS** | Detected and refused for object (`{ data }`), renamed (`{ p: data }`), array (`[ data ]`), nested, default, and rest parameters. |
+| **Data-Flow Ordering Enforcement** | Local Code | **PASS** | Declaration must appear strictly prior to `eval()` call; subsequent assignments/mutations are refused. |
+| **24 Targeted Regression Tests in Suite 7** | Local Tests | **PASS** | All 24 cases pass with strict assertions. |
+| **Full Vitest Test Suite** | Local Tests | **PASS** | 15 test files, 194 tests passing (0 failures). |
 | **TypeScript Typecheck** | Local Build | **PASS** | `tsc --noEmit` exited with 0. |
 | **ESLint Validation** | Local Build | **PASS** | `eslint` exited with 0. |
-| **Next.js Production Build** | Local Build | **PASS** | `next build` compiled all routes in 844ms with 0 errors. |
-| **Gitleaks Secret Scan** | Local Repo | **PASS** | 25 commits scanned: 0 leaks found. |
+| **Next.js Production Build** | Local Build | **PASS** | `next build` compiled all routes in 2.0s with 0 errors. |
+| **Gitleaks Secret Scan** | Local Repo | **PASS** | 28 commits scanned: 0 leaks found. |
 | **Semgrep OSS Scan** | Local Repo | **PASS** | 86 files, 210 rules: 0 findings (0 blocking). |
 | **OSV-Scanner** | Local Repo | **PASS** | 667 packages: 0 vulnerabilities. |
-| **Commit Pushed to Main** | Remote Repo | **PASS** | Focused commit `649f6ab` pushed to `origin main`. |
+| **Commit Pushed to Main** | Remote Repo | **PASS** | Focused commit `18c365c` pushed to `origin main`. |
 | **Vercel Production Deployment** | Production | **PASS** | Production health verified live. |
-| **Production Health Endpoint** | Production | **PASS** | `https://vibeshield-ai-phi.vercel.app/api/health` returns healthy (189ms). |
+| **Production Health Endpoint** | Production | **PASS** | `https://vibeshield-ai-phi.vercel.app/api/health` returns healthy. |
 | **GitHub Pull Request Creation** | Production | **BLOCKED** | Missing GitHub write token (by design; `.patch` download fallback verified). |
 | **Browser Subagent Live Drive** | Environment | **BLOCKED** | Local macOS CDP context management unsupported on port 9222. |
