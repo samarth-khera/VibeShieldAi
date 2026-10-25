@@ -21,6 +21,7 @@ export type ScanDeps = {
   llmProvider?: LlmProvider;
   verifyTurnstile?: typeof verifyTurnstileToken;
   verifyRepo?: (owner: string, repo: string) => Promise<{ ok: boolean; code?: string; error?: string }>;
+  checkAiQuota?: (clientIpHash: string) => Promise<AiQuotaCheckResult>;
 };
 
 const MAX_BODY_BYTES = 2048;
@@ -325,7 +326,9 @@ export async function explainScanFinding(
 
   // 2. Database-backed circuit breaker and atomic per-IP/global quota checks
   const ipHash = clientKey(req.headers);
-  const quotaCheck: AiQuotaCheckResult = await checkAiQuotaAndCircuitBreaker(ipHash).catch(() => ({ allowed: true }));
+  const quotaCheck: AiQuotaCheckResult = deps.checkAiQuota
+    ? await deps.checkAiQuota(ipHash)
+    : await checkAiQuotaAndCircuitBreaker(ipHash).catch(() => ({ allowed: true }));
   if (!quotaCheck.allowed) {
     return fail(429, quotaCheck.reason || "rate_limited", quotaCheck.message || "Too many AI analysis requests. Please wait before trying again.", {
       "Retry-After": String(quotaCheck.retryAfterSeconds || 60),

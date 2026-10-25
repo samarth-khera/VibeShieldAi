@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   scan:
-    name: Execute Security Scan & Local AI
+    name: Execute Security Scanners (Gitleaks, Semgrep, OSV-Scanner)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 

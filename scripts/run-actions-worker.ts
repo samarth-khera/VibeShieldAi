@@ -81,13 +81,6 @@ async function main() {
       }
     }
 
-    // Sanitize all findings before sending
-    for (const f of scanResult.findings) {
-      if (f.redactedEvidence) {
-        f.redactedEvidence = redactText(f.redactedEvidence);
-      }
-    }
-
     // Assemble payload
     const callbackPayload = {
       jobId,

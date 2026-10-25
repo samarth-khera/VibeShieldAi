@@ -476,6 +476,7 @@ describe("AI Security Analyst (Phase 4)", () => {
         config: {} as unknown as ScanDeps["config"],
         enqueue: async () => {},
         rateLimit: async () => ({ allowed: true, retryAfterSeconds: 0 }),
+        checkAiQuota: async () => ({ allowed: true }),
         workerOnline: async () => true,
         llmProvider: provider,
       };
