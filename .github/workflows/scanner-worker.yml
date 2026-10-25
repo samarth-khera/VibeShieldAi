@@ -53,7 +53,7 @@ jobs:
           pip install --no-cache-dir semgrep
 
           echo "Installing OSV-Scanner..."
-          sudo curl -sSL https://github.com/google/osv-scanner/releases/download/v1.7.0/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          sudo curl -sSL https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
           sudo chmod +x /usr/local/bin/osv-scanner
 
           echo "Verifying scanner versions:"
@@ -63,7 +63,7 @@ jobs:
 
       - name: Pre-cache OSV Vulnerability Database
         run: |
-          osv-scanner --download-offline-databases || true
+          osv-scanner scan source --download-offline-databases . || osv-scanner --download-offline-databases || true
 
       - name: Cache Ollama Models
         uses: actions/cache@v4

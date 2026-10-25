@@ -102,15 +102,38 @@ export async function runOsvScan(
     }
     args.push(scanPath);
 
-    const res = await runSubprocess(
-      binary,
-      args,
-      {
-        cwd: scanPath,
-        timeoutMs: options?.timeoutMs ?? 60_000,
-        allowedExitCodes: [0, 1],
-      },
-    );
+    let res;
+    try {
+      res = await runSubprocess(
+        binary,
+        args,
+        {
+          cwd: scanPath,
+          timeoutMs: options?.timeoutMs ?? 60_000,
+          allowedExitCodes: [0, 1],
+        },
+      );
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("stat source: no such file or directory") || msg.includes("unknown command")) {
+        const v1Args = ["-r", "--format", "json", "--allow-no-lockfiles", "--no-ignore"];
+        if (process.env.OSV_OFFLINE === "true" || options?.offline) {
+          v1Args.push("--offline");
+        }
+        v1Args.push(scanPath);
+        res = await runSubprocess(
+          binary,
+          v1Args,
+          {
+            cwd: scanPath,
+            timeoutMs: options?.timeoutMs ?? 60_000,
+            allowedExitCodes: [0, 1],
+          },
+        );
+      } else {
+        throw e;
+      }
+    }
 
     const stdout = res.stdout.trim();
     if (!stdout) {
