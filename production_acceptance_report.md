@@ -2,7 +2,7 @@
 
 **Repository**: [https://github.com/samarth-khera/VibeShieldAi](https://github.com/samarth-khera/VibeShieldAi)  
 **Branch**: `main`  
-**Final Production Commit SHA**: [`36fbcad`](https://github.com/samarth-khera/VibeShieldAi/commit/36fbcad)  
+**Final Production Commit SHA**: [`bb0dec5`](https://github.com/samarth-khera/VibeShieldAi/commit/bb0dec5)  
 **Live Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 **Live Health Endpoint**: [https://vibeshield-ai-phi.vercel.app/api/health](https://vibeshield-ai-phi.vercel.app/api/health)  
 **Report Date**: 2026-10-26  
@@ -11,19 +11,26 @@
 
 ## 1. Executive Summary
 
-This report documents the resolution of the final AST verifier acceptance check closing the two remaining verification gaps for `eval()` remediation in VibeShield AI:
+This report documents the resolution of the final AST verifier acceptance check closing both local and global verification gaps for `eval()` remediation in VibeShield AI:
 
-1. **Verification of `JSON.stringify` Binding Identity**:
+1. **Verification of `JSON.stringify` Binding Identity & Global Object Mutations**:
    - Does not accept an AST call merely because its syntax is `JSON.stringify(...)`.
-   - Implemented `hasJsonShadowOrOverride(sourceFile)` which rigorously inspects all declarations, bindings, imports, and mutations across the AST:
+   - Implemented `hasJsonShadowOrOverride(sourceFile)` with AST unwrapping and property analysis:
      - Variable declarations (`const JSON`, `let JSON`, `var JSON`, destructured `{ JSON }`).
      - Function, class, enum, namespace/module, interface, and type alias declarations named `JSON`.
      - Parameter bindings and catch clauses binding `JSON`.
      - Imports (`import JSON`, `import { JSON }`, `import * as JSON`, `import JSON = require`).
      - Export specifiers (`export { custom as JSON }`).
-     - Assignments and mutations (`JSON = ...`, `JSON.stringify = ...`, `JSON["stringify"] = ...`, `globalThis.JSON = ...`).
-     - Delete expressions (`delete JSON.stringify`).
-     - Property definition or object mutation (`Object.assign(JSON, ...)`, `Object.defineProperty(JSON, ...)`).
+     - Direct and computed property global overrides:
+       - `globalThis["JSON"] = ...`, `window["JSON"] = ...`, `global["JSON"] = ...`, `self["JSON"] = ...`
+       - Single-quoted, double-quoted, and template literal variants (`[`JSON`]`).
+       - Casted expressions: `(globalThis as any)["JSON"] = ...`, `(<any>window)["JSON"] = ...`.
+     - Global object replacement operations:
+       - `Object.defineProperty(globalThis, "JSON", ...)` and window/global/self variants.
+       - `Object.defineProperties(globalThis, ...)` when defining `JSON`.
+       - `Object.assign(globalThis, { JSON: ... })` and window/global/self variants.
+       - `Reflect.defineProperty(globalThis, "JSON", ...)` and window/global/self variants.
+     - Delete expressions: `delete JSON.stringify`, `delete globalThis["JSON"]`, `delete window.JSON`.
    - If the `JSON` identifier cannot be proven to resolve strictly to the genuine built-in global object, automatic remediation is rejected and routed to manual review.
 
 2. **Fail-Closed on TypeScript Parse Diagnostics & Ambiguous Resolution**:
@@ -52,7 +59,7 @@ All changes have been validated across the complete test suite (**197 tests pass
 
 ---
 
-## 3. Targeted Regression Cases Exercised (All 27 Cases in Suite 7 & AST Acceptance)
+## 3. Targeted Regression Cases Exercised (All 34 Cases in Suite 7 & AST Acceptance)
 
 | Test Case | Description | Test Implementation | Result |
 | :--- | :--- | :--- | :--- |
@@ -77,6 +84,13 @@ All changes have been validated across the complete test suite (**197 tests pass
 | **Variant 7B** | Mutated JSON.stringify property | `JSON.stringify = () => "evil()"; ... eval("(" + data + ")");` | **PASS** (Refused: mutation to JSON object detected) |
 | **Variant 7C** | Imported custom JSON module | `import JSON from "custom-json-lib"; ... eval("(" + data + ")");` | **PASS** (Refused: imported JSON module detected) |
 | **Variant 7D** | Parameter binding named JSON | `function getParamConfig(JSON: any) { ... eval("(" + data + ")"); }` | **PASS** (Refused: JSON parameter binding detected) |
+| **Variant 7E** | Computed property override: `globalThis["JSON"]` | `globalThis["JSON"] = { stringify: () => "alert('pwned')" }; eval("(" + data + ")");` | **PASS** (Refused: computed globalThis property override detected) |
+| **Variant 7F** | Computed property override: `window["JSON"]` | `window["JSON"] = { stringify: () => "alert('pwned')" }; eval("(" + data + ")");` | **PASS** (Refused: computed window property override detected) |
+| **Variant 7G** | Computed property override: `global["JSON"]` | `global["JSON"] = { stringify: () => "alert('pwned')" }; eval("(" + data + ")");` | **PASS** (Refused: computed global property override detected) |
+| **Variant 7H** | `Object.defineProperty(globalThis, "JSON", ...)` | `Object.defineProperty(globalThis, "JSON", { value: ... });` & window/global | **PASS** (Refused: Object.defineProperty global override detected) |
+| **Variant 7I** | `Object.defineProperties(globalThis, ...)` defining JSON | `Object.defineProperties(globalThis, { JSON: { value: ... } });` & window computed | **PASS** (Refused: Object.defineProperties global override detected) |
+| **Variant 7J** | `Object.assign(globalThis, { JSON: ... })` | `Object.assign(globalThis, { JSON: ... });` & window/global | **PASS** (Refused: Object.assign global override detected) |
+| **Variant 7K** | `Reflect.defineProperty(globalThis, "JSON", ...)` | `Reflect.defineProperty(globalThis, "JSON", { value: ... });` & window/global | **PASS** (Refused: Reflect.defineProperty global override detected) |
 | **Variant 8A** | Malformed source: missing expression syntax error | `const bad = ; const data = JSON.stringify(...); eval("(" + data + ")");` | **PASS** (Refused: parse diagnostics detected) |
 | **Variant 8B** | Malformed source: unclosed block / delimiter | `function getUnclosedConfig() { ... eval("(" + data + ")"` | **PASS** (Refused: parse diagnostics detected) |
 | **Variant 9A** | Ambiguous target calls: multiple calls without finding line | Multiple eval calls referencing data with no line number passed. | **PASS** (Refused: ambiguous target call resolution) |
@@ -96,7 +110,7 @@ All changes have been validated across the complete test suite (**197 tests pass
 
 | Check | Command Run | Exit Code | Outcome Details |
 | :--- | :--- | :---: | :--- |
-| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 197 tests passed (0 failed)** in 12.95s. |
+| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 197 tests passed (0 failed)** in 13.26s. |
 | **TypeScript Typecheck** | `npm run typecheck` (`tsc --noEmit`) | `0` | **0 type errors**. Clean compilation across all files. |
 | **ESLint** | `npm run lint` (`eslint`) | `0` | **0 lint warnings / 0 lint errors**. |
 | **Production Build** | `npm run build` (`next build`) | `0` | Turbopack production build succeeded in 2.0s. All 21 static and dynamic routes compiled. |
@@ -141,7 +155,7 @@ The complete end-to-end remediation workflow was verified using automated integr
 ## 6. Deployment & Health Verification Evidence
 
 ### Vercel Production Deployment
-- **Commit**: [`36fbcad`](https://github.com/samarth-khera/VibeShieldAi/commit/36fbcad)  
+- **Commit**: [`bb0dec5`](https://github.com/samarth-khera/VibeShieldAi/commit/bb0dec5)  
 - **Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 - **Environment**: Production  
 
@@ -154,8 +168,8 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 {
   "status": "healthy",
   "mode": "github-actions",
-  "timestamp": "2026-10-25T20:04:55.551Z",
-  "latencyMs": 244,
+  "timestamp": "2026-10-26T08:05:50.012Z",
+  "latencyMs": 224,
   "services": {
     "database": "healthy",
     "dispatcher": "ready"
@@ -195,19 +209,20 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 | **Elimination of Heuristic Function/Variable Name Proof** | Local Code | **PASS** | Function names, variable names, comments, and imports are completely ignored as proof. |
 | **AST-Based Lexical Scope & Data-Flow Proof** | Local Code | **PASS** | Evaluated via `ts.createSourceFile` AST analysis enforcing single `const` declaration, ancestor scope containment, and lack of mutations. |
 | **JSON.stringify Binding Identity Verification** | Local Code | **PASS** | Evaluated via `hasJsonShadowOrOverride` verifying JSON identifier is the authentic unshadowed built-in global object. |
+| **Global JSON Computed & Object/Reflect Mutation Detection** | Local Code | **PASS** | Evaluates computed overrides (`globalThis["JSON"]`, `window["JSON"]`, `global["JSON"]`) and `Object.defineProperty`, `Object.defineProperties`, `Object.assign`, `Reflect.defineProperty`. |
 | **TypeScript Parser Diagnostics Fail-Closed Gate** | Local Code | **PASS** | Explicitly checks `sourceFile.parseDiagnostics`; any syntax error or malformed code fails closed. |
 | **Unambiguous Target Call Resolution** | Local Code | **PASS** | Evaluates 1:1 matching between finding line and AST target call; multiple ambiguous calls fail closed. |
 | **Destructured Parameter Rejection** | Local Code | **PASS** | Detected and refused for object (`{ data }`), renamed (`{ p: data }`), array (`[ data ]`), nested, default, and rest parameters. |
 | **Data-Flow Ordering Enforcement** | Local Code | **PASS** | Declaration must appear strictly prior to `eval()` call; subsequent assignments/mutations are refused. |
-| **27 Targeted Regression Tests in Suite 7 & AST Acceptance** | Local Tests | **PASS** | All 27 cases pass with strict assertions. |
+| **34 Targeted Regression Tests in Suite 7 & AST Acceptance** | Local Tests | **PASS** | All 34 cases pass with strict assertions. |
 | **Full Vitest Test Suite** | Local Tests | **PASS** | 15 test files, 197 tests passing (0 failures). |
 | **TypeScript Typecheck** | Local Build | **PASS** | `tsc --noEmit` exited with 0. |
 | **ESLint Validation** | Local Build | **PASS** | `eslint` exited with 0. |
 | **Next.js Production Build** | Local Build | **PASS** | `next build` compiled all routes in 2.0s with 0 errors. |
-| **Gitleaks Secret Scan** | Local Repo | **PASS** | 30 commits scanned: 0 leaks found. |
+| **Gitleaks Secret Scan** | Local Repo | **PASS** | 32 commits scanned: 0 leaks found. |
 | **Semgrep OSS Scan** | Local Repo | **PASS** | 86 files, 210 rules: 0 findings (0 blocking). |
 | **OSV-Scanner** | Local Repo | **PASS** | 667 packages: 0 vulnerabilities. |
-| **Commit Pushed to Main** | Remote Repo | **PASS** | Focused commit `36fbcad` pushed to `origin main`. |
+| **Commit Pushed to Main** | Remote Repo | **PASS** | Focused commit `bb0dec5` pushed to `origin main`. |
 | **Vercel Production Deployment** | Production | **PASS** | Production health verified live. |
 | **Production Health Endpoint** | Production | **PASS** | `https://vibeshield-ai-phi.vercel.app/api/health` returns healthy. |
 | **GitHub Pull Request Creation** | Production | **BLOCKED** | Missing GitHub write token (by design; `.patch` download fallback verified). |
