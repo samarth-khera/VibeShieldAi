@@ -2028,6 +2028,237 @@ export function getReflectSetSafeConfig() {
 }`;
         expect(verifyJsonSourceProof(reflectSetSafeSource, "data", 4)).toBe(true);
 
+        // Indirect Object.assign via variable containing JSON
+        const indirectAssignGlobalThisSource = `const overrides = {
+  JSON: { stringify: () => "alert('pwned-indirect-assign')" }
+};
+Object.assign(globalThis, overrides);
+export function getIndirectAssignConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(indirectAssignGlobalThisSource, "data", 8)).toBe(false);
+
+        let llmCalledOnIndirectAssign = false;
+        const mockLlmForIndirectAssign: LlmProvider = {
+          getModelName: () => "mock-llm",
+          isConfigured: () => true,
+          generateText: async () => {
+            llmCalledOnIndirectAssign = true;
+            return "diff";
+          },
+        };
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "Indirect Object.assign globalThis override",
+              filePath: "src/indirect-assign.ts",
+              startLine: 8,
+              endLine: 8,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-indirect-assign",
+            commitSha: "sha-indirect-assign",
+            sourceContent: indirectAssignGlobalThisSource,
+            llmProvider: mockLlmForIndirectAssign,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+        expect(llmCalledOnIndirectAssign).toBe(false);
+
+        // window, global, self variants of indirect Object.assign
+        const indirectAssignWindowSource = `const overrides = { JSON: { stringify: () => "alert('pwned-window')" } };
+Object.assign(window, overrides);
+export function getIndirectAssignWindow() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(indirectAssignWindowSource, "data", 5)).toBe(false);
+
+        const indirectAssignGlobalSource = `const overrides = { JSON: { stringify: () => "alert('pwned-global')" } };
+Object.assign(global, overrides);
+export function getIndirectAssignGlobal() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(indirectAssignGlobalSource, "data", 5)).toBe(false);
+
+        const indirectAssignSelfSource = `const overrides = { JSON: { stringify: () => "alert('pwned-self')" } };
+Object.assign(self, overrides);
+export function getIndirectAssignSelf() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(indirectAssignSelfSource, "data", 5)).toBe(false);
+
+        // Indirect Object.defineProperties via variable containing JSON
+        const indirectDefinePropertiesSource = `const descriptors = {
+  JSON: { value: { stringify: () => "alert('pwned-indirect-descriptors')" } }
+};
+Object.defineProperties(globalThis, descriptors);
+export function getIndirectDefinePropsConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(indirectDefinePropertiesSource, "data", 8)).toBe(false);
+
+        let llmCalledOnIndirectDefineProps = false;
+        const mockLlmForIndirectDefineProps: LlmProvider = {
+          getModelName: () => "mock-llm",
+          isConfigured: () => true,
+          generateText: async () => {
+            llmCalledOnIndirectDefineProps = true;
+            return "diff";
+          },
+        };
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "Indirect Object.defineProperties globalThis override",
+              filePath: "src/indirect-define-properties.ts",
+              startLine: 8,
+              endLine: 8,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-indirect-define-props",
+            commitSha: "sha-indirect-define-props",
+            sourceContent: indirectDefinePropertiesSource,
+            llmProvider: mockLlmForIndirectDefineProps,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+        expect(llmCalledOnIndirectDefineProps).toBe(false);
+
+        // window, global, self variants of indirect Object.defineProperties
+        const indirectDefinePropsWindowSource = `const descriptors = { JSON: { value: { stringify: () => "alert('pwned-window')" } } };
+Object.defineProperties(window, descriptors);
+export function getIndirectDefinePropsWindow() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(indirectDefinePropsWindowSource, "data", 5)).toBe(false);
+
+        const indirectDefinePropsGlobalSource = `const descriptors = { JSON: { value: { stringify: () => "alert('pwned-global')" } } };
+Object.defineProperties(global, descriptors);
+export function getIndirectDefinePropsGlobal() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(indirectDefinePropsGlobalSource, "data", 5)).toBe(false);
+
+        const indirectDefinePropsSelfSource = `const descriptors = { JSON: { value: { stringify: () => "alert('pwned-self')" } } };
+Object.defineProperties(self, descriptors);
+export function getIndirectDefinePropsSelf() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(indirectDefinePropsSelfSource, "data", 5)).toBe(false);
+
+        // Spread-based mutation sources: Object.assign(globalThis, { ...overrides })
+        const spreadAssignSource = `const overrides = { JSON: { stringify: () => "alert('pwned-spread')" } };
+Object.assign(globalThis, { ...overrides });
+export function getSpreadAssignConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(spreadAssignSource, "data", 5)).toBe(false);
+
+        let llmCalledOnSpreadAssign = false;
+        const mockLlmForSpreadAssign: LlmProvider = {
+          getModelName: () => "mock-llm",
+          isConfigured: () => true,
+          generateText: async () => {
+            llmCalledOnSpreadAssign = true;
+            return "diff";
+          },
+        };
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "Spread Object.assign globalThis override",
+              filePath: "src/spread-assign.ts",
+              startLine: 5,
+              endLine: 5,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-spread-assign",
+            commitSha: "sha-spread-assign",
+            sourceContent: spreadAssignSource,
+            llmProvider: mockLlmForSpreadAssign,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+        expect(llmCalledOnSpreadAssign).toBe(false);
+
+        // Unknown/unresolved spread sources fail closed
+        const unknownSpreadAssignSource = `Object.assign(globalThis, { ...unknownOverrides });
+export function getUnknownSpreadConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(unknownSpreadAssignSource, "data", 4)).toBe(false);
+
+        const unknownSpreadDefinePropsSource = `Object.defineProperties(globalThis, { ...unknownDescriptors });
+export function getUnknownSpreadDefinePropsConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(unknownSpreadDefinePropsSource, "data", 4)).toBe(false);
+
+        // Unresolved computed property in object literal fails closed
+        const unresolvedComputedAssignSource = `const dynamicKey = "JSON";
+Object.assign(globalThis, { [dynamicKey]: { stringify: () => "evil" } });
+export function getUnresolvedComputedConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(unresolvedComputedAssignSource, "data", 5)).toBe(false);
+
+        // Safe, statically inspectable non-JSON sources allow verified safe eval remediation
+        const safeAssignVarSource = `const safeOverrides = { otherProp: 123 };
+Object.assign(globalThis, safeOverrides);
+export function getSafeAssignVarConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(safeAssignVarSource, "data", 5)).toBe(true);
+
+        const safeAssignLiteralSource = `Object.assign(globalThis, { otherProp: 123, foo: "bar" });
+export function getSafeAssignLiteralConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(safeAssignLiteralSource, "data", 4)).toBe(true);
+
+        const safeSpreadAssignSource = `const safeBase = { otherProp: 123 };
+Object.assign(globalThis, { ...safeBase, directProp: 456 });
+export function getSafeSpreadAssignConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(safeSpreadAssignSource, "data", 5)).toBe(true);
+
+        const safeDefinePropertiesSource = `const safeDescriptors = { otherProp: { value: 123 } };
+Object.defineProperties(globalThis, safeDescriptors);
+export function getSafeDefinePropsConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(safeDefinePropertiesSource, "data", 5)).toBe(true);
+
+        const safeComputedNonJsonSource = `Object.assign(globalThis, { ["other"]: 123 });
+export function getSafeComputedNonJsonConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(safeComputedNonJsonSource, "data", 4)).toBe(true);
+
         // Unrelated eligible remediation (e.g. security headers) remains functional
         const headerFinding = makeFinding({
           ruleId: "security-headers-missing",

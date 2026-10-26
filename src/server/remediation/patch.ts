@@ -153,12 +153,120 @@ function getUnwrappedExpression(expr: ts.Expression): ts.Expression {
 }
 
 /**
+ * Resolves a variable name to its single const VariableDeclaration in the file,
+ * returning null if there are 0, multiple, mutated, non-const, or destructured declarations.
+ */
+function findSingleConstVariableDeclaration(
+  varName: string,
+  sourceFile: ts.SourceFile
+): ts.VariableDeclaration | null {
+  const declarations: ts.Node[] = [];
+  function findDecls(node: ts.Node) {
+    if (ts.isVariableDeclaration(node)) {
+      if (parameterBindsName(node.name, varName)) {
+        declarations.push(node);
+      }
+    } else if (
+      (ts.isFunctionDeclaration(node) ||
+        ts.isClassDeclaration(node) ||
+        ts.isEnumDeclaration(node) ||
+        ts.isInterfaceDeclaration(node) ||
+        ts.isTypeAliasDeclaration(node) ||
+        ts.isModuleDeclaration(node)) &&
+      node.name &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === varName
+    ) {
+      declarations.push(node);
+    } else if (ts.isParameter(node)) {
+      if (parameterBindsName(node.name, varName)) {
+        declarations.push(node);
+      }
+    } else if (ts.isImportClause(node)) {
+      if (node.name && node.name.text === varName) {
+        declarations.push(node);
+      }
+      if (node.namedBindings) {
+        if (ts.isNamespaceImport(node.namedBindings) && node.namedBindings.name.text === varName) {
+          declarations.push(node);
+        }
+        if (ts.isNamedImports(node.namedBindings)) {
+          for (const spec of node.namedBindings.elements) {
+            if (spec.name.text === varName) {
+              declarations.push(spec);
+            }
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, findDecls);
+  }
+  findDecls(sourceFile);
+
+  if (declarations.length !== 1) {
+    return null;
+  }
+
+  const decl = declarations[0];
+  if (!ts.isVariableDeclaration(decl)) {
+    return null;
+  }
+
+  if (!ts.isIdentifier(decl.name) || decl.name.text !== varName) {
+    return null;
+  }
+
+  const varDeclList = decl.parent;
+  if (
+    !ts.isVariableDeclarationList(varDeclList) ||
+    (varDeclList.flags & ts.NodeFlags.Const) === 0
+  ) {
+    return null;
+  }
+
+  let hasMutation = false;
+  function checkAssign(node: ts.Node) {
+    if (ts.isBinaryExpression(node)) {
+      const isAssign =
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
+        (node.operatorToken.kind >= ts.SyntaxKind.FirstCompoundAssignment &&
+          node.operatorToken.kind <= ts.SyntaxKind.LastCompoundAssignment);
+      if (isAssign && parameterBindsName(node.left, varName)) {
+        hasMutation = true;
+      }
+    } else if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)
+    ) {
+      if (ts.isIdentifier(node.operand) && node.operand.text === varName) {
+        hasMutation = true;
+      }
+    }
+    ts.forEachChild(node, checkAssign);
+  }
+  checkAssign(sourceFile);
+  if (hasMutation) {
+    return null;
+  }
+
+  return decl;
+}
+
+/**
  * Checks if an expression resolves to a known global root (globalThis, window, global, self).
  */
-function isGlobalObject(expr: ts.Expression): boolean {
+function isGlobalObject(expr: ts.Expression, sourceFile?: ts.SourceFile): boolean {
   const unwrapped = getUnwrappedExpression(expr);
   if (ts.isIdentifier(unwrapped)) {
-    return ["globalThis", "window", "global", "self"].includes(unwrapped.text);
+    if (["globalThis", "window", "global", "self"].includes(unwrapped.text)) {
+      return true;
+    }
+    if (sourceFile) {
+      const decl = findSingleConstVariableDeclaration(unwrapped.text, sourceFile);
+      if (decl && decl.initializer && isGlobalObject(decl.initializer, sourceFile)) {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -166,39 +274,61 @@ function isGlobalObject(expr: ts.Expression): boolean {
 /**
  * Checks if a property name node matches the target string (e.g. "JSON").
  * Handles identifiers, string literals, no-substitution template literals,
- * and computed property names like ["JSON"] or [`JSON`].
+ * computed property names like ["JSON"] or [`JSON`], and single const identifiers.
  */
-function isPropertyNamed(nameNode: ts.Node | undefined, target: string): boolean {
+function isPropertyNamed(
+  nameNode: ts.Node | undefined,
+  target: string,
+  sourceFile?: ts.SourceFile
+): boolean {
   if (!nameNode) return false;
   const unwrapped = ts.isExpression(nameNode as ts.Node)
     ? getUnwrappedExpression(nameNode as ts.Expression)
     : nameNode;
-  if (ts.isIdentifier(unwrapped) && unwrapped.text === target) return true;
+  if (ts.isIdentifier(unwrapped)) {
+    if (unwrapped.text === target) return true;
+    if (sourceFile) {
+      const decl = findSingleConstVariableDeclaration(unwrapped.text, sourceFile);
+      if (decl && decl.initializer) {
+        return isPropertyNamed(decl.initializer, target, sourceFile);
+      }
+    }
+  }
   if (ts.isStringLiteral(unwrapped) && unwrapped.text === target) return true;
   if (ts.isNoSubstitutionTemplateLiteral(unwrapped) && unwrapped.text === target) return true;
   if (ts.isComputedPropertyName(unwrapped)) {
     const expr = getUnwrappedExpression(unwrapped.expression);
-    if (ts.isStringLiteral(expr) && expr.text === target) return true;
-    if (ts.isNoSubstitutionTemplateLiteral(expr) && expr.text === target) return true;
+    return isPropertyNamed(expr, target, sourceFile);
   }
   if (ts.isArrayLiteralExpression(unwrapped) && unwrapped.elements.length === 1) {
     const elem = getUnwrappedExpression(unwrapped.elements[0]);
-    if (ts.isStringLiteral(elem) && elem.text === target) return true;
-    if (ts.isNoSubstitutionTemplateLiteral(elem) && elem.text === target) return true;
+    return isPropertyNamed(elem, target, sourceFile);
   }
   return false;
 }
 
 /**
- * Checks if a property key is a statically proven string literal that is NOT "JSON".
+ * Checks if a property key is a statically proven literal that is NOT "JSON".
  */
-function isStaticNonJsonLiteral(node: ts.Node | undefined): boolean {
+function isStaticNonJsonLiteral(node: ts.Node | undefined, sourceFile?: ts.SourceFile): boolean {
   if (!node) return false;
   const unwrapped = ts.isExpression(node as ts.Node)
     ? getUnwrappedExpression(node as ts.Expression)
     : node;
+  if (ts.isNumericLiteral(unwrapped)) {
+    return true;
+  }
+  if (unwrapped.kind === ts.SyntaxKind.TrueKeyword || unwrapped.kind === ts.SyntaxKind.FalseKeyword) {
+    return true;
+  }
   if (ts.isStringLiteral(unwrapped) || ts.isNoSubstitutionTemplateLiteral(unwrapped)) {
     return unwrapped.text !== "JSON";
+  }
+  if (ts.isIdentifier(unwrapped) && sourceFile) {
+    const decl = findSingleConstVariableDeclaration(unwrapped.text, sourceFile);
+    if (decl && decl.initializer) {
+      return isStaticNonJsonLiteral(decl.initializer, sourceFile);
+    }
   }
   return false;
 }
@@ -224,11 +354,11 @@ function getAccessedPropertyName(expr: ts.PropertyAccessExpression | ts.ElementA
  * Checks whether an expression accesses targetProp on a global object
  * (e.g. globalThis.JSON, window["JSON"], global['JSON'], self[`JSON`]).
  */
-function isGlobalPropertyAccess(expr: ts.Expression, targetProp: string): boolean {
+function isGlobalPropertyAccess(expr: ts.Expression, targetProp: string, sourceFile?: ts.SourceFile): boolean {
   const unwrapped = getUnwrappedExpression(expr);
   if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
     const prop = getAccessedPropertyName(unwrapped);
-    if (prop === targetProp && isGlobalObject(unwrapped.expression)) {
+    if (prop === targetProp && isGlobalObject(unwrapped.expression, sourceFile)) {
       return true;
     }
   }
@@ -239,14 +369,14 @@ function isGlobalPropertyAccess(expr: ts.Expression, targetProp: string): boolea
  * Checks whether an expression references JSON or a property on JSON,
  * or globalThis.JSON / window["JSON"] / etc.
  */
-function referencesJsonTarget(expr: ts.Expression): boolean {
+function referencesJsonTarget(expr: ts.Expression, sourceFile?: ts.SourceFile): boolean {
   let curr: ts.Expression | undefined = expr;
   while (curr) {
     const unwrapped = getUnwrappedExpression(curr);
     if (ts.isIdentifier(unwrapped) && unwrapped.text === "JSON") {
       return true;
     }
-    if (isGlobalPropertyAccess(unwrapped, "JSON")) {
+    if (isGlobalPropertyAccess(unwrapped, "JSON", sourceFile)) {
       return true;
     }
     if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
@@ -259,10 +389,34 @@ function referencesJsonTarget(expr: ts.Expression): boolean {
 }
 
 /**
- * Checks whether an object literal expression defines or assigns a property named target.
+ * Evaluates whether an expression passed as a source to Object.assign() or descriptors
+ * to Object.defineProperties() can be statically proven NOT to define or modify "JSON".
+ * Fails closed (returns false) if the source contains "JSON", spreads of unproven objects,
+ * unresolved computed properties, or expressions that cannot be statically verified.
  */
-function objectDefinesProperty(expr: ts.Expression, target: string): boolean {
+function isStaticallyProvenNotToModifyJson(
+  expr: ts.Expression,
+  sourceFile: ts.SourceFile,
+  visited: Set<ts.Node> = new Set<ts.Node>()
+): boolean {
   const unwrapped = getUnwrappedExpression(expr);
+  if (visited.has(unwrapped)) {
+    return false; // circular or already seen
+  }
+  visited.add(unwrapped);
+
+  // Primitive literals without own enumerable properties
+  if (
+    unwrapped.kind === ts.SyntaxKind.NullKeyword ||
+    unwrapped.kind === ts.SyntaxKind.UndefinedKeyword ||
+    unwrapped.kind === ts.SyntaxKind.TrueKeyword ||
+    unwrapped.kind === ts.SyntaxKind.FalseKeyword ||
+    ts.isNumericLiteral(unwrapped)
+  ) {
+    return true;
+  }
+
+  // Object literal expression: verify every property
   if (ts.isObjectLiteralExpression(unwrapped)) {
     for (const prop of unwrapped.properties) {
       if (
@@ -272,12 +426,53 @@ function objectDefinesProperty(expr: ts.Expression, target: string): boolean {
         ts.isGetAccessorDeclaration(prop) ||
         ts.isSetAccessorDeclaration(prop)
       ) {
-        if (isPropertyNamed(prop.name, target)) {
-          return true;
+        if (isPropertyNamed(prop.name, "JSON", sourceFile)) {
+          return false;
         }
+        if (ts.isComputedPropertyName(prop.name)) {
+          const compExpr = getUnwrappedExpression(prop.name.expression);
+          if (isPropertyNamed(compExpr, "JSON", sourceFile)) {
+            return false;
+          }
+          if (!isStaticNonJsonLiteral(compExpr, sourceFile)) {
+            // Unresolved computed property -> cannot assume safe
+            return false;
+          }
+        } else if (
+          ts.isIdentifier(prop.name) ||
+          ts.isStringLiteral(prop.name) ||
+          ts.isNoSubstitutionTemplateLiteral(prop.name)
+        ) {
+          if (prop.name.text === "JSON") {
+            return false;
+          }
+        } else {
+          return false;
+        }
+      } else if (ts.isSpreadAssignment(prop)) {
+        // Inspect spread properties: do not assume safe unless expression is statically proven
+        if (!isStaticallyProvenNotToModifyJson(prop.expression, sourceFile, visited)) {
+          return false;
+        }
+      } else {
+        return false;
       }
     }
+    return true;
   }
+
+  // Identifier: resolve to its single const declaration in sourceFile
+  if (ts.isIdentifier(unwrapped)) {
+    if (unwrapped.text === "JSON") {
+      return false;
+    }
+    const decl = findSingleConstVariableDeclaration(unwrapped.text, sourceFile);
+    if (!decl || !decl.initializer) {
+      return false;
+    }
+    return isStaticallyProvenNotToModifyJson(decl.initializer, sourceFile, visited);
+  }
+
   return false;
 }
 
@@ -413,36 +608,38 @@ function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
           const firstArg = node.arguments[0];
           if (firstArg) {
             // Direct target is JSON itself or global property access (e.g. globalThis.JSON, window["JSON"])
-            if (referencesJsonTarget(firstArg)) {
+            if (referencesJsonTarget(firstArg, sourceFile)) {
               shadowedOrOverridden = true;
               return;
             }
 
             // Target is a global root (globalThis, window, global, self)
-            if (isGlobalObject(firstArg)) {
+            if (isGlobalObject(firstArg, sourceFile)) {
               if (calleeProp === "defineProperty" || calleeProp === "set") {
                 const secondArg = node.arguments[1];
                 if (secondArg) {
-                  if (isPropertyNamed(secondArg, "JSON")) {
+                  if (isPropertyNamed(secondArg, "JSON", sourceFile)) {
                     shadowedOrOverridden = true;
                     return;
                   }
                   // If secondArg cannot be proven to be a known static non-JSON property,
                   // dynamic global integrity cannot be proven reliably; fail closed.
-                  if (!isStaticNonJsonLiteral(secondArg)) {
+                  if (!isStaticNonJsonLiteral(secondArg, sourceFile)) {
                     shadowedOrOverridden = true;
                     return;
                   }
                 }
               } else if (calleeProp === "defineProperties") {
                 const secondArg = node.arguments[1];
-                if (secondArg && objectDefinesProperty(secondArg, "JSON")) {
+                if (!secondArg || !isStaticallyProvenNotToModifyJson(secondArg, sourceFile)) {
                   shadowedOrOverridden = true;
                   return;
                 }
               } else if (calleeProp === "assign") {
-                for (const sourceArg of node.arguments.slice(1)) {
-                  if (objectDefinesProperty(sourceArg, "JSON")) {
+                const sourceArgs = node.arguments.slice(1);
+                for (const sourceArg of sourceArgs) {
+                  const exprToCheck = ts.isSpreadElement(sourceArg) ? sourceArg.expression : sourceArg;
+                  if (!isStaticallyProvenNotToModifyJson(exprToCheck, sourceFile)) {
                     shadowedOrOverridden = true;
                     return;
                   }
