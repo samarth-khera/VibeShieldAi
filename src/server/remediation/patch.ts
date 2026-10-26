@@ -131,6 +131,135 @@ function getScopeContainer(node: ts.Node): ts.Node | null {
 }
 
 /**
+ * Unwraps parenthesized expressions, type assertions, as expressions,
+ * non-null expressions, and satisfies expressions.
+ */
+function getUnwrappedExpression(expr: ts.Expression): ts.Expression {
+  let curr = expr;
+  while (curr) {
+    if (
+      ts.isParenthesizedExpression(curr) ||
+      ts.isAsExpression(curr) ||
+      ts.isTypeAssertionExpression(curr) ||
+      ts.isNonNullExpression(curr) ||
+      ts.isSatisfiesExpression(curr)
+    ) {
+      curr = curr.expression;
+    } else {
+      break;
+    }
+  }
+  return curr;
+}
+
+/**
+ * Checks if an expression resolves to a known global root (globalThis, window, global, self).
+ */
+function isGlobalObject(expr: ts.Expression): boolean {
+  const unwrapped = getUnwrappedExpression(expr);
+  if (ts.isIdentifier(unwrapped)) {
+    return ["globalThis", "window", "global", "self"].includes(unwrapped.text);
+  }
+  return false;
+}
+
+/**
+ * Checks if a property name node matches the target string (e.g. "JSON").
+ * Handles identifiers, string literals, no-substitution template literals,
+ * and computed property names like ["JSON"] or [`JSON`].
+ */
+function isPropertyNamed(nameNode: ts.Node | undefined, target: string): boolean {
+  if (!nameNode) return false;
+  if (ts.isIdentifier(nameNode) && nameNode.text === target) return true;
+  if (ts.isStringLiteral(nameNode) && nameNode.text === target) return true;
+  if (ts.isNoSubstitutionTemplateLiteral(nameNode) && nameNode.text === target) return true;
+  if (ts.isComputedPropertyName(nameNode)) {
+    const expr = getUnwrappedExpression(nameNode.expression);
+    if (ts.isStringLiteral(expr) && expr.text === target) return true;
+    if (ts.isNoSubstitutionTemplateLiteral(expr) && expr.text === target) return true;
+  }
+  return false;
+}
+
+/**
+ * Extracts accessed property name from a property access or element access expression.
+ * Returns the property name string, or null if it cannot be determined statically.
+ */
+function getAccessedPropertyName(expr: ts.PropertyAccessExpression | ts.ElementAccessExpression): string | null {
+  if (ts.isPropertyAccessExpression(expr)) {
+    return expr.name.text;
+  }
+  if (ts.isElementAccessExpression(expr)) {
+    const arg = getUnwrappedExpression(expr.argumentExpression);
+    if (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg)) {
+      return arg.text;
+    }
+  }
+  return null;
+}
+
+/**
+ * Checks whether an expression accesses targetProp on a global object
+ * (e.g. globalThis.JSON, window["JSON"], global['JSON'], self[`JSON`]).
+ */
+function isGlobalPropertyAccess(expr: ts.Expression, targetProp: string): boolean {
+  const unwrapped = getUnwrappedExpression(expr);
+  if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
+    const prop = getAccessedPropertyName(unwrapped);
+    if (prop === targetProp && isGlobalObject(unwrapped.expression)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Checks whether an expression references JSON or a property on JSON,
+ * or globalThis.JSON / window["JSON"] / etc.
+ */
+function referencesJsonTarget(expr: ts.Expression): boolean {
+  let curr: ts.Expression | undefined = expr;
+  while (curr) {
+    const unwrapped = getUnwrappedExpression(curr);
+    if (ts.isIdentifier(unwrapped) && unwrapped.text === "JSON") {
+      return true;
+    }
+    if (isGlobalPropertyAccess(unwrapped, "JSON")) {
+      return true;
+    }
+    if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
+      curr = unwrapped.expression;
+    } else {
+      break;
+    }
+  }
+  return false;
+}
+
+/**
+ * Checks whether an object literal expression defines or assigns a property named target.
+ */
+function objectDefinesProperty(expr: ts.Expression, target: string): boolean {
+  const unwrapped = getUnwrappedExpression(expr);
+  if (ts.isObjectLiteralExpression(unwrapped)) {
+    for (const prop of unwrapped.properties) {
+      if (
+        ts.isPropertyAssignment(prop) ||
+        ts.isShorthandPropertyAssignment(prop) ||
+        ts.isMethodDeclaration(prop) ||
+        ts.isGetAccessorDeclaration(prop) ||
+        ts.isSetAccessorDeclaration(prop)
+      ) {
+        if (isPropertyNamed(prop.name, target)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Verifies whether the identifier "JSON" is shadowed, overridden, imported,
  * or mutated anywhere in the source file.
  * Returns true if "JSON" is shadowed or overridden (i.e. cannot be proven to be
@@ -215,67 +344,78 @@ function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
       }
     }
 
-    // 6. Assignments and mutations: JSON = ..., JSON.stringify = ..., JSON["stringify"] = ...
+    // 6. Assignments and mutations: JSON = ..., JSON.stringify = ..., globalThis["JSON"] = ..., window["JSON"] = ...
     if (ts.isBinaryExpression(node)) {
       const isAssign =
         node.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
         (node.operatorToken.kind >= ts.SyntaxKind.FirstCompoundAssignment &&
           node.operatorToken.kind <= ts.SyntaxKind.LastCompoundAssignment);
-      if (isAssign) {
-        if (ts.isIdentifier(node.left) && node.left.text === "JSON") {
-          shadowedOrOverridden = true;
-          return;
-        }
-        if (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left)) {
-          let curr: ts.Expression = node.left.expression;
-          while (ts.isPropertyAccessExpression(curr) || ts.isElementAccessExpression(curr)) {
-            curr = curr.expression;
-          }
-          if (ts.isIdentifier(curr)) {
-            if (curr.text === "JSON") {
-              shadowedOrOverridden = true;
-              return;
-            }
-            if (
-              (curr.text === "globalThis" || curr.text === "window" || curr.text === "global") &&
-              ts.isPropertyAccessExpression(node.left) &&
-              node.left.name.text === "JSON"
-            ) {
-              shadowedOrOverridden = true;
-              return;
-            }
-          }
-        }
-      }
-    }
-
-    // 7. Delete expressions: delete JSON.stringify or delete (window as any).JSON
-    if (ts.isDeleteExpression(node)) {
-      let curr = node.expression;
-      while (ts.isPropertyAccessExpression(curr) || ts.isElementAccessExpression(curr)) {
-        if (ts.isIdentifier(curr.expression) && curr.expression.text === "JSON") {
-          shadowedOrOverridden = true;
-          return;
-        }
-        curr = curr.expression;
-      }
-      if (ts.isIdentifier(curr) && curr.text === "JSON") {
+      if (isAssign && referencesJsonTarget(node.left)) {
         shadowedOrOverridden = true;
         return;
       }
     }
 
-    // 8. Object.assign(JSON, ...) / Object.defineProperty(JSON, ...) / Reflect.defineProperty(JSON, ...)
+    // 7. Delete expressions: delete JSON.stringify, delete globalThis["JSON"], delete window.JSON
+    if (ts.isDeleteExpression(node)) {
+      if (referencesJsonTarget(node.expression)) {
+        shadowedOrOverridden = true;
+        return;
+      }
+    }
+
+    // 8. Object / Reflect manipulation calls:
+    // Object.defineProperty(globalThis, "JSON", ...)
+    // Reflect.defineProperty(globalThis, "JSON", ...)
+    // Object.defineProperties(globalThis, ...) when defining JSON
+    // Object.assign(globalThis, { JSON: ... })
+    // and direct target mutations: Object.assign(JSON, ...), Object.defineProperty(JSON, ...)
     if (ts.isCallExpression(node)) {
-      if (ts.isPropertyAccessExpression(node.expression)) {
-        const prop = node.expression.name.text;
-        const obj = node.expression.expression;
-        if (ts.isIdentifier(obj) && (obj.text === "Object" || obj.text === "Reflect")) {
-          if (["defineProperty", "defineProperties", "assign"].includes(prop)) {
-            const firstArg = node.arguments[0];
-            if (firstArg && ts.isIdentifier(firstArg) && firstArg.text === "JSON") {
+      const callee = getUnwrappedExpression(node.expression);
+      if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
+        const calleeProp = getAccessedPropertyName(callee);
+        const calleeObj = getUnwrappedExpression(callee.expression);
+        const isObjectOrReflect =
+          (ts.isIdentifier(calleeObj) && (calleeObj.text === "Object" || calleeObj.text === "Reflect")) ||
+          isGlobalPropertyAccess(calleeObj, "Object") ||
+          isGlobalPropertyAccess(calleeObj, "Reflect");
+
+        if (
+          isObjectOrReflect &&
+          (calleeProp === "defineProperty" ||
+            calleeProp === "defineProperties" ||
+            calleeProp === "assign")
+        ) {
+          const firstArg = node.arguments[0];
+          if (firstArg) {
+            // Direct target is JSON itself or global property access (e.g. globalThis.JSON, window["JSON"])
+            if (referencesJsonTarget(firstArg)) {
               shadowedOrOverridden = true;
               return;
+            }
+
+            // Target is a global root (globalThis, window, global, self)
+            if (isGlobalObject(firstArg)) {
+              if (calleeProp === "defineProperty") {
+                const secondArg = node.arguments[1];
+                if (secondArg && isPropertyNamed(secondArg, "JSON")) {
+                  shadowedOrOverridden = true;
+                  return;
+                }
+              } else if (calleeProp === "defineProperties") {
+                const secondArg = node.arguments[1];
+                if (secondArg && objectDefinesProperty(secondArg, "JSON")) {
+                  shadowedOrOverridden = true;
+                  return;
+                }
+              } else if (calleeProp === "assign") {
+                for (const sourceArg of node.arguments.slice(1)) {
+                  if (objectDefinesProperty(sourceArg, "JSON")) {
+                    shadowedOrOverridden = true;
+                    return;
+                  }
+                }
+              }
             }
           }
         }

@@ -1668,6 +1668,256 @@ export function getImportedConfig() {
   return eval("(" + data + ")");
 }`;
         expect(verifyJsonSourceProof(paramJsonSource, "data", 4)).toBe(false);
+
+        // Computed property overrides: globalThis["JSON"], window["JSON"], global["JSON"]
+        const computedGlobalThisSource = `globalThis["JSON"] = {
+  stringify: () => "alert('pwned-globalThis')"
+};
+export function getComputedGlobalThisConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(computedGlobalThisSource, "data", 7)).toBe(false);
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "globalThis computed override",
+              filePath: "src/computed-globalthis.ts",
+              startLine: 7,
+              endLine: 7,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-computed-globalthis",
+            commitSha: "sha-computed-1",
+            sourceContent: computedGlobalThisSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        const computedWindowSource = `window["JSON"] = {
+  stringify: () => "alert('pwned-window')"
+};
+export function getComputedWindowConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(computedWindowSource, "data", 7)).toBe(false);
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "window computed override",
+              filePath: "src/computed-window.ts",
+              startLine: 7,
+              endLine: 7,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-computed-window",
+            commitSha: "sha-computed-2",
+            sourceContent: computedWindowSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        const computedGlobalSource = `global["JSON"] = {
+  stringify: () => "alert('pwned-global')"
+};
+export function getComputedGlobalConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(computedGlobalSource, "data", 7)).toBe(false);
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "global computed override",
+              filePath: "src/computed-global.ts",
+              startLine: 7,
+              endLine: 7,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-computed-global",
+            commitSha: "sha-computed-3",
+            sourceContent: computedGlobalSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        // Object.defineProperty(globalThis, "JSON", ...) & window/global variants
+        const definePropGlobalThisSource = `Object.defineProperty(globalThis, "JSON", {
+  value: { stringify: () => "alert('pwned-defineProperty')" }
+});
+export function getDefinePropConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(definePropGlobalThisSource, "data", 7)).toBe(false);
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "Object.defineProperty globalThis override",
+              filePath: "src/define-prop-globalthis.ts",
+              startLine: 7,
+              endLine: 7,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-define-prop-globalthis",
+            commitSha: "sha-define-prop-1",
+            sourceContent: definePropGlobalThisSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        const definePropWindowSource = `Object.defineProperty(window, "JSON", {
+  value: { stringify: () => "alert('pwned-window-defineProperty')" }
+});
+export function getDefinePropWindowConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(definePropWindowSource, "data", 7)).toBe(false);
+
+        const definePropGlobalSource = `Object.defineProperty(global, "JSON", {
+  value: { stringify: () => "alert('pwned-global-defineProperty')" }
+});
+export function getDefinePropGlobalConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(definePropGlobalSource, "data", 7)).toBe(false);
+
+        // Object.defineProperties(globalThis, ...) when defining JSON & window variant
+        const definePropertiesGlobalThisSource = `Object.defineProperties(globalThis, {
+  JSON: { value: { stringify: () => "alert('pwned-defineProperties')" } }
+});
+export function getDefinePropertiesConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(definePropertiesGlobalThisSource, "data", 7)).toBe(false);
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "Object.defineProperties globalThis override",
+              filePath: "src/define-props-globalthis.ts",
+              startLine: 7,
+              endLine: 7,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-define-props-globalthis",
+            commitSha: "sha-define-props-1",
+            sourceContent: definePropertiesGlobalThisSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        const definePropertiesWindowComputedSource = `Object.defineProperties(window, {
+  ["JSON"]: { value: { stringify: () => "alert('pwned-defineProperties-window')" } }
+});
+export function getDefinePropertiesWindowConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(definePropertiesWindowComputedSource, "data", 7)).toBe(false);
+
+        // Object.assign(globalThis, { JSON: ... }) & window/global variants
+        const assignGlobalThisSource = `Object.assign(globalThis, {
+  JSON: { stringify: () => "alert('pwned-assign-globalThis')" }
+});
+export function getAssignGlobalThisConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(assignGlobalThisSource, "data", 7)).toBe(false);
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "Object.assign globalThis override",
+              filePath: "src/assign-globalthis.ts",
+              startLine: 7,
+              endLine: 7,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-assign-globalthis",
+            commitSha: "sha-assign-1",
+            sourceContent: assignGlobalThisSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        const assignWindowSource = `Object.assign(window, {
+  ["JSON"]: { stringify: () => "alert('pwned-assign-window')" }
+});
+export function getAssignWindowConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(assignWindowSource, "data", 7)).toBe(false);
+
+        const assignGlobalSource = `Object.assign(global, {
+  JSON: { stringify: () => "alert('pwned-assign-global')" }
+});
+export function getAssignGlobalConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(assignGlobalSource, "data", 7)).toBe(false);
+
+        // Reflect.defineProperty(globalThis, "JSON", ...) & window/global variants
+        const reflectDefinePropGlobalThisSource = `Reflect.defineProperty(globalThis, "JSON", {
+  value: { stringify: () => "alert('pwned-reflect-globalThis')" }
+});
+export function getReflectDefinePropConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectDefinePropGlobalThisSource, "data", 7)).toBe(false);
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "Reflect.defineProperty globalThis override",
+              filePath: "src/reflect-globalthis.ts",
+              startLine: 7,
+              endLine: 7,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-reflect-globalthis",
+            commitSha: "sha-reflect-1",
+            sourceContent: reflectDefinePropGlobalThisSource,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        const reflectDefinePropWindowSource = `Reflect.defineProperty(window, "JSON", {
+  value: { stringify: () => "alert('pwned-reflect-window')" }
+});
+export function getReflectDefinePropWindowConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectDefinePropWindowSource, "data", 7)).toBe(false);
+
+        const reflectDefinePropGlobalSource = `Reflect.defineProperty(global, "JSON", {
+  value: { stringify: () => "alert('pwned-reflect-global')" }
+});
+export function getReflectDefinePropGlobalConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectDefinePropGlobalSource, "data", 7)).toBe(false);
       });
 
       it("variant 8: fails closed on TypeScript parse diagnostics for malformed source containing otherwise safe-looking declarations", async () => {
