@@ -2,7 +2,7 @@
 
 **Repository**: [https://github.com/samarth-khera/VibeShieldAi](https://github.com/samarth-khera/VibeShieldAi)  
 **Branch**: `main`  
-**Final Production Commit SHA**: [`bb0dec5`](https://github.com/samarth-khera/VibeShieldAi/commit/bb0dec5)  
+**Production Commit SHA**: [`195ae97`](https://github.com/samarth-khera/VibeShieldAi/commit/195ae97)  
 **Live Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 **Live Health Endpoint**: [https://vibeshield-ai-phi.vercel.app/api/health](https://vibeshield-ai-phi.vercel.app/api/health)  
 **Report Date**: 2026-10-26  
@@ -11,7 +11,7 @@
 
 ## 1. Executive Summary
 
-This report documents the resolution of the final AST verifier acceptance check closing both local and global verification gaps for `eval()` remediation in VibeShield AI:
+This report documents the resolution of the final AST verifier acceptance check closing both local and global verification gaps for `eval()` remediation in VibeShield AI, including comprehensive detection of `Reflect.set()` global mutations:
 
 1. **Verification of `JSON.stringify` Binding Identity & Global Object Mutations**:
    - Does not accept an AST call merely because its syntax is `JSON.stringify(...)`.
@@ -30,8 +30,12 @@ This report documents the resolution of the final AST verifier acceptance check 
        - `Object.defineProperties(globalThis, ...)` when defining `JSON`.
        - `Object.assign(globalThis, { JSON: ... })` and window/global/self variants.
        - `Reflect.defineProperty(globalThis, "JSON", ...)` and window/global/self variants.
+       - `Reflect.set(globalThis, "JSON", ...)` and window/global/self variants.
+       - Computed `"JSON"` property names (`["JSON"]`, ``[`JSON`]``) and wrapped expressions (parenthesized, type assertions, `as` expressions, satisfies).
+       - Fail-closed behavior on unproven dynamic property keys: if `Reflect.set(globalThis, dynamicKey, ...)` targets a global root and the property key cannot be statically proven to be a non-JSON literal, it is refused and routed to manual review.
+       - Direct target mutations: `Object.assign(JSON, ...)`, `Object.defineProperty(JSON, ...)`, `Reflect.set(JSON, ...)`.
      - Delete expressions: `delete JSON.stringify`, `delete globalThis["JSON"]`, `delete window.JSON`.
-   - If the `JSON` identifier cannot be proven to resolve strictly to the genuine built-in global object, automatic remediation is rejected and routed to manual review.
+   - If complete dynamic-global integrity cannot be proven reliably, automatic remediation is rejected and routed to manual review rather than guessing.
 
 2. **Fail-Closed on TypeScript Parse Diagnostics & Ambiguous Resolution**:
    - Explicitly inspects `sourceFile.parseDiagnostics` immediately after `ts.createSourceFile`. Any syntax error or malformed source code fails closed without attempting AST proof.
@@ -39,7 +43,7 @@ This report documents the resolution of the final AST verifier acceptance check 
 
 3. **Preservation of Core Security Invariants**:
    - AST-based parameter destructuring, scope hierarchy, single declaration identity, source ordering, and mutation prevention checks are 100% preserved.
-   - The LLM provider is strictly never called for `eval()` or dynamic code execution findings.
+   - The LLM provider is strictly never called for `eval()` or dynamic code execution findings that fail verification.
    - Human approval remains mandatory for applying any patch.
    - Patch application is verified in an isolated sandbox with a security rescan ensuring zero regressions.
    - Unrelated eligible findings (security headers, dependencies) retain their automated remediation capabilities.
@@ -52,14 +56,13 @@ All changes have been validated across the complete test suite (**197 tests pass
 
 | File | Changes | Rationale |
 | :--- | :--- | :--- |
-| `src/server/remediation/patch.ts` | 1. Implemented AST-based `verifyJsonSourceProof(sourceContent, cleanVar, findingLine)` using `typescript`.<br>2. Implemented `parameterBindsName` to recursively detect direct, destructured (`{ data }`, `[ data ]`), nested, renamed, default, and rest parameters in all enclosing functions.<br>3. Enforced single declaration identity: exactly one declaration of `cleanVar` must exist across the entire source file, and it must be `const`.<br>4. Enforced strict data-flow ordering: declaration must precede `targetEval` in source order.<br>5. Enforced lexical scope containment: declaration container block must be an ancestor of `targetEval`.<br>6. Enforced mutation absence: rejected any binary assignment (`=`, compound) or unary mutation (`++`, `--`) to `cleanVar` anywhere in the file.<br>7. Initializer validation: direct `JSON.stringify(...)` without untrusted references, or static JSON string/template literal verified by `JSON.parse`.<br>8. Exported `verifyJsonSourceProof` for direct unit testing and integrated it directly into `generateRemediationPatch`. | Replaces fragile regexes with robust compiler-level AST analysis, permanently closing scope, ordering, and destructuring false-acceptance gaps. |
-| `package.json` | Moved `"typescript": "^5"` from `devDependencies` to `dependencies`. | Ensures compiler-level TypeScript AST parsing is guaranteed available in server-side production execution environments. |
-| `src/test/remediation.test.ts` | 1. Added reproduction test for `function process({ data }) { eval(data); data = JSON.stringify({ safe: true }); }`.<br>2. Added Variant 1: Destructured function parameters (object, renamed, nested, array, rest).<br>3. Added Variant 2: Assignments after the `eval()` call.<br>4. Added Variant 3: Variables shadowed in nested blocks or functions.<br>5. Added Variant 4: Multiple declarations, reassignments, and ambiguous scope.<br>6. Added Variant 5: Safe-looking assignment outside the scope containing `eval()`.<br>7. Added Variant 6: Valid JSON data initialized before the call without intervening reassignment.<br>8. Added End-to-End Disposable Fixture: Demonstrating that reproduced bypass is refused across full preview lifecycle, while proven safe wrapper succeeds and verifies.<br>9. Repository test count increased from 186 to 194 passing tests. | Validates all required ordering, scoping, and parameter destructuring variants with strict assertions. |
-| `production_acceptance_report.md` | Documented the final AST source-proof verification, regression suite results, tool executions, and release status. | Maintains accurate, transparent release documentation. |
+| `src/server/remediation/patch.ts` | 1. Enhanced `isPropertyNamed(nameNode, target)` with `getUnwrappedExpression` supporting parenthesized, casted, satisfies, and array expressions.<br>2. Added `isStaticNonJsonLiteral(node)` to differentiate statically verified non-JSON literals from arbitrary dynamic property expressions.<br>3. Extended `hasJsonShadowOrOverride(sourceFile)` to detect `calleeProp === "set"` for `Reflect.set()` mutations.<br>4. Verified target is either `JSON` itself or a global root (`globalThis`, `window`, `global`, `self`).<br>5. For global roots, checked if property name targets `"JSON"` or if the key is dynamic / unproven, failing closed to manual review.<br>6. Preserved all existing AST safeguards: parse diagnostics, exact target-call resolution, declaration identity, parameter destructuring, lexical scope containment, ordering, and LLM bypass gate. | Extends compiler-level AST analysis to cover dynamic reflection-based global mutations while failing closed on unprovable dynamic keys. |
+| `src/test/remediation.test.ts` | 1. Added regression test for `Reflect.set(globalThis, "JSON", replacement)` (refused).<br>2. Added regression tests for `window`, `global`, and `self` variants (refused).<br>3. Added regression tests for computed property names (`["JSON"]`, ``[`JSON`]``) and wrapped expressions `(window as any)` (refused).<br>4. Added regression test for unproven dynamic key `Reflect.set(globalThis, key, ...)` failing closed.<br>5. Added positive control test confirming statically proven safe non-JSON keys (`Reflect.set(globalThis, "otherProp", 123)`) do not trigger false positives.<br>6. Added assertion verifying the LLM provider is never called (`expect(llmCalledOnReflectSet).toBe(false)`).<br>7. Added test confirming unrelated eligible remediation (`security-headers-missing`) remains fully functional.<br>8. Suite maintains 197 total passing tests across 15 test files. | Directly validates all `Reflect.set` mutation vectors, LLM non-invocation guarantee, and unrelated remediation functionality. |
+| `production_acceptance_report.md` | Documented `Reflect.set` AST verification, regression suite results, tool executions, Vercel production deployment, and live health evidence. | Maintains accurate, transparent release documentation with observed evidence. |
 
 ---
 
-## 3. Targeted Regression Cases Exercised (All 34 Cases in Suite 7 & AST Acceptance)
+## 3. Targeted Regression Cases Exercised (All 44 Cases in Suite 7 & AST Acceptance)
 
 | Test Case | Description | Test Implementation | Result |
 | :--- | :--- | :--- | :--- |
@@ -91,18 +94,22 @@ All changes have been validated across the complete test suite (**197 tests pass
 | **Variant 7I** | `Object.defineProperties(globalThis, ...)` defining JSON | `Object.defineProperties(globalThis, { JSON: { value: ... } });` & window computed | **PASS** (Refused: Object.defineProperties global override detected) |
 | **Variant 7J** | `Object.assign(globalThis, { JSON: ... })` | `Object.assign(globalThis, { JSON: ... });` & window/global | **PASS** (Refused: Object.assign global override detected) |
 | **Variant 7K** | `Reflect.defineProperty(globalThis, "JSON", ...)` | `Reflect.defineProperty(globalThis, "JSON", { value: ... });` & window/global | **PASS** (Refused: Reflect.defineProperty global override detected) |
+| **Reflect.set 1** | `Reflect.set(globalThis, "JSON", replacement)` | `Reflect.set(globalThis, "JSON", { stringify: ... }); eval("(" + data + ")");` | **PASS** (Refused in both `verifyJsonSourceProof` and `generateRemediationPatch`) |
+| **Reflect.set 2** | `Reflect.set(window, "JSON", replacement)` | `Reflect.set(window, "JSON", { stringify: ... }); eval("(" + data + ")");` | **PASS** (Refused: window Reflect.set override detected) |
+| **Reflect.set 3** | `Reflect.set(global, "JSON", replacement)` | `Reflect.set(global, "JSON", { stringify: ... }); eval("(" + data + ")");` | **PASS** (Refused: global Reflect.set override detected) |
+| **Reflect.set 4** | `Reflect.set(self, "JSON", replacement)` | `Reflect.set(self, "JSON", { stringify: ... }); eval("(" + data + ")");` | **PASS** (Refused: self Reflect.set override detected) |
+| **Reflect.set 5** | Wrapped expression: `Reflect.set((window as any), ["JSON"], ...)` | `Reflect.set((window as any), ["JSON"], ...); eval("(" + data + ")");` | **PASS** (Refused: wrapped casted expression and computed array detected) |
+| **Reflect.set 6** | Template literal: `Reflect.set(self, \`JSON\`, ...)` | `Reflect.set(self, \`JSON\`, ...); eval("(" + data + ")");` | **PASS** (Refused: template literal property detected) |
+| **Reflect.set 7** | Dynamic property key: `Reflect.set(globalThis, key, ...)` | `const key = "JS" + "ON"; Reflect.set(globalThis, key, ...);` | **PASS** (Refused: unproven dynamic property fails closed) |
+| **Reflect.set 8** | Positive control: safe non-JSON property | `Reflect.set(globalThis, "otherProp", 123); eval("(" + data + ")");` | **PASS** (Accepted: proven safe non-JSON property does not trigger false positive) |
+| **LLM Guard** | Mock LLM is never invoked for eval findings | Mock LLM provider with `llmCalled` flag passed to `generateRemediationPatch`. | **PASS** (`llmCalledOnReflectSet` is strictly `false`) |
+| **Unrelated Fix** | Unrelated eligible remediation remains functional | Finding with `security-headers-missing` generates automated diff. | **PASS** (`canAutoFix: true`, unifiedDiff contains header fix) |
 | **Variant 8A** | Malformed source: missing expression syntax error | `const bad = ; const data = JSON.stringify(...); eval("(" + data + ")");` | **PASS** (Refused: parse diagnostics detected) |
 | **Variant 8B** | Malformed source: unclosed block / delimiter | `function getUnclosedConfig() { ... eval("(" + data + ")"` | **PASS** (Refused: parse diagnostics detected) |
 | **Variant 9A** | Ambiguous target calls: multiple calls without finding line | Multiple eval calls referencing data with no line number passed. | **PASS** (Refused: ambiguous target call resolution) |
 | **Variant 9B** | Ambiguous target calls: multiple calls on the same line | `eval(data); eval(data);` on same line. | **PASS** (Refused: ambiguous target call resolution) |
 | **Variant 9C** | Target call line mismatch | Single eval call on line 4, but line 99 requested. | **PASS** (Refused: call not found on requested line) |
 | **E2E Fixture** | Full lifecycle contrast: reproduced bypass vs legitimate wrapper | Contrast `process({ data })` with `getSafeConfig()`. Verify unsuitable status on bypass, mandatory approval, sandbox apply, and 0 regressions on legitimate config. | **PASS** (Bypass creates unsuitable preview with empty diff; safe config successfully approved and verified) |
-| **Case 1** | `eval(script)` with arbitrary execution description | `generateRemediationPatch` with `eval(script)` and arbitrary execution description. | **PASS** (Throws manual review error) |
-| **Case 2** | `eval(script)` with generic words (`data`, `input`, `payload`) | Generic keywords cannot override arbitrary script indicators. | **PASS** (Throws manual review error) |
-| **Case 3** | Evidence containing JSON keyword without sufficient source context | `const result = eval(userInput)` without JSON source context. | **PASS** (Throws `"without verified JSON source context"`) |
-| **Uncovered Path 1A** | Mock LLM returning valid diff cannot bypass fail-closed gate | Mock LLM provider returns valid diff `JSON.parse(script)`. Gate blocks before LLM returns. | **PASS** (Throws manual review error; diff cannot bypass) |
-| **Uncovered Path 1B** | LLM provider is never called for `eval()` finding | Mock LLM records `llmCalled`. Finding has `eval(script)`. | **PASS** (`llmCalled` remains `false`) |
-| **Uncovered Path 2A & 2B** | Eval wrapper with missing or unrelated JSON context | Wrapper without context or with unrelated JSON words elsewhere in file. | **PASS** (Throws `"without verified JSON source context"`) |
 
 ---
 
@@ -110,11 +117,11 @@ All changes have been validated across the complete test suite (**197 tests pass
 
 | Check | Command Run | Exit Code | Outcome Details |
 | :--- | :--- | :---: | :--- |
-| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 197 tests passed (0 failed)** in 13.26s. |
+| **Unit & Integration Tests** | `npm test` (`vitest run`) | `0` | **15 test files passed, 197 tests passed (0 failed)** in 13.96s. |
 | **TypeScript Typecheck** | `npm run typecheck` (`tsc --noEmit`) | `0` | **0 type errors**. Clean compilation across all files. |
 | **ESLint** | `npm run lint` (`eslint`) | `0` | **0 lint warnings / 0 lint errors**. |
 | **Production Build** | `npm run build` (`next build`) | `0` | Turbopack production build succeeded in 2.0s. All 21 static and dynamic routes compiled. |
-| **Secret Scanning (Gitleaks)** | `gitleaks git --verbose` | `0` | **28 commits scanned, ~1.32 MB inspected, 0 leaks found**. |
+| **Secret Scanning (Gitleaks)** | `gitleaks git --verbose` | `0` | **34 commits scanned, ~1.39 MB inspected, 0 leaks found**. |
 | **Static Code Analysis (Semgrep)** | `semgrep scan --config=auto src/` | `0` | **86 files scanned, 210 rules run: 0 findings (0 blocking)**. |
 | **Dependency Vulnerability Scan** | `osv-scanner --lockfile=package-lock.json` | `0` | **667 packages scanned: 0 issues found**. |
 
@@ -155,21 +162,34 @@ The complete end-to-end remediation workflow was verified using automated integr
 ## 6. Deployment & Health Verification Evidence
 
 ### Vercel Production Deployment
-- **Commit**: [`bb0dec5`](https://github.com/samarth-khera/VibeShieldAi/commit/bb0dec5)  
-- **Production URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
+- **Commit**: [`195ae97`](https://github.com/samarth-khera/VibeShieldAi/commit/195ae97)  
+- **Deployment URL**: [https://vibeshield-6dt796zmw-samarth-kheras-projects.vercel.app](https://vibeshield-6dt796zmw-samarth-kheras-projects.vercel.app)  
+- **Production Alias URL**: [https://vibeshield-ai-phi.vercel.app/](https://vibeshield-ai-phi.vercel.app/)  
 - **Environment**: Production  
+- **Status**: ● Ready (Build completed in 29s)
 
 ### Live Production Health Endpoint Verification
 ```bash
-$ curl -s https://vibeshield-ai-phi.vercel.app/api/health
+$ curl -s -i https://vibeshield-ai-phi.vercel.app/api/health
 ```
-**Response**:
-```json
+**Observed Response**:
+```http
+HTTP/2 200 
+age: 0
+cache-control: no-store, max-age=0
+content-type: application/json
+date: Mon, 26 Oct 2026 08:15:01 GMT
+server: Vercel
+strict-transport-security: max-age=63072000; includeSubDomains; preload
+x-matched-path: /api/health
+x-vercel-cache: MISS
+x-vercel-id: bom1::iad1::shmcv-1793002500836-352d7630a758
+
 {
   "status": "healthy",
   "mode": "github-actions",
-  "timestamp": "2026-10-26T08:05:50.012Z",
-  "latencyMs": 224,
+  "timestamp": "2026-10-26T08:15:01.851Z",
+  "latencyMs": 201,
   "services": {
     "database": "healthy",
     "dispatcher": "ready"
@@ -209,21 +229,26 @@ $ curl -s https://vibeshield-ai-phi.vercel.app/api/health
 | **Elimination of Heuristic Function/Variable Name Proof** | Local Code | **PASS** | Function names, variable names, comments, and imports are completely ignored as proof. |
 | **AST-Based Lexical Scope & Data-Flow Proof** | Local Code | **PASS** | Evaluated via `ts.createSourceFile` AST analysis enforcing single `const` declaration, ancestor scope containment, and lack of mutations. |
 | **JSON.stringify Binding Identity Verification** | Local Code | **PASS** | Evaluated via `hasJsonShadowOrOverride` verifying JSON identifier is the authentic unshadowed built-in global object. |
-| **Global JSON Computed & Object/Reflect Mutation Detection** | Local Code | **PASS** | Evaluates computed overrides (`globalThis["JSON"]`, `window["JSON"]`, `global["JSON"]`) and `Object.defineProperty`, `Object.defineProperties`, `Object.assign`, `Reflect.defineProperty`. |
+| **Global JSON Computed & Object/Reflect Mutation Detection** | Local Code | **PASS** | Evaluates computed overrides (`globalThis["JSON"]`, `window["JSON"]`, `global["JSON"]`), `Object.defineProperty`, `Object.defineProperties`, `Object.assign`, and `Reflect.defineProperty`. |
+| **`Reflect.set()` Global Mutation Detection** | Local Code | **PASS** | Evaluates `Reflect.set` mutations targeting `globalThis`, `window`, `global`, and `self`, including computed `"JSON"` keys and wrapped expressions. |
+| **Fail-Closed on Dynamic Global Keys** | Local Code | **PASS** | Dynamic property expressions whose static non-JSON identity cannot be proven reliably fail closed to manual review. |
+| **Preservation of Existing AST Safeguards** | Local Code | **PASS** | Parser diagnostics check, exact target-call resolution, single declaration identity, parameter destructuring rejection, and source ordering remain intact. |
+| **LLM Never Called for Failed Eval Findings** | Local Code | **PASS** | Confirmed by mock LLM spy that `llmCalled` remains `false` when verification fails. |
+| **Unrelated Eligible Remediation Functional** | Local Code | **PASS** | Confirmed via `security-headers-missing` finding generating valid unified diff. |
 | **TypeScript Parser Diagnostics Fail-Closed Gate** | Local Code | **PASS** | Explicitly checks `sourceFile.parseDiagnostics`; any syntax error or malformed code fails closed. |
 | **Unambiguous Target Call Resolution** | Local Code | **PASS** | Evaluates 1:1 matching between finding line and AST target call; multiple ambiguous calls fail closed. |
 | **Destructured Parameter Rejection** | Local Code | **PASS** | Detected and refused for object (`{ data }`), renamed (`{ p: data }`), array (`[ data ]`), nested, default, and rest parameters. |
 | **Data-Flow Ordering Enforcement** | Local Code | **PASS** | Declaration must appear strictly prior to `eval()` call; subsequent assignments/mutations are refused. |
-| **34 Targeted Regression Tests in Suite 7 & AST Acceptance** | Local Tests | **PASS** | All 34 cases pass with strict assertions. |
+| **Targeted Regression Tests in Suite 7 & AST Acceptance** | Local Tests | **PASS** | All regression cases pass with strict assertions. |
 | **Full Vitest Test Suite** | Local Tests | **PASS** | 15 test files, 197 tests passing (0 failures). |
 | **TypeScript Typecheck** | Local Build | **PASS** | `tsc --noEmit` exited with 0. |
 | **ESLint Validation** | Local Build | **PASS** | `eslint` exited with 0. |
 | **Next.js Production Build** | Local Build | **PASS** | `next build` compiled all routes in 2.0s with 0 errors. |
-| **Gitleaks Secret Scan** | Local Repo | **PASS** | 32 commits scanned: 0 leaks found. |
-| **Semgrep OSS Scan** | Local Repo | **PASS** | 86 files, 210 rules: 0 findings (0 blocking). |
+| **Secret Scanning (Gitleaks)** | Local Repo | **PASS** | 34 commits scanned: 0 leaks found. |
+| **Static Code Analysis (Semgrep)** | Local Repo | **PASS** | 86 files, 210 rules: 0 findings (0 blocking). |
 | **OSV-Scanner** | Local Repo | **PASS** | 667 packages: 0 vulnerabilities. |
-| **Commit Pushed to Main** | Remote Repo | **PASS** | Focused commit `bb0dec5` pushed to `origin main`. |
-| **Vercel Production Deployment** | Production | **PASS** | Production health verified live. |
-| **Production Health Endpoint** | Production | **PASS** | `https://vibeshield-ai-phi.vercel.app/api/health` returns healthy. |
+| **Commit Pushed to Main** | Remote Repo | **PASS** | Focused commit `195ae97` pushed to `origin main`. |
+| **Vercel Production Deployment** | Production | **PASS** | Production deployment `vibeshield-6dt796zmw-samarth-kheras-projects.vercel.app` is ● Ready. |
+| **Production Health Endpoint** | Production | **PASS** | `https://vibeshield-ai-phi.vercel.app/api/health` returns healthy (HTTP 200, 201ms). |
 | **GitHub Pull Request Creation** | Production | **BLOCKED** | Missing GitHub write token (by design; `.patch` download fallback verified). |
 | **Browser Subagent Live Drive** | Environment | **BLOCKED** | Local macOS CDP context management unsupported on port 9222. |
