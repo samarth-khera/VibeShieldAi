@@ -1918,6 +1918,131 @@ export function getReflectDefinePropGlobalConfig() {
   return eval("(" + data + ")");
 }`;
         expect(verifyJsonSourceProof(reflectDefinePropGlobalSource, "data", 7)).toBe(false);
+
+        // Reflect.set(globalThis, "JSON", ...) & window, global, self variants
+        const reflectSetGlobalThisSource = `Reflect.set(globalThis, "JSON", {
+  stringify: () => "alert('pwned-reflect-set-globalThis')"
+});
+export function getReflectSetConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectSetGlobalThisSource, "data", 7)).toBe(false);
+
+        let llmCalledOnReflectSet = false;
+        const mockLlmForReflectSet: LlmProvider = {
+          getModelName: () => "mock-llm",
+          isConfigured: () => true,
+          generateText: async () => {
+            llmCalledOnReflectSet = true;
+            return "diff";
+          },
+        };
+
+        await expect(
+          generateRemediationPatch({
+            finding: makeFinding({
+              scanner: "semgrep",
+              ruleId: "semgrep:eval-detected",
+              title: "Reflect.set globalThis override",
+              filePath: "src/reflect-set-globalthis.ts",
+              startLine: 7,
+              endLine: 7,
+              redactedEvidence: '  return eval("(" + data + ")");',
+            }),
+            scanJobId: "job-reflect-set-globalthis",
+            commitSha: "sha-reflect-set-1",
+            sourceContent: reflectSetGlobalThisSource,
+            llmProvider: mockLlmForReflectSet,
+          })
+        ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
+
+        // LLM must never be invoked for eval findings that fail verification
+        expect(llmCalledOnReflectSet).toBe(false);
+
+        // window variant
+        const reflectSetWindowSource = `Reflect.set(window, "JSON", {
+  stringify: () => "alert('pwned-reflect-set-window')"
+});
+export function getReflectSetWindowConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectSetWindowSource, "data", 7)).toBe(false);
+
+        // global variant
+        const reflectSetGlobalSource = `Reflect.set(global, "JSON", {
+  stringify: () => "alert('pwned-reflect-set-global')"
+});
+export function getReflectSetGlobalConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectSetGlobalSource, "data", 7)).toBe(false);
+
+        // self variant
+        const reflectSetSelfSource = `Reflect.set(self, "JSON", {
+  stringify: () => "alert('pwned-reflect-set-self')"
+});
+export function getReflectSetSelfConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectSetSelfSource, "data", 7)).toBe(false);
+
+        // Computed "JSON" property names and wrapped expressions
+        const reflectSetWrappedSource = `Reflect.set((window as any), ["JSON"], {
+  stringify: () => "alert('pwned-reflect-set-wrapped')"
+});
+export function getReflectSetWrappedConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectSetWrappedSource, "data", 7)).toBe(false);
+
+        const reflectSetTemplateSource = `Reflect.set(self, \`JSON\`, {
+  stringify: () => "alert('pwned-reflect-set-template')"
+});
+export function getReflectSetTemplateConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectSetTemplateSource, "data", 7)).toBe(false);
+
+        // Dynamic property key on global root fails closed
+        const reflectSetDynamicSource = `const key = "JS" + "ON";
+Reflect.set(globalThis, key, {
+  stringify: () => "alert('pwned-dynamic')"
+});
+export function getReflectSetDynamicConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectSetDynamicSource, "data", 8)).toBe(false);
+
+        // Positive control: Statically proven safe non-JSON property does not trigger false positive
+        const reflectSetSafeSource = `Reflect.set(globalThis, "otherProp", 123);
+export function getReflectSetSafeConfig() {
+  const data = JSON.stringify({ safe: true });
+  return eval("(" + data + ")");
+}`;
+        expect(verifyJsonSourceProof(reflectSetSafeSource, "data", 4)).toBe(true);
+
+        // Unrelated eligible remediation (e.g. security headers) remains functional
+        const headerFinding = makeFinding({
+          ruleId: "security-headers-missing",
+          title: "Missing nosniff header",
+          filePath: "src/server.ts",
+          startLine: 1,
+          redactedEvidence: "res.status(200);",
+        });
+        const headerPatch = await generateRemediationPatch({
+          finding: headerFinding,
+          scanJobId: "job-header",
+          commitSha: "sha-header",
+        });
+        expect(headerPatch.eligibility.canAutoFix).toBe(true);
+        expect(headerPatch.unifiedDiff).toContain("res.headers.set('X-Content-Type-Options', 'nosniff');");
       });
 
       it("variant 8: fails closed on TypeScript parse diagnostics for malformed source containing otherwise safe-looking declarations", async () => {

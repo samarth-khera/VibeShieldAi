@@ -170,13 +170,35 @@ function isGlobalObject(expr: ts.Expression): boolean {
  */
 function isPropertyNamed(nameNode: ts.Node | undefined, target: string): boolean {
   if (!nameNode) return false;
-  if (ts.isIdentifier(nameNode) && nameNode.text === target) return true;
-  if (ts.isStringLiteral(nameNode) && nameNode.text === target) return true;
-  if (ts.isNoSubstitutionTemplateLiteral(nameNode) && nameNode.text === target) return true;
-  if (ts.isComputedPropertyName(nameNode)) {
-    const expr = getUnwrappedExpression(nameNode.expression);
+  const unwrapped = ts.isExpression(nameNode as ts.Node)
+    ? getUnwrappedExpression(nameNode as ts.Expression)
+    : nameNode;
+  if (ts.isIdentifier(unwrapped) && unwrapped.text === target) return true;
+  if (ts.isStringLiteral(unwrapped) && unwrapped.text === target) return true;
+  if (ts.isNoSubstitutionTemplateLiteral(unwrapped) && unwrapped.text === target) return true;
+  if (ts.isComputedPropertyName(unwrapped)) {
+    const expr = getUnwrappedExpression(unwrapped.expression);
     if (ts.isStringLiteral(expr) && expr.text === target) return true;
     if (ts.isNoSubstitutionTemplateLiteral(expr) && expr.text === target) return true;
+  }
+  if (ts.isArrayLiteralExpression(unwrapped) && unwrapped.elements.length === 1) {
+    const elem = getUnwrappedExpression(unwrapped.elements[0]);
+    if (ts.isStringLiteral(elem) && elem.text === target) return true;
+    if (ts.isNoSubstitutionTemplateLiteral(elem) && elem.text === target) return true;
+  }
+  return false;
+}
+
+/**
+ * Checks if a property key is a statically proven string literal that is NOT "JSON".
+ */
+function isStaticNonJsonLiteral(node: ts.Node | undefined): boolean {
+  if (!node) return false;
+  const unwrapped = ts.isExpression(node as ts.Node)
+    ? getUnwrappedExpression(node as ts.Expression)
+    : node;
+  if (ts.isStringLiteral(unwrapped) || ts.isNoSubstitutionTemplateLiteral(unwrapped)) {
+    return unwrapped.text !== "JSON";
   }
   return false;
 }
@@ -367,9 +389,10 @@ function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
     // 8. Object / Reflect manipulation calls:
     // Object.defineProperty(globalThis, "JSON", ...)
     // Reflect.defineProperty(globalThis, "JSON", ...)
+    // Reflect.set(globalThis, "JSON", ...)
     // Object.defineProperties(globalThis, ...) when defining JSON
     // Object.assign(globalThis, { JSON: ... })
-    // and direct target mutations: Object.assign(JSON, ...), Object.defineProperty(JSON, ...)
+    // and direct target mutations: Object.assign(JSON, ...), Object.defineProperty(JSON, ...), Reflect.set(JSON, ...)
     if (ts.isCallExpression(node)) {
       const callee = getUnwrappedExpression(node.expression);
       if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
@@ -384,7 +407,8 @@ function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
           isObjectOrReflect &&
           (calleeProp === "defineProperty" ||
             calleeProp === "defineProperties" ||
-            calleeProp === "assign")
+            calleeProp === "assign" ||
+            calleeProp === "set")
         ) {
           const firstArg = node.arguments[0];
           if (firstArg) {
@@ -396,11 +420,19 @@ function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
 
             // Target is a global root (globalThis, window, global, self)
             if (isGlobalObject(firstArg)) {
-              if (calleeProp === "defineProperty") {
+              if (calleeProp === "defineProperty" || calleeProp === "set") {
                 const secondArg = node.arguments[1];
-                if (secondArg && isPropertyNamed(secondArg, "JSON")) {
-                  shadowedOrOverridden = true;
-                  return;
+                if (secondArg) {
+                  if (isPropertyNamed(secondArg, "JSON")) {
+                    shadowedOrOverridden = true;
+                    return;
+                  }
+                  // If secondArg cannot be proven to be a known static non-JSON property,
+                  // dynamic global integrity cannot be proven reliably; fail closed.
+                  if (!isStaticNonJsonLiteral(secondArg)) {
+                    shadowedOrOverridden = true;
+                    return;
+                  }
                 }
               } else if (calleeProp === "defineProperties") {
                 const secondArg = node.arguments[1];
