@@ -41,25 +41,55 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache Scanner Binaries
+        id: cache-scanner-binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/bin/gitleaks
+            /usr/local/bin/osv-scanner
+          key: scanner-binaries-gitleaks-v8.18.2-osv-v2.7.0
 
       - name: Install Scanner Binaries (Gitleaks, Semgrep, OSV-Scanner)
         run: |
           set -e
-          echo "Installing Gitleaks..."
-          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz | sudo tar -xz -C /usr/local/bin gitleaks
-          sudo chmod +x /usr/local/bin/gitleaks
+          if [ ! -f /usr/local/bin/gitleaks ]; then
+            echo "Installing Gitleaks v8.18.2..."
+            curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz | sudo tar -xz -C /usr/local/bin gitleaks
+            sudo chmod +x /usr/local/bin/gitleaks
+          else
+            echo "Gitleaks restored from cache."
+          fi
 
-          echo "Installing Semgrep..."
-          pip install --no-cache-dir semgrep
+          echo "Installing Semgrep pinned version 1.182.0..."
+          pip install semgrep==1.182.0
 
-          echo "Installing OSV-Scanner..."
-          sudo curl -sSL https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
-          sudo chmod +x /usr/local/bin/osv-scanner
+          if [ ! -f /usr/local/bin/osv-scanner ]; then
+            echo "Installing OSV-Scanner v2.7.0..."
+            sudo curl -sSL https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+            sudo chmod +x /usr/local/bin/osv-scanner
+          else
+            echo "OSV-Scanner restored from cache."
+          fi
 
           echo "Verifying scanner versions:"
           gitleaks version
           semgrep --version
           osv-scanner --version
+
+      - name: Get Date for OSV DB Cache
+        id: osv-date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Cache OSV Vulnerability Database
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/osv-scanner
+          key: osv-db-${{ runner.os }}-${{ steps.osv-date.outputs.date }}
+          restore-keys: |
+            osv-db-${{ runner.os }}-
 
       - name: Pre-cache OSV Vulnerability Database
         run: |

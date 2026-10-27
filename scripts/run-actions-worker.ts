@@ -43,16 +43,21 @@ async function main() {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), config.retrievalTimeoutMs);
 
+    const t0 = Date.now();
     console.log("Fetching repository metadata and commit SHA...");
+    const tMeta = Date.now();
     const meta = await fetchRepoMetadata(fetch, parsed.owner, parsed.repo, config, controller.signal);
     const commitSha = await fetchCommitSha(fetch, parsed.owner, parsed.repo, meta.defaultBranch, config, controller.signal);
+    const metadataDurationMs = Date.now() - tMeta;
 
-    console.log(`Commit: ${commitSha} on branch ${meta.defaultBranch}`);
+    console.log(`Commit: ${commitSha} on branch ${meta.defaultBranch} (retrieval: ${metadataDurationMs}ms)`);
 
     // Bounded download and safe extraction
     console.log("Downloading bounded archive snapshot...");
+    const tDownload = Date.now();
     const res = await openArchive(fetch, parsed.owner, parsed.repo, commitSha, config, controller.signal);
     const declaredArchiveBytes = Number.parseInt(res.headers.get("content-length") ?? "", 10);
+    const downloadDurationMs = Date.now() - tDownload;
 
     workspace = await mkdtemp(path.join(tmpdir(), "vibeshield-run-"));
     await chmod(workspace, 0o700);
@@ -64,14 +69,18 @@ async function main() {
     });
 
     console.log("Extracting archive safely with resource limits...");
+    const tExtract = Date.now();
     const stats = await extractArchiveSafely(sourceStream, sourceDir, config);
     clearTimeout(timer);
-    console.log(`Extracted ${stats.fileCount} files (${(stats.unpackedBytes / 1024 / 1024).toFixed(2)} MB).`);
+    const extractDurationMs = Date.now() - tExtract;
+    console.log(`Extracted ${stats.fileCount} files (${(stats.unpackedBytes / 1024 / 1024).toFixed(2)} MB in ${extractDurationMs}ms).`);
 
     // Execute real security scanning engine
-    console.log("Running Gitleaks, Semgrep, and OSV-Scanner...");
+    console.log("Running Gitleaks, Semgrep, and OSV-Scanner in parallel...");
+    const tScan = Date.now();
     const scanResult = await runSecurityScanEngine(sourceDir);
-    console.log(`Scan completed with status: ${scanResult.status}`);
+    const scanEngineDurationMs = Date.now() - tScan;
+    console.log(`Scan completed with status: ${scanResult.status} in ${scanEngineDurationMs}ms (Gitleaks: ${scanResult.gitleaksDurationMs}ms, Semgrep: ${scanResult.semgrepDurationMs}ms, OSV: ${scanResult.osvDurationMs}ms)`);
     console.log(`Findings count: ${scanResult.findings.length} (Critical: ${scanResult.counts.critical}, High: ${scanResult.counts.high}, Medium: ${scanResult.counts.medium}, Low: ${scanResult.counts.low}, Info: ${scanResult.counts.info})`);
 
     // Sanitize all findings before sending
@@ -80,6 +89,16 @@ async function main() {
         f.redactedEvidence = redactText(f.redactedEvidence);
       }
     }
+
+    const stageDurations = {
+      metadataMs: metadataDurationMs,
+      downloadMs: downloadDurationMs,
+      extractionMs: extractDurationMs,
+      scanningMs: scanEngineDurationMs,
+      callbackMs: 0,
+    };
+
+    scanResult.scanCoverage.stageDurations = stageDurations;
 
     // Assemble payload
     const callbackPayload = {
@@ -113,7 +132,12 @@ async function main() {
     };
 
     console.log("Signing payload and sending callback to Vercel control plane...");
+    const tCallback = Date.now();
     await postCallback(callbackUrl, callbackSecret, callbackPayload);
+    const callbackDurationMs = Date.now() - tCallback;
+    stageDurations.callbackMs = callbackDurationMs;
+    const totalPipelineDurationMs = Date.now() - t0;
+    console.log(`[Metrics] Retrieval: ${metadataDurationMs}ms, Download: ${downloadDurationMs}ms, Extraction: ${extractDurationMs}ms, Scanning: ${scanEngineDurationMs}ms, Callback: ${callbackDurationMs}ms (Total: ${totalPipelineDurationMs}ms).`);
     console.log("Callback successfully accepted!");
   } catch (err: unknown) {
     console.error("Worker pipeline failed with error:", err);

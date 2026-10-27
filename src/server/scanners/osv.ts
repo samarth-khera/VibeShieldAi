@@ -74,14 +74,38 @@ function normalizeOsvSeverity(vuln: OSVVulnerability): NormalizedSeverity {
   return "medium";
 }
 
-function findFixedVersion(vuln: OSVVulnerability): string | null {
+export function findFixedVersionForPackage(
+  vuln: OSVVulnerability,
+  packageName: string,
+  ecosystem?: string,
+): string | null {
+  const normTarget = packageName.toLowerCase().replace(/[-_.]+/g, "-");
   for (const aff of vuln.affected || []) {
+    const affName = aff.package?.name?.toLowerCase().replace(/[-_.]+/g, "-");
+    if (affName && affName !== normTarget) {
+      continue;
+    }
+    if (ecosystem && aff.package?.ecosystem) {
+      if (aff.package.ecosystem.toLowerCase() !== ecosystem.toLowerCase()) {
+        continue;
+      }
+    }
     for (const r of aff.ranges || []) {
       for (const ev of r.events || []) {
         if (ev.fixed) return ev.fixed;
       }
     }
   }
+
+  // Fallback if only 1 affected block exists
+  if (vuln.affected && vuln.affected.length === 1) {
+    for (const r of vuln.affected[0].ranges || []) {
+      for (const ev of r.events || []) {
+        if (ev.fixed) return ev.fixed;
+      }
+    }
+  }
+
   return null;
 }
 
@@ -182,7 +206,7 @@ export async function runOsvScan(
         for (const vuln of pkg.vulnerabilities || []) {
           const vulnId = vuln.id;
           const severity = normalizeOsvSeverity(vuln);
-          const fixedVer = findFixedVersion(vuln);
+          const fixedVer = findFixedVersionForPackage(vuln, pkgName, ecosystem);
 
           const cveAlias = vuln.aliases?.find((a) => a.startsWith("CVE-"));
           const primaryId = cveAlias || vulnId;
@@ -213,6 +237,7 @@ export async function runOsvScan(
               name: pkgName,
               version: pkgVersion,
               ecosystem,
+              fixedVersion: fixedVer,
             },
             metadata: {
               aliases: vuln.aliases,

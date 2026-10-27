@@ -4,35 +4,34 @@ import { runOsvScan } from "./osv";
 import { runSubprocess } from "./runner";
 import type { NormalizedFinding, ScanCoverage, ScanEngineResult, ScannerVersions } from "./types";
 
-export async function detectScannerVersions(): Promise<ScannerVersions> {
+let cachedVersions: ScannerVersions | null = null;
+
+export async function detectScannerVersions(forceRefresh = false): Promise<ScannerVersions> {
+  if (!forceRefresh && cachedVersions) {
+    return cachedVersions;
+  }
+
+  const [gitleaksRes, semgrepRes, osvRes] = await Promise.all([
+    runSubprocess("gitleaks", ["version"], { cwd: "/tmp", timeoutMs: 5000 }).catch(() => null),
+    runSubprocess("semgrep", ["--version"], { cwd: "/tmp", timeoutMs: 5000 }).catch(() => null),
+    runSubprocess("osv-scanner", ["--version"], { cwd: "/tmp", timeoutMs: 5000 }).catch(() => null),
+  ]);
+
+  const gitleaks = gitleaksRes?.stdout ? gitleaksRes.stdout.trim() || null : "unavailable";
+  const semgrep = semgrepRes?.stdout ? semgrepRes.stdout.trim().split("\n")[0] || null : "unavailable";
+  let osvScanner: string | null = "unavailable";
+  if (osvRes?.stdout) {
+    const line = osvRes.stdout.trim().split("\n").find((l) => l.includes("osv-scanner version:"));
+    osvScanner = line ? line.replace("osv-scanner version:", "").trim() : (osvRes.stdout.trim().split("\n")[0] || null);
+  }
+
   const versions: ScannerVersions = {
-    gitleaks: null,
-    semgrep: null,
-    osvScanner: null,
+    gitleaks,
+    semgrep,
+    osvScanner,
   };
 
-  try {
-    const res = await runSubprocess("gitleaks", ["version"], { cwd: "/tmp", timeoutMs: 5000 });
-    versions.gitleaks = res.stdout.trim() || null;
-  } catch {
-    versions.gitleaks = "unavailable";
-  }
-
-  try {
-    const res = await runSubprocess("semgrep", ["--version"], { cwd: "/tmp", timeoutMs: 5000 });
-    versions.semgrep = res.stdout.trim().split("\n")[0] || null;
-  } catch {
-    versions.semgrep = "unavailable";
-  }
-
-  try {
-    const res = await runSubprocess("osv-scanner", ["--version"], { cwd: "/tmp", timeoutMs: 5000 });
-    const line = res.stdout.trim().split("\n").find((l) => l.includes("osv-scanner version:"));
-    versions.osvScanner = line ? line.replace("osv-scanner version:", "").trim() : (res.stdout.trim().split("\n")[0] || null);
-  } catch {
-    versions.osvScanner = "unavailable";
-  }
-
+  cachedVersions = versions;
   return versions;
 }
 

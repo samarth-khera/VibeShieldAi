@@ -1,3 +1,4 @@
+import path from "node:path";
 import { RetrievalError } from "./errors";
 import type { ServerConfig } from "./config";
 
@@ -173,4 +174,55 @@ export async function openArchive(
     throw new RetrievalError("rejected_by_limits", "archive_too_large", "Repository archive exceeds the size limit.");
   }
   return res;
+}
+
+/**
+ * Safely fetches raw file content for a validated file path at an immutable commit SHA.
+ * Validates path traversal, repository boundaries, and file size.
+ */
+export async function fetchFileAtCommit(
+  fetchImpl: FetchLike,
+  owner: string,
+  repo: string,
+  filePath: string,
+  commitSha: string,
+  config: ServerConfig,
+  signal: AbortSignal,
+): Promise<string> {
+  if (!/^[a-zA-Z0-9_.-]+$/.test(owner) || !/^[a-zA-Z0-9_.-]+$/.test(repo)) {
+    throw new RetrievalError("download_failed", "invalid_repository", "Invalid repository coordinates.");
+  }
+  if (!/^[a-zA-Z0-9_./-]+$/.test(commitSha) || commitSha.includes("..")) {
+    throw new RetrievalError("download_failed", "invalid_commit", "Invalid commit identifier.");
+  }
+
+  const normalized = path.normalize(filePath).replace(/\\/g, "/");
+  if (
+    path.isAbsolute(normalized) ||
+    normalized.startsWith("../") ||
+    normalized.includes("/../") ||
+    normalized.startsWith(".git")
+  ) {
+    throw new RetrievalError("download_failed", "path_traversal", "Forbidden file path.");
+  }
+
+  const encodedPath = normalized
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
+  const url = `https://${API_HOST}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}?ref=${encodeURIComponent(commitSha)}`;
+
+  const res = await safeFetch(
+    fetchImpl,
+    url,
+    { headers: headers(config, "application/vnd.github.raw+json") },
+    signal,
+  );
+
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => undefined);
+    throw mapHttpFailure(res);
+  }
+
+  return await res.text();
 }

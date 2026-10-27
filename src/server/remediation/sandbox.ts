@@ -5,7 +5,8 @@ import { runSubprocess } from "../scanners/runner";
 import { runSecurityScanEngine } from "../scanners/engine";
 import type { NormalizedFinding, ScanEngineResult } from "../scanners/types";
 import type { RescanComparison } from "./types";
-import { validateUnifiedDiff } from "./patch";
+import { validateUnifiedDiff, applyUnifiedDiffString } from "./patch";
+export { applyUnifiedDiffString };
 
 export type ApplyAndRescanParams = {
   originalFindings: NormalizedFinding[];
@@ -14,54 +15,6 @@ export type ApplyAndRescanParams = {
   sourceFiles?: Record<string, string>; // In-memory source files (or downloaded repo files)
   scanEngine?: (dir: string) => Promise<ScanEngineResult>;
 };
-
-/**
- * Applies a unified diff string to a string file content in memory.
- */
-export function applyUnifiedDiffString(original: string, diff: string): string {
-  const origLines = original.split("\n");
-  const diffLines = diff.split("\n");
-
-  const result: string[] = [];
-  let origIdx = 0;
-  let inHunk = false;
-
-  for (let i = 0; i < diffLines.length; i++) {
-    const line = diffLines[i];
-    if (line.startsWith("@@")) {
-      const match = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-      if (match) {
-        const startLine = Number.parseInt(match[1], 10) - 1;
-        while (origIdx < startLine && origIdx < origLines.length) {
-          result.push(origLines[origIdx++]);
-        }
-        inHunk = true;
-      }
-      continue;
-    }
-
-    if (!inHunk) continue;
-
-    if (line.startsWith("-")) {
-      // Line removed from original
-      origIdx++;
-    } else if (line.startsWith("+")) {
-      // Line added to new version
-      result.push(line.slice(1));
-    } else if (line.startsWith(" ")) {
-      // Context line
-      result.push(line.slice(1));
-      origIdx++;
-    }
-  }
-
-  // Append remaining original lines
-  while (origIdx < origLines.length) {
-    result.push(origLines[origIdx++]);
-  }
-
-  return result.join("\n");
-}
 
 /**
  * Executes the patch application and rescan pipeline in a strictly isolated temporary workspace.

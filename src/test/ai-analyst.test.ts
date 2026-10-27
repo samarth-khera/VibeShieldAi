@@ -5,6 +5,7 @@ import type { NormalizedFinding } from "../server/scanners/types";
 import { explainFinding } from "../server/ai/service";
 import { explainScanFinding, type ScanDeps } from "../server/scans-service";
 import { type LlmProvider, type LlmMessageParams, OllamaProvider } from "../server/ai/client";
+import { GeminiTruncatedOutputError, GeminiQuotaExceededError } from "../server/ai/gemini-provider";
 import { buildUserPrompt } from "../server/ai/prompts";
 
 class MockJobStore implements JobStore {
@@ -318,10 +319,35 @@ describe("AI Security Analyst (Phase 4)", () => {
       }
     });
 
-    it("handles schema validation failures safely", async () => {
-      provider.responseText = JSON.stringify({
-        summary: "Too short", // violates .min(10)
+    it("parses output with harmless surrounding text before and after JSON", async () => {
+      provider.responseText =
+        "Here is the AI security analysis for the finding:\n" +
+        JSON.stringify({
+          summary: "Surrounding text code execution issue.",
+          whyItMatters: "Allows arbitrary code execution when unvalidated.",
+          impact: "Complete system compromise via remote execution.",
+          exploitabilityConditions: "Attacker controlled input to eval().",
+          remediationSteps: ["Replace eval with safe mathematical parser."],
+          verificationSteps: ["Run test suite and verify rejection of injections."],
+          uncertainties: [],
+          disclaimer: "AI generated static guidance.",
+        }) +
+        "\nHope this helps remediate the finding safely!";
+
+      const result = await explainFinding(testJobId, "find-eval", {
+        store,
+        provider,
       });
+
+      expect(result.available).toBe(true);
+      if (result.available) {
+        expect(result.explanation.summary).toBe("Surrounding text code execution issue.");
+      }
+    });
+
+    it("handles truncated provider output (unclosed JSON) safely returning output_truncated diagnostic", async () => {
+      provider.responseText =
+        '{"summary": "Arbitrary code execution via eval", "whyItMatters": "Allows unauthenticated attackers to execute commands", "impact": "Full server compromise", "remediationSteps": ["Remove eval", "Use parser"';
 
       const result = await explainFinding(testJobId, "find-eval", {
         store,
@@ -330,7 +356,55 @@ describe("AI Security Analyst (Phase 4)", () => {
 
       expect(result.available).toBe(false);
       if (!result.available) {
-        expect(result.code).toBe("invalid_response");
+        expect(result.code).toBe("output_truncated");
+        expect(result.message).toContain("truncated");
+        expect(result.diagnostic?.category).toBe("output_truncated");
+        expect(result.diagnostic?.correlationId).toBeDefined();
+      }
+    });
+
+    it("handles provider GeminiTruncatedOutputError safely returning output_truncated diagnostic", async () => {
+      const mockProvider: LlmProvider = {
+        isConfigured: () => true,
+        getModelName: () => "gemini-2.5-flash",
+        generateText: async () => {
+          throw new GeminiTruncatedOutputError("Gemini output was truncated due to output token limit.");
+        },
+      };
+
+      const result = await explainFinding(testJobId, "find-eval", {
+        store,
+        provider: mockProvider,
+      });
+
+      expect(result.available).toBe(false);
+      if (!result.available) {
+        expect(result.code).toBe("output_truncated");
+        expect(result.message).toContain("truncated");
+        expect(result.diagnostic?.category).toBe("output_truncated");
+      }
+    });
+
+    it("handles quota exhaustion safely returning quota_exhausted diagnostic without exposing secrets", async () => {
+      const mockProvider: LlmProvider = {
+        isConfigured: () => true,
+        getModelName: () => "gemini-2.5-flash",
+        generateText: async () => {
+          throw new GeminiQuotaExceededError("Gemini API quota exhausted (429 / RESOURCE_EXHAUSTED): AIzaSyFakeSecretKey");
+        },
+      };
+
+      const result = await explainFinding(testJobId, "find-eval", {
+        store,
+        provider: mockProvider,
+      });
+
+      expect(result.available).toBe(false);
+      if (!result.available) {
+        expect(result.code).toBe("quota_exhausted");
+        expect(result.message).toContain("upstream daily quota limits");
+        expect(result.message).not.toContain("AIzaSyFakeSecretKey");
+        expect(result.diagnostic?.category).toBe("quota_exhausted");
       }
     });
   });

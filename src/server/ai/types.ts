@@ -21,6 +21,67 @@ export const AiExplanationSchema = z.object({
   ),
 });
 
+export const AiExplanationJsonSchema: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    summary: {
+      type: "string",
+      description: "Clear, concise 1-2 sentence plain-English explanation of the security issue (min 10 characters).",
+    },
+    whyItMatters: {
+      type: "string",
+      description: "Why this vulnerability or weakness matters to the security posture of the application (min 10 characters).",
+    },
+    impact: {
+      type: "string",
+      description: "Concrete potential impact if exploited, grounded in the evidence (min 10 characters).",
+    },
+    exploitabilityConditions: {
+      type: "string",
+      description: "Prerequisites or environmental conditions required for this finding to be exploitable (min 10 characters).",
+    },
+    remediationSteps: {
+      type: "array",
+      items: { type: "string" },
+      description: "Concrete remediation steps to resolve the finding.",
+    },
+    codeExample: {
+      type: "object",
+      nullable: true,
+      description: "Optional safe illustrative replacement code or unified diff.",
+      properties: {
+        language: { type: "string", description: "Programming language (e.g. typescript, python, javascript)." },
+        code: { type: "string", description: "Remediated code replacement or illustrative snippet." },
+        title: { type: "string", description: "Title of the code example." },
+        isDiff: { type: "boolean", description: "Whether the code represents a unified git diff." },
+      },
+      required: ["code"],
+    },
+    verificationSteps: {
+      type: "array",
+      items: { type: "string" },
+      description: "Step-by-step verification commands or checks to confirm resolution.",
+    },
+    uncertainties: {
+      type: "array",
+      items: { type: "string" },
+      description: "Known ambiguities or context limitations not visible in the static evidence.",
+    },
+    disclaimer: {
+      type: "string",
+      description: "Safety disclaimer regarding static automated analysis.",
+    },
+  },
+  required: [
+    "summary",
+    "whyItMatters",
+    "impact",
+    "exploitabilityConditions",
+    "remediationSteps",
+    "verificationSteps",
+  ],
+};
+
 export type CodeExample = z.infer<typeof CodeExampleSchema>;
 export type AiFindingExplanation = z.infer<typeof AiExplanationSchema>;
 
@@ -32,6 +93,12 @@ export type CachedAiExplanation = {
   model: string;
   generatedAt: string;
   explanation: AiFindingExplanation;
+};
+
+export type AiDiagnosticInfo = {
+  correlationId: string;
+  model: string;
+  category: string;
 };
 
 export type AiExplainResult =
@@ -50,8 +117,12 @@ export type AiExplainResult =
         | "provider_error"
         | "rate_limited"
         | "invalid_response"
+        | "schema_validation_failed"
+        | "output_truncated"
         | "timeout"
         | "model_missing"
         | "service_unavailable";
       message: string;
+      diagnostic?: AiDiagnosticInfo;
     };
+

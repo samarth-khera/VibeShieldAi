@@ -77,6 +77,46 @@ describe("Phase 7: Production Gemini Migration & Zero-Billing Security Test Suit
       expect(sanitized).not.toContain(sampleGoogleKey);
       expect(sanitized).toContain("[REDACTED_API_KEY]");
     });
+
+    it("confirms Gemini generateContent request includes explicit structured response schema", async () => {
+      let capturedConfig: Record<string, unknown> | null = null;
+      const mockClient = {
+        models: {
+          generateContent: vi.fn().mockImplementation(async (params) => {
+            capturedConfig = params.config;
+            return {
+              text: JSON.stringify({
+                summary: "Test summary min 10 chars",
+                whyItMatters: "Test why it matters 10 chars",
+                impact: "Test impact min 10 chars",
+                exploitabilityConditions: "Test exploit conditions",
+                remediationSteps: ["Step 1"],
+                verificationSteps: ["Step 1"],
+              }),
+            };
+          }),
+        },
+      };
+
+      const provider = new GeminiProvider({
+        apiKey: "test-mock-gemini-key-12345",
+        client: mockClient as never,
+      });
+
+      await provider.generateText({
+        system: "system prompt",
+        userPrompt: "user prompt",
+        format: "json",
+      });
+
+      expect(mockClient.models.generateContent).toHaveBeenCalledTimes(1);
+      expect(capturedConfig).not.toBeNull();
+      expect(capturedConfig!.responseMimeType).toBe("application/json");
+      expect(capturedConfig!.responseJsonSchema).toBeDefined();
+      expect(capturedConfig!.responseSchema).toBeDefined();
+      expect((capturedConfig!.responseJsonSchema as { type?: string }).type).toBe("object");
+      expect((capturedConfig!.responseJsonSchema as { required?: string[] }).required).toContain("summary");
+    });
   });
 
   describe("2. Quota Detection & Zero-Retry Guardrail", () => {

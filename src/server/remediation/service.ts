@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { JobStore } from "../job-store";
 import type { LlmProvider } from "../ai/client";
-import type { FetchLike } from "../github";
+import { fetchFileAtCommit, type FetchLike } from "../github";
+import { getConfig } from "../config";
 import { classifyRemediationEligibility } from "./eligibility";
 import { generateRemediationPatch } from "./patch";
 import { applyAndRescanInSandbox } from "./sandbox";
@@ -52,13 +53,37 @@ export async function createPreview(
   let affectedFiles: string[] = [];
 
   if (eligibility.canAutoFix) {
+    let sourceContent = deps.sourceFiles ? deps.sourceFiles[finding.filePath] : undefined;
+    if (!sourceContent && deps.fetchImpl && job.owner && job.repo && commitSha) {
+      try {
+        const config = getConfig();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 10000);
+        try {
+          sourceContent = await fetchFileAtCommit(
+            deps.fetchImpl,
+            job.owner,
+            job.repo,
+            finding.filePath,
+            commitSha,
+            config,
+            controller.signal,
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch {
+        // Safe fail-closed: sourceContent remains undefined and patch generator handles it cleanly
+      }
+    }
+
     try {
       const patchResult = await generateRemediationPatch({
         finding,
         scanJobId,
         commitSha,
         llmProvider: deps.llmProvider,
-        sourceContent: deps.sourceFiles ? deps.sourceFiles[finding.filePath] : undefined,
+        sourceContent,
       });
       unifiedDiff = patchResult.unifiedDiff;
       patchSummary = patchResult.patchSummary;

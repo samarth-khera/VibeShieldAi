@@ -70,6 +70,31 @@ export function ScanStatusPanel({
         )}
       </div>
 
+      {/* Active Phase Banner */}
+      {!isFailed && !isCompleted && !isReadyForScan && (
+        <div className="mt-3 rounded-lg border border-accent/30 bg-accent/5 p-3 text-xs">
+          <div className="flex items-center gap-2 font-medium text-foreground">
+            <Loader2 className="size-3.5 animate-spin text-accent" />
+            {job.status === "queued" ? (
+              <span>Queued — Waiting for GitHub Actions runner…</span>
+            ) : job.status === "retrieving" ? (
+              <span>Downloading &amp; extracting repository snapshot…</span>
+            ) : isScanning ? (
+              <span>Running 3 security engines in parallel (Gitleaks, Semgrep, OSV-Scanner)…</span>
+            ) : (
+              <span>Processing repository…</span>
+            )}
+          </div>
+          <p className="mt-1 font-mono text-[11px] text-muted">
+            {job.status === "queued"
+              ? "Scan job submitted. Runner startup and queue wait depend on GitHub Actions availability."
+              : job.status === "retrieving"
+                ? "Streaming tarball snapshot from GitHub API and extracting with safety limits."
+                : "Scanning code for leaked secrets, static security flaws, and vulnerable dependencies."}
+          </p>
+        </div>
+      )}
+
       {/* Pipeline Stepper */}
       {!isFailed && (
         <div className="mt-4 space-y-3">
@@ -92,7 +117,9 @@ export function ScanStatusPanel({
               ) : (
                 <CircleDashed className="size-4" aria-hidden />
               )}
-              <span className="font-medium">1. Repository snapshot</span>
+              <span className="font-medium">
+                {job.status === "queued" ? "1. Queued (Runner)" : "1. Repository snapshot"}
+              </span>
             </div>
 
             {/* Step 2: Security Analysis */}
@@ -145,7 +172,9 @@ export function ScanStatusPanel({
                     <KeyRound className="size-3.5 text-accent" aria-hidden /> Gitleaks
                   </span>
                   {job.scanners.gitleaks.status === "completed" ? (
-                    <span className="text-accent">✓ done</span>
+                    <span className="text-accent">
+                      ✓ done {job.scanners.gitleaks.durationMs ? `(${job.scanners.gitleaks.durationMs}ms)` : ""}
+                    </span>
                   ) : job.scanners.gitleaks.status === "failed" ? (
                     <span className="text-sev-critical">⚠ error</span>
                   ) : (
@@ -161,7 +190,9 @@ export function ScanStatusPanel({
                     <Layers className="size-3.5 text-accent" aria-hidden /> Semgrep
                   </span>
                   {job.scanners.semgrep.status === "completed" ? (
-                    <span className="text-accent">✓ done</span>
+                    <span className="text-accent">
+                      ✓ done {job.scanners.semgrep.durationMs ? `(${job.scanners.semgrep.durationMs}ms)` : ""}
+                    </span>
                   ) : job.scanners.semgrep.status === "failed" ? (
                     <span className="text-sev-critical">⚠ error</span>
                   ) : (
@@ -177,7 +208,9 @@ export function ScanStatusPanel({
                     <Package className="size-3.5 text-accent" aria-hidden /> OSV-Scanner
                   </span>
                   {job.scanners.osvScanner.status === "completed" ? (
-                    <span className="text-accent">✓ done</span>
+                    <span className="text-accent">
+                      ✓ done {job.scanners.osvScanner.durationMs ? `(${job.scanners.osvScanner.durationMs}ms)` : ""}
+                    </span>
                   ) : job.scanners.osvScanner.status === "failed" ? (
                     <span className="text-sev-critical">⚠ error</span>
                   ) : (

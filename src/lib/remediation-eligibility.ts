@@ -9,6 +9,29 @@ export interface RemediationEligibility {
 }
 
 /**
+ * Typed single-source-of-truth helper for resolving a finding's fixed version.
+ * Checks packageInfo.fixedVersion, metadata.fixedVersion, or any typed package representation.
+ */
+export function resolveFindingFixedVersion(finding: {
+  packageInfo?: unknown;
+  metadata?: unknown;
+}): string | null {
+  if (finding.packageInfo && typeof finding.packageInfo === "object") {
+    const pkg = finding.packageInfo as { fixedVersion?: unknown };
+    if (typeof pkg.fixedVersion === "string" && pkg.fixedVersion.trim().length > 0) {
+      return pkg.fixedVersion.trim();
+    }
+  }
+  if (finding.metadata && typeof finding.metadata === "object") {
+    const meta = finding.metadata as { fixedVersion?: unknown };
+    if (typeof meta.fixedVersion === "string" && meta.fixedVersion.trim().length > 0) {
+      return meta.fixedVersion.trim();
+    }
+  }
+  return null;
+}
+
+/**
  * Universal classification helper used both server-side and client-side.
  */
 export function classifyRemediationEligibility(finding: {
@@ -17,6 +40,7 @@ export function classifyRemediationEligibility(finding: {
   title?: string | null;
   filePath?: string | null;
   packageInfo?: unknown;
+  metadata?: unknown;
 }): RemediationEligibility {
   const category = (finding.category || "").toLowerCase();
   const ruleId = (finding.ruleId || "").toLowerCase();
@@ -39,15 +63,15 @@ export function classifyRemediationEligibility(finding: {
 
   // 2. Dependencies
   if (category.includes("dependenc") || finding.packageInfo != null) {
-    const pkg = finding.packageInfo as { name?: string; fixedVersion?: string } | null;
-    const hasFixed = Boolean(pkg?.fixedVersion);
+    const fixedVersion = resolveFindingFixedVersion(finding);
+    const hasFixed = Boolean(fixedVersion);
 
     if (hasFixed) {
       return {
         eligibility: "potentially_breaking",
         canAutoFix: true,
         requiresRotation: false,
-        reason: `Automated version bump to patched release ${pkg?.fixedVersion || ""}.`,
+        reason: `Automated version bump to patched release ${fixedVersion}.`,
         warnings: [
           "Upgrading library versions may introduce breaking changes or transitive dependency conflicts.",
           "Run the project's automated test suite before merging this remediation.",

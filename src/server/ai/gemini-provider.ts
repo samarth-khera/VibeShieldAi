@@ -1,5 +1,6 @@
 import { GoogleGenAI, ApiError } from "@google/genai";
 import type { LlmMessageParams, LlmProvider } from "./client";
+import { AiExplanationJsonSchema } from "./types";
 
 export class GeminiQuotaExceededError extends Error {
   readonly status = 429;
@@ -10,6 +11,16 @@ export class GeminiQuotaExceededError extends Error {
     this.name = "GeminiQuotaExceededError";
   }
 }
+
+export class GeminiTruncatedOutputError extends Error {
+  readonly isTruncated = true;
+
+  constructor(message: string) {
+    super(redactSecrets(message));
+    this.name = "GeminiTruncatedOutputError";
+  }
+}
+
 
 /**
  * Strips Google API keys or sensitive authorization tokens from strings.
@@ -101,18 +112,23 @@ export class GeminiProvider implements LlmProvider {
     return this.modelName;
   }
 
-  private getClient(): GoogleGenAI {
-    if (this.clientInstance) return this.clientInstance;
+  private getClient(timeoutMs?: number): GoogleGenAI {
+    if (this.clientInstance && (!timeoutMs || timeoutMs === this.defaultTimeoutMs)) {
+      return this.clientInstance;
+    }
     if (!this.apiKey) {
       throw new Error("GEMINI_API_KEY is not configured.");
     }
-    this.clientInstance = new GoogleGenAI({
+    const client = new GoogleGenAI({
       apiKey: this.apiKey,
       httpOptions: {
-        timeout: this.defaultTimeoutMs,
+        timeout: timeoutMs ?? this.defaultTimeoutMs,
       },
     });
-    return this.clientInstance;
+    if (!this.clientInstance) {
+      this.clientInstance = client;
+    }
+    return client;
   }
 
   async generateText(params: LlmMessageParams): Promise<string> {
@@ -120,13 +136,15 @@ export class GeminiProvider implements LlmProvider {
       throw new Error("Gemini AI provider is disabled or not configured.");
     }
 
-    const client = this.getClient();
     const timeoutMs = params.timeoutMs ?? this.defaultTimeoutMs;
+    const client = this.getClient(timeoutMs);
 
     // Retry loop: AT MOST 1 retry for transient 500/503 network errors.
     // NEVER retry on 429 / RESOURCE_EXHAUSTED.
     const maxAttempts = 2;
     let lastError: unknown = null;
+
+    const schema = params.responseSchema ?? (params.format === "json" ? AiExplanationJsonSchema : undefined);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -141,8 +159,10 @@ export class GeminiProvider implements LlmProvider {
           config: {
             systemInstruction: params.system ? { parts: [{ text: params.system }] } : undefined,
             responseMimeType: params.format === "json" ? "application/json" : undefined,
+            responseJsonSchema: schema,
+            responseSchema: schema,
             temperature: 0.1,
-            maxOutputTokens: params.maxTokens ?? 800,
+            maxOutputTokens: params.maxTokens ?? 1500,
           },
         });
 
@@ -154,6 +174,13 @@ export class GeminiProvider implements LlmProvider {
         });
 
         const response = await Promise.race([responsePromise, timeoutPromise]);
+        const candidate = response?.candidates?.[0];
+        const finishReason = candidate?.finishReason;
+
+        if (finishReason === "MAX_TOKENS") {
+          throw new GeminiTruncatedOutputError("Gemini output was truncated due to output token limit.");
+        }
+
         const text = response?.text;
 
         if (typeof text === "string" && text.length > 0) {
@@ -171,6 +198,10 @@ export class GeminiProvider implements LlmProvider {
           throw new GeminiQuotaExceededError(
             `Gemini API quota exhausted (429 / RESOURCE_EXHAUSTED): ${redactSecrets(rawMsg)}`
           );
+        }
+
+        if (err instanceof GeminiTruncatedOutputError) {
+          throw err;
         }
 
         const msg = err instanceof Error ? err.message : String(err);

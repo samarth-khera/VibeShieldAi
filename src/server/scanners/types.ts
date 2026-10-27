@@ -22,6 +22,7 @@ export type NormalizedFinding = {
     name: string;
     version: string;
     ecosystem?: string;
+    fixedVersion?: string | null;
   } | null;
   metadata?: Record<string, unknown> | null;
   aiExplanation?: unknown;
@@ -54,6 +55,13 @@ export type ScanCoverage = {
   lockfilesFound: string[];
   scannersRun: string[];
   limitations: string[];
+  stageDurations?: {
+    metadataMs?: number;
+    downloadMs?: number;
+    extractionMs?: number;
+    scanningMs?: number;
+    callbackMs?: number;
+  };
 };
 
 export type ScanEngineResult = {

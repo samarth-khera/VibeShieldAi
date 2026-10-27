@@ -201,10 +201,18 @@ export function RealReportView({ jobId }: { jobId: string }) {
               <Loader2 className="size-8 animate-spin text-accent" />
               <div>
                 <h2 className="font-display text-2xl font-bold">
-                  {job.status === "scanning" ? "Running Security Scanners…" : "Preparing Repository…"}
+                  {job.status === "scanning"
+                    ? "Running Security Scanners…"
+                    : job.status === "retrieving"
+                      ? "Downloading & Extracting Repository Snapshot…"
+                      : "Queued — Waiting for GitHub Actions Runner…"}
                 </h2>
                 <p className="mt-1 font-mono text-xs text-muted">
-                  Scanning {repoName} across Gitleaks secrets, Semgrep code rules, and OSV-Scanner dependencies.
+                  {job.status === "scanning"
+                    ? `Scanning ${repoName} across Gitleaks secrets, Semgrep code rules, and OSV-Scanner dependencies.`
+                    : job.status === "retrieving"
+                      ? `Fetching repository snapshot and commit SHA for ${repoName}.`
+                      : `Job is queued in GitHub Actions. Waiting for an available runner (free-tier runner queue).`}
                 </p>
               </div>
             </div>
@@ -321,6 +329,12 @@ export function RealReportView({ jobId }: { jobId: string }) {
               </span>
               <span>Engines: Gitleaks · Semgrep · OSV-Scanner</span>
             </div>
+            {job.scanCoverage.stageDurations && (
+              <p className="mt-2 text-[11px] text-muted">
+                Pipeline Stages: Retrieval {(job.scanCoverage.stageDurations.metadataMs ?? 0) + (job.scanCoverage.stageDurations.downloadMs ?? 0) + (job.scanCoverage.stageDurations.extractionMs ?? 0)}ms · Scanning {job.scanCoverage.stageDurations.scanningMs ?? 0}ms
+                {job.scanCoverage.stageDurations.callbackMs ? ` · Callback ${job.scanCoverage.stageDurations.callbackMs}ms` : ""}
+              </p>
+            )}
             {job.scanCoverage.limitations.length > 0 && (
               <p className="mt-2 text-[11px] text-sev-medium">
                 Note: {job.scanCoverage.limitations.join(" · ")}

@@ -4,6 +4,7 @@ export type LlmMessageParams = {
   maxTokens?: number;
   timeoutMs?: number;
   format?: "json";
+  responseSchema?: Record<string, unknown>;
 };
 
 export interface LlmProvider {

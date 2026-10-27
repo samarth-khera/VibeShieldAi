@@ -31,6 +31,7 @@ export type PublicFinding = {
     name: string;
     version: string;
     ecosystem?: string;
+    fixedVersion?: string | null;
   } | null;
   metadata?: Record<string, unknown> | null;
   aiExplanation?: {
@@ -78,6 +79,13 @@ export type PublicScanJob = {
     lockfilesFound: string[];
     scannersRun: string[];
     limitations: string[];
+    stageDurations?: {
+      metadataMs?: number;
+      downloadMs?: number;
+      extractionMs?: number;
+      scanningMs?: number;
+      callbackMs?: number;
+    };
   } | null;
   summary?: {
     critical: number;
@@ -93,6 +101,7 @@ export type PublicScanJob = {
   workerOnline: boolean | null;
   createdAt: string;
   updatedAt: string;
+  startedAt?: string | null;
   completedAt: string | null;
   expiresAt: string;
 };

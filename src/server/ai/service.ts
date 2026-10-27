@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import type { JobStore, FindingRecord } from "../job-store";
 import {
   AiExplanationSchema,
+  AiExplanationJsonSchema,
   type AiFindingExplanation,
   type CachedAiExplanation,
   type AiExplainResult,
@@ -8,20 +10,104 @@ import {
 import { AI_PROMPT_VERSION, SYSTEM_PROMPT, buildUserPrompt, computeContextHash } from "./prompts";
 import { getLlmProvider, type LlmProvider } from "./client";
 import { tripAiCircuitBreaker, recordAiRequest } from "./circuit-breaker";
-import { isQuotaExhaustedError } from "./gemini-provider";
+import { isQuotaExhaustedError, GeminiTruncatedOutputError } from "./gemini-provider";
 
-function extractJson(text: string): string {
+export class TruncatedJsonError extends Error {
+  readonly isTruncated = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "TruncatedJsonError";
+  }
+}
+
+/**
+ * Extracts a JSON object from text using a string/escape-aware balanced brace parser.
+ * Handles pure JSON, markdown fenced blocks, and harmless surrounding text.
+ * Throws TruncatedJsonError if opening braces remain unclosed at EOF.
+ * Throws SyntaxError if no valid JSON object can be extracted.
+ */
+export function extractJson(text: string): string {
   const trimmed = text.trim();
-  // Strip markdown fences if present
-  if (trimmed.startsWith("```")) {
-    const lines = trimmed.split("\n");
-    if (lines.length >= 2) {
-      const start = 1;
-      const end = lines[lines.length - 1].trim().startsWith("```") ? lines.length - 1 : lines.length;
-      return lines.slice(start, end).join("\n").trim();
+  if (!trimmed) {
+    throw new SyntaxError("Empty AI response received.");
+  }
+
+  // 1. If text contains a markdown fence ```...```, try extracting from the fence first
+  const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (fenceMatch && fenceMatch[1]) {
+    const candidate = fenceMatch[1].trim();
+    if (candidate.startsWith("{") && candidate.endsWith("}")) {
+      try {
+        JSON.parse(candidate);
+        return candidate;
+      } catch {
+        // Fall through to balanced brace parser
+      }
     }
   }
-  return trimmed;
+
+  // 2. String/escape-aware balanced-brace parser
+  let startIndex = -1;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+
+    if (escape) {
+      escape = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      if (inString) {
+        escape = true;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (!inString) {
+      if (ch === "{") {
+        if (depth === 0) {
+          startIndex = i;
+        }
+        depth++;
+      } else if (ch === "}") {
+        if (depth > 0) {
+          depth--;
+          if (depth === 0 && startIndex !== -1) {
+            const candidate = trimmed.slice(startIndex, i + 1);
+            try {
+              JSON.parse(candidate);
+              return candidate;
+            } catch {
+              // Not valid JSON object; reset and keep scanning
+              startIndex = -1;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // If we found a start brace that remained unclosed at EOF, it's truncated output
+  if (startIndex !== -1 && (depth > 0 || inString)) {
+    throw new TruncatedJsonError("AI response was cut off before closing JSON object.");
+  }
+
+  // 3. Fallback: try parsing trimmed text directly
+  try {
+    JSON.parse(trimmed);
+    return trimmed;
+  } catch {
+    throw new SyntaxError("No valid balanced JSON object found in AI response.");
+  }
 }
 
 export async function explainFinding(
@@ -42,13 +128,14 @@ export async function explainFinding(
 
   const provider = deps.provider || getLlmProvider();
   const modelName = provider.getModelName();
+  const correlationId = randomUUID().slice(0, 12);
 
   if (!provider.isConfigured()) {
     return {
       available: false,
       code: "ai_not_configured",
-      message:
-        "Local AI Security Analyst is currently unavailable or disabled on the server.",
+      message: "Local AI Security Analyst is currently unavailable or disabled on the server.",
+      diagnostic: { correlationId, model: modelName, category: "not_configured" },
     };
   }
 
@@ -83,12 +170,13 @@ export async function explainFinding(
       system: SYSTEM_PROMPT,
       userPrompt,
       format: "json",
+      responseSchema: AiExplanationJsonSchema,
       maxTokens:
         deps.maxTokens ??
-        Number.parseInt(process.env.AI_MAX_OUTPUT_TOKENS || "800", 10),
+        Number.parseInt(process.env.AI_MAX_OUTPUT_TOKENS || "1500", 10),
       timeoutMs:
         deps.timeoutMs ??
-        Number.parseInt(process.env.OLLAMA_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || "120000", 10),
+        Number.parseInt(process.env.AI_REQUEST_TIMEOUT_MS || "30000", 10),
     });
   } catch (err: unknown) {
     if (isQuotaExhaustedError(err)) {
@@ -102,14 +190,24 @@ export async function explainFinding(
         code: "quota_exhausted",
         message:
           "AI Security Analyst is temporarily unavailable due to upstream daily quota limits. Security scanner findings remain fully accessible.",
+        diagnostic: { correlationId, model: modelName, category: "quota_exhausted" },
       };
     }
     const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof GeminiTruncatedOutputError || message.includes("truncated") || message.includes("output token limit")) {
+      return {
+        available: false,
+        code: "output_truncated",
+        message: "The AI analysis response was truncated due to output limits. Please retry.",
+        diagnostic: { correlationId, model: modelName, category: "output_truncated" },
+      };
+    }
     if (message.includes("timed out") || message.includes("timeout")) {
       return {
         available: false,
         code: "timeout",
         message: "The AI analysis request timed out. Please try again.",
+        diagnostic: { correlationId, model: modelName, category: "timeout" },
       };
     }
     if (message.includes("not installed in Ollama") || message.includes("not found")) {
@@ -117,24 +215,28 @@ export async function explainFinding(
         available: false,
         code: "model_missing",
         message: `The configured local model is not installed in Ollama (${provider.getModelName()}). Please pull the model on the host.`,
+        diagnostic: { correlationId, model: modelName, category: "model_missing" },
       };
     }
     if (
       message.includes("service is unavailable") ||
       message.includes("ECONNREFUSED") ||
-      message.includes("Failed to fetch")
+      message.includes("Failed to fetch") ||
+      message.includes("503")
     ) {
       return {
         available: false,
         code: "service_unavailable",
         message:
           "The AI inference service is temporarily offline or unreachable. Scanner findings and static guidance remain accessible.",
+        diagnostic: { correlationId, model: modelName, category: "service_unavailable" },
       };
     }
     return {
       available: false,
       code: "provider_error",
       message: "The AI provider encountered an issue analyzing this finding. Please retry shortly.",
+      diagnostic: { correlationId, model: modelName, category: "provider_error" },
     };
   }
 
@@ -142,11 +244,20 @@ export async function explainFinding(
   try {
     const cleanJson = extractJson(rawText);
     parsedJson = JSON.parse(cleanJson);
-  } catch {
+  } catch (parseErr: unknown) {
+    if (parseErr instanceof TruncatedJsonError) {
+      return {
+        available: false,
+        code: "output_truncated",
+        message: "The AI analysis response was truncated. Please retry.",
+        diagnostic: { correlationId, model: modelName, category: "output_truncated" },
+      };
+    }
     return {
       available: false,
       code: "invalid_response",
       message: "The AI analysis returned malformed output. Please retry.",
+      diagnostic: { correlationId, model: modelName, category: "malformed_json" },
     };
   }
 
@@ -154,8 +265,9 @@ export async function explainFinding(
   if (!validation.success) {
     return {
       available: false,
-      code: "invalid_response",
+      code: "schema_validation_failed",
       message: "The AI explanation failed schema validation. Please retry.",
+      diagnostic: { correlationId, model: modelName, category: "schema_validation_failed" },
     };
   }
 

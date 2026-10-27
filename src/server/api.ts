@@ -105,6 +105,7 @@ export function toPublicJob(job: JobRecord, workerOnline?: boolean) {
     workerOnline: job.status === "queued" ? (workerOnline ?? null) : null,
     createdAt: job.createdAt.toISOString(),
     updatedAt: job.updatedAt.toISOString(),
+    startedAt: job.startedAt?.toISOString() ?? null,
     completedAt: job.completedAt?.toISOString() ?? null,
     expiresAt: job.expiresAt.toISOString(),
   };

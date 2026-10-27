@@ -4,7 +4,7 @@ import type { LlmProvider } from "../ai/client";
 import { redactText } from "../scanners/redact";
 import type { FindingRecord } from "../job-store";
 import type { NormalizedFinding } from "../scanners/types";
-import { classifyRemediationEligibility } from "./eligibility";
+import { classifyRemediationEligibility, resolveFindingFixedVersion } from "./eligibility";
 
 export type PatchValidationResult = {
   valid: boolean;
@@ -87,6 +87,197 @@ export function validateUnifiedDiff(diff: string): PatchValidationResult {
   }
 
   return { valid: true, affectedFiles: Array.from(affectedFilesSet) };
+}
+
+/**
+ * Applies a unified diff string to a string file content in memory.
+ */
+export function applyUnifiedDiffString(original: string, diff: string): string {
+  const origLines = original.split("\n");
+  const diffLines = diff.split("\n");
+
+  const result: string[] = [];
+  let origIdx = 0;
+  let inHunk = false;
+
+  for (let i = 0; i < diffLines.length; i++) {
+    const line = diffLines[i];
+    if (line.startsWith("@@")) {
+      const match = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (match) {
+        const startLine = Number.parseInt(match[1], 10) - 1;
+        while (origIdx < startLine && origIdx < origLines.length) {
+          result.push(origLines[origIdx++]);
+        }
+        inHunk = true;
+      }
+      continue;
+    }
+
+    if (!inHunk) continue;
+
+    if (line.startsWith("-")) {
+      origIdx++;
+    } else if (line.startsWith("+")) {
+      result.push(line.slice(1));
+    } else if (line.startsWith(" ")) {
+      result.push(line.slice(1));
+      origIdx++;
+    }
+  }
+
+  while (origIdx < origLines.length) {
+    result.push(origLines[origIdx++]);
+  }
+
+  return result.join("\n");
+}
+
+export type ManifestTransformResult = {
+  updatedContent: string;
+  oldLine: string;
+  newLine: string;
+  lineIndex: number;
+  oldVersion: string;
+};
+
+/**
+ * Updates a declared dependency version in a Python requirements.txt manifest,
+ * strictly preserving comments, indentation, version operators, extras, and environment markers.
+ */
+export function updatePythonRequirementsContent(
+  content: string,
+  targetPkgName: string,
+  fixedVersion: string,
+): ManifestTransformResult | null {
+  const lines = content.split("\n");
+  const normalize = (n: string) => n.toLowerCase().replace(/[-_.]+/g, "-");
+  const targetNorm = normalize(targetPkgName);
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    // Separate inline comment
+    let mainPart = rawLine;
+    let commentPart = "";
+    const commentMatch = rawLine.match(/^([^#]*)(#.*)$/);
+    if (commentMatch) {
+      mainPart = commentMatch[1];
+      commentPart = commentMatch[2];
+    }
+
+    // Separate environment marker (; ...)
+    let reqPart = mainPart;
+    let markerPart = "";
+    const markerIdx = mainPart.indexOf(";");
+    if (markerIdx !== -1) {
+      reqPart = mainPart.slice(0, markerIdx);
+      markerPart = mainPart.slice(markerIdx);
+    }
+
+    // Match dependency name, optional extras, operator, and version constraint
+    const reqMatch = reqPart.match(/^(\s*)([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(\[[^\]]*\])?(\s*)(==|~=|>=|<=|!=|===|<|>)(.*)$/);
+    if (!reqMatch) continue;
+
+    const [, indent, pkgName, extras = "", spacing, op, versionRest] = reqMatch;
+    if (normalize(pkgName) !== targetNorm) continue;
+
+    const oldVersion = versionRest.trim();
+    let newOp = op;
+    if (op === "==" || op === "===" || op === "~=") {
+      newOp = op;
+    } else if (op === "<=" || op === "<") {
+      newOp = "<=";
+    } else if (op === ">=") {
+      newOp = "==";
+    }
+
+    const versionSpacing = versionRest.match(/^\s*/)?.[0] || "";
+    const versionTrailingSpace = versionRest.match(/\s*$/)?.[0] || "";
+    const newLine = `${indent}${pkgName}${extras}${spacing}${newOp}${versionSpacing}${fixedVersion}${versionTrailingSpace}${markerPart}${commentPart}`;
+
+    const newLines = [...lines];
+    newLines[i] = newLine;
+
+    return {
+      updatedContent: newLines.join("\n"),
+      oldLine: rawLine,
+      newLine,
+      lineIndex: i,
+      oldVersion,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Updates a declared dependency version in a Node.js package.json manifest,
+ * strictly preserving existing prefixes (^, ~, >=), formatting, indentation, and structure.
+ */
+export function updatePackageJsonContent(
+  content: string,
+  targetPkgName: string,
+  fixedVersion: string,
+): ManifestTransformResult | null {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+
+  const depSections = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
+  let foundSection: string | null = null;
+  let currentDeclaredVersion: string | null = null;
+
+  for (const sec of depSections) {
+    const secObj = parsed[sec];
+    if (secObj && typeof secObj === "object" && typeof (secObj as Record<string, unknown>)[targetPkgName] === "string") {
+      foundSection = sec;
+      currentDeclaredVersion = (secObj as Record<string, unknown>)[targetPkgName] as string;
+      break;
+    }
+  }
+
+  if (!foundSection || !currentDeclaredVersion) {
+    return null;
+  }
+
+  const prefixMatch = currentDeclaredVersion.match(/^(\^|~|>=|<=|>|<)?/);
+  const prefix = prefixMatch?.[1] || "";
+  const newDeclaredVersion = `${prefix}${fixedVersion}`;
+
+  const lines = content.split("\n");
+  const targetKeyQuote = `"${targetPkgName}"`;
+  const staticPairRegex = /^(\s*"[^"]+"\s*:\s*)"([^"]+)"(.*)$/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.includes(targetKeyQuote)) continue;
+
+    const m = line.match(staticPairRegex);
+    if (m) {
+      const colonIndex = line.indexOf(":");
+      const keyPart = line.slice(0, colonIndex).trim();
+      if (keyPart === targetKeyQuote) {
+        const newLine = `${m[1]}"${newDeclaredVersion}"${m[3]}`;
+        const newLines = [...lines];
+        newLines[i] = newLine;
+        return {
+          updatedContent: newLines.join("\n"),
+          oldLine: line,
+          newLine,
+          lineIndex: i,
+          oldVersion: currentDeclaredVersion,
+        };
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -252,22 +443,182 @@ function findSingleConstVariableDeclaration(
   return decl;
 }
 
+interface ProxyResolution {
+  isProxy: boolean;
+  target?: ts.Expression;
+  handler?: ts.Expression;
+}
+
 /**
- * Checks if an expression resolves to a known global root (globalThis, window, global, self).
+ * Resolves whether an expression is a `new Proxy(target, handler)` constructor call or `Proxy.revocable`,
+ * directly or through simple const variable aliases.
  */
-function isGlobalObject(expr: ts.Expression, sourceFile?: ts.SourceFile): boolean {
+function resolveProxy(
+  expr: ts.Expression,
+  sourceFile?: ts.SourceFile,
+  visited = new Set<ts.Node>()
+): ProxyResolution {
   const unwrapped = getUnwrappedExpression(expr);
+  if (visited.has(unwrapped)) {
+    return { isProxy: false };
+  }
+  visited.add(unwrapped);
+
+  if (ts.isNewExpression(unwrapped)) {
+    const callee = getUnwrappedExpression(unwrapped.expression);
+    const isProxy =
+      (ts.isIdentifier(callee) && callee.text === "Proxy") ||
+      (ts.isPropertyAccessExpression(callee) &&
+        callee.name.text === "Proxy" &&
+        isGlobalObject(callee.expression, sourceFile, visited)) ||
+      isGlobalPropertyAccess(callee, "Proxy", sourceFile);
+    if (isProxy && unwrapped.arguments && unwrapped.arguments.length >= 1) {
+      return {
+        isProxy: true,
+        target: unwrapped.arguments[0],
+        handler: unwrapped.arguments[1],
+      };
+    }
+  }
+
+  // Also support Proxy.revocable(target, handler)
+  if (ts.isCallExpression(unwrapped)) {
+    const callee = getUnwrappedExpression(unwrapped.expression);
+    const isRevocable =
+      (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) &&
+      getAccessedPropertyName(callee) === "revocable" &&
+      ((ts.isIdentifier(callee.expression) && callee.expression.text === "Proxy") ||
+        isGlobalPropertyAccess(callee.expression, "Proxy", sourceFile));
+    if (isRevocable && unwrapped.arguments.length >= 1) {
+      return {
+        isProxy: true,
+        target: unwrapped.arguments[0],
+        handler: unwrapped.arguments[1],
+      };
+    }
+  }
+
+  // Also support pair.proxy where pair = Proxy.revocable(target, handler)
+  if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
+    const prop = getAccessedPropertyName(unwrapped);
+    if (prop === "proxy") {
+      const inner = resolveProxy(unwrapped.expression, sourceFile, visited);
+      if (inner.isProxy) {
+        return inner;
+      }
+    }
+  }
+
+  if (ts.isIdentifier(unwrapped) && sourceFile) {
+    const decl = findSingleConstVariableDeclaration(unwrapped.text, sourceFile);
+    if (decl && decl.initializer) {
+      return resolveProxy(decl.initializer, sourceFile, visited);
+    }
+  }
+
+  return { isProxy: false };
+}
+
+/**
+ * Checks whether a proxy handler expression is an empty object literal with no traps.
+ */
+function isTransparentProxyHandler(
+  handler: ts.Expression | undefined,
+  sourceFile?: ts.SourceFile,
+  visited = new Set<ts.Node>()
+): boolean {
+  if (!handler) return true;
+  const unwrapped = getUnwrappedExpression(handler);
+  if (visited.has(unwrapped)) return false;
+  visited.add(unwrapped);
+
+  if (ts.isObjectLiteralExpression(unwrapped)) {
+    return unwrapped.properties.length === 0;
+  }
+  if (ts.isIdentifier(unwrapped) && sourceFile) {
+    const decl = findSingleConstVariableDeclaration(unwrapped.text, sourceFile);
+    if (decl && decl.initializer) {
+      return isTransparentProxyHandler(decl.initializer, sourceFile, visited);
+    }
+  }
+  return false;
+}
+
+/**
+ * Checks whether an expression can be statically proven to be a safe, locally defined
+ * non-global object literal (e.g. `{ ... }` or a single `const` initialized with an object literal).
+ */
+function isStaticallyProvenLocalNonGlobalObject(
+  expr: ts.Expression,
+  sourceFile?: ts.SourceFile,
+  visited = new Set<ts.Node>()
+): boolean {
+  const unwrapped = getUnwrappedExpression(expr);
+  if (visited.has(unwrapped)) {
+    return false;
+  }
+  visited.add(unwrapped);
+
+  if (ts.isObjectLiteralExpression(unwrapped)) {
+    return true;
+  }
+
+  if (ts.isIdentifier(unwrapped) && sourceFile) {
+    if (["globalThis", "window", "global", "self", "JSON"].includes(unwrapped.text)) {
+      return false;
+    }
+    const decl = findSingleConstVariableDeclaration(unwrapped.text, sourceFile);
+    if (decl && decl.initializer) {
+      return isStaticallyProvenLocalNonGlobalObject(decl.initializer, sourceFile, visited);
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Checks if an expression resolves to a known global root (globalThis, window, global, self),
+ * including direct or variable-aliased `new Proxy(globalRoot, ...)` wrappers.
+ */
+function isGlobalObject(
+  expr: ts.Expression,
+  sourceFile?: ts.SourceFile,
+  visited = new Set<ts.Node>()
+): boolean {
+  const unwrapped = getUnwrappedExpression(expr);
+  if (visited.has(unwrapped)) {
+    return false;
+  }
+  visited.add(unwrapped);
+
   if (ts.isIdentifier(unwrapped)) {
     if (["globalThis", "window", "global", "self"].includes(unwrapped.text)) {
       return true;
     }
     if (sourceFile) {
       const decl = findSingleConstVariableDeclaration(unwrapped.text, sourceFile);
-      if (decl && decl.initializer && isGlobalObject(decl.initializer, sourceFile)) {
+      if (decl && decl.initializer && isGlobalObject(decl.initializer, sourceFile, visited)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
+    const prop = getAccessedPropertyName(unwrapped);
+    if (prop && ["globalThis", "window", "global", "self"].includes(prop)) {
+      if (isGlobalObject(unwrapped.expression, sourceFile, visited)) {
         return true;
       }
     }
   }
+
+  // Handle direct or aliased new Proxy(globalRoot, ...)
+  const proxy = resolveProxy(unwrapped, sourceFile, new Set<ts.Node>());
+  if (proxy.isProxy && proxy.target) {
+    return isGlobalObject(proxy.target, sourceFile, visited);
+  }
+
   return false;
 }
 
@@ -367,18 +718,44 @@ function isGlobalPropertyAccess(expr: ts.Expression, targetProp: string, sourceF
 
 /**
  * Checks whether an expression references JSON or a property on JSON,
- * or globalThis.JSON / window["JSON"] / etc.
+ * or globalThis.JSON / window["JSON"] / etc., including direct or aliased Proxy wrappers.
  */
-function referencesJsonTarget(expr: ts.Expression, sourceFile?: ts.SourceFile): boolean {
+function referencesJsonTarget(
+  expr: ts.Expression,
+  sourceFile?: ts.SourceFile,
+  visited = new Set<ts.Node>()
+): boolean {
   let curr: ts.Expression | undefined = expr;
   while (curr) {
     const unwrapped = getUnwrappedExpression(curr);
-    if (ts.isIdentifier(unwrapped) && unwrapped.text === "JSON") {
-      return true;
+    if (visited.has(unwrapped)) {
+      break;
+    }
+    visited.add(unwrapped);
+
+    if (ts.isIdentifier(unwrapped)) {
+      if (unwrapped.text === "JSON") {
+        return true;
+      }
+      if (sourceFile) {
+        const decl = findSingleConstVariableDeclaration(unwrapped.text, sourceFile);
+        if (decl && decl.initializer && referencesJsonTarget(decl.initializer, sourceFile, visited)) {
+          return true;
+        }
+      }
     }
     if (isGlobalPropertyAccess(unwrapped, "JSON", sourceFile)) {
       return true;
     }
+
+    // Handle direct or aliased new Proxy(JSON, ...)
+    const proxy = resolveProxy(unwrapped, sourceFile, new Set<ts.Node>());
+    if (proxy.isProxy && proxy.target) {
+      if (referencesJsonTarget(proxy.target, sourceFile, visited)) {
+        return true;
+      }
+    }
+
     if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
       curr = unwrapped.expression;
     } else {
@@ -414,6 +791,15 @@ function isStaticallyProvenNotToModifyJson(
     ts.isNumericLiteral(unwrapped)
   ) {
     return true;
+  }
+
+  // Handle Proxy source: safe only if target is proven safe and handler is transparent
+  const proxy = resolveProxy(unwrapped, sourceFile, new Set<ts.Node>());
+  if (proxy.isProxy) {
+    if (proxy.target && isTransparentProxyHandler(proxy.handler)) {
+      return isStaticallyProvenNotToModifyJson(proxy.target, sourceFile, visited);
+    }
+    return false;
   }
 
   // Object literal expression: verify every property
@@ -567,17 +953,51 @@ function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
         node.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
         (node.operatorToken.kind >= ts.SyntaxKind.FirstCompoundAssignment &&
           node.operatorToken.kind <= ts.SyntaxKind.LastCompoundAssignment);
-      if (isAssign && referencesJsonTarget(node.left)) {
-        shadowedOrOverridden = true;
-        return;
+      if (isAssign) {
+        if (referencesJsonTarget(node.left, sourceFile)) {
+          shadowedOrOverridden = true;
+          return;
+        }
+        if (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left)) {
+          const propName = getAccessedPropertyName(node.left);
+          if (propName === "JSON" || !propName) {
+            const objProxy = resolveProxy(node.left.expression, sourceFile);
+            if (objProxy.isProxy) {
+              const isTransparent = isTransparentProxyHandler(objProxy.handler);
+              const isProvenLocal = objProxy.target
+                ? isStaticallyProvenLocalNonGlobalObject(objProxy.target, sourceFile)
+                : false;
+              if (!isProvenLocal || !isTransparent) {
+                shadowedOrOverridden = true;
+                return;
+              }
+            }
+          }
+        }
       }
     }
 
     // 7. Delete expressions: delete JSON.stringify, delete globalThis["JSON"], delete window.JSON
     if (ts.isDeleteExpression(node)) {
-      if (referencesJsonTarget(node.expression)) {
+      if (referencesJsonTarget(node.expression, sourceFile)) {
         shadowedOrOverridden = true;
         return;
+      }
+      if (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression)) {
+        const propName = getAccessedPropertyName(node.expression);
+        if (propName === "JSON" || !propName) {
+          const objProxy = resolveProxy(node.expression.expression, sourceFile);
+          if (objProxy.isProxy) {
+            const isTransparent = isTransparentProxyHandler(objProxy.handler);
+            const isProvenLocal = objProxy.target
+              ? isStaticallyProvenLocalNonGlobalObject(objProxy.target, sourceFile)
+              : false;
+            if (!isProvenLocal || !isTransparent) {
+              shadowedOrOverridden = true;
+              return;
+            }
+          }
+        }
       }
     }
 
@@ -595,8 +1015,8 @@ function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
         const calleeObj = getUnwrappedExpression(callee.expression);
         const isObjectOrReflect =
           (ts.isIdentifier(calleeObj) && (calleeObj.text === "Object" || calleeObj.text === "Reflect")) ||
-          isGlobalPropertyAccess(calleeObj, "Object") ||
-          isGlobalPropertyAccess(calleeObj, "Reflect");
+          isGlobalPropertyAccess(calleeObj, "Object", sourceFile) ||
+          isGlobalPropertyAccess(calleeObj, "Reflect", sourceFile);
 
         if (
           isObjectOrReflect &&
@@ -613,7 +1033,7 @@ function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
               return;
             }
 
-            // Target is a global root (globalThis, window, global, self)
+            // Target is a global root (globalThis, window, global, self, or Proxy wrapping one)
             if (isGlobalObject(firstArg, sourceFile)) {
               if (calleeProp === "defineProperty" || calleeProp === "set") {
                 const secondArg = node.arguments[1];
@@ -642,6 +1062,41 @@ function hasJsonShadowOrOverride(sourceFile: ts.SourceFile): boolean {
                   if (!isStaticallyProvenNotToModifyJson(exprToCheck, sourceFile)) {
                     shadowedOrOverridden = true;
                     return;
+                  }
+                }
+              }
+            }
+
+            // Target is a Proxy whose target or mutation behavior cannot be established safely
+            const proxy = resolveProxy(firstArg, sourceFile);
+            if (proxy.isProxy) {
+              const isTransparent = isTransparentProxyHandler(proxy.handler);
+              const isProvenLocalObject = proxy.target
+                ? isStaticallyProvenLocalNonGlobalObject(proxy.target, sourceFile)
+                : false;
+
+              // If proxy target is not a proven local object OR handler has traps/untrusted behavior
+              if (!isProvenLocalObject || !isTransparent) {
+                if (calleeProp === "defineProperty" || calleeProp === "set") {
+                  const secondArg = node.arguments[1];
+                  if (!secondArg || isPropertyNamed(secondArg, "JSON", sourceFile) || !isStaticNonJsonLiteral(secondArg, sourceFile)) {
+                    shadowedOrOverridden = true;
+                    return;
+                  }
+                } else if (calleeProp === "defineProperties") {
+                  const secondArg = node.arguments[1];
+                  if (!secondArg || !isStaticallyProvenNotToModifyJson(secondArg, sourceFile)) {
+                    shadowedOrOverridden = true;
+                    return;
+                  }
+                } else if (calleeProp === "assign") {
+                  const sourceArgs = node.arguments.slice(1);
+                  for (const sourceArg of sourceArgs) {
+                    const exprToCheck = ts.isSpreadElement(sourceArg) ? sourceArg.expression : sourceArg;
+                    if (!isStaticallyProvenNotToModifyJson(exprToCheck, sourceFile)) {
+                      shadowedOrOverridden = true;
+                      return;
+                    }
                   }
                 }
               }
@@ -954,7 +1409,7 @@ export async function generateRemediationPatch(params: {
   affectedFiles: string[];
   eligibility: ReturnType<typeof classifyRemediationEligibility>;
 }> {
-  const { finding, llmProvider, sourceContent } = params;
+  const { finding, llmProvider, sourceContent, commitSha } = params;
   const eligibility = classifyRemediationEligibility(finding);
 
   if (!eligibility.canAutoFix) {
@@ -1078,27 +1533,77 @@ export async function generateRemediationPatch(params: {
   }
 
   // 2. Dependency advisory automated bump (for non-eval findings)
-  if (finding.packageInfo != null) {
-    const pkg = finding.packageInfo as { name?: string; fixedVersion?: string; version?: string } | null;
-    const pkgName = pkg?.name || "dependency";
-    const oldVer = pkg?.version || "1.0.0";
-    const newVer = pkg?.fixedVersion || "1.0.1";
+  const isDependencyFinding =
+    finding.packageInfo != null ||
+    finding.scanner === "osv-scanner" ||
+    finding.category === "Dependencies" ||
+    finding.category === "vulnerability";
 
+  if (isDependencyFinding) {
+    const pkg = finding.packageInfo as { name?: string; fixedVersion?: string; version?: string; ecosystem?: string } | null;
+    const pkgName = pkg?.name;
+    const fixedVersion = resolveFindingFixedVersion(finding);
+
+    if (!pkgName || !fixedVersion) {
+      throw new Error(
+        `Cannot generate automated dependency patch: No confirmed fixed version available for ${pkgName || finding.title || "dependency"}. Manual review is required.`
+      );
+    }
+
+    if (!sourceContent || typeof sourceContent !== "string" || !sourceContent.trim()) {
+      throw new Error(
+        `Cannot generate automated patch for ${cleanFile}: Manifest source content is unavailable from scanned commit ${commitSha}. Manual review is required.`
+      );
+    }
+
+    const fileName = path.basename(cleanFile).toLowerCase();
+    const isPythonReq =
+      /requirements.*\.txt$/i.test(fileName) ||
+      fileName === "requirements.txt" ||
+      fileName === "requirements.in";
+    const isPackageJson = fileName === "package.json";
+
+    if (!isPythonReq && !isPackageJson) {
+      throw new Error(
+        `Automated patch generation is not supported for manifest format "${fileName}". Manual code review is required.`
+      );
+    }
+
+    let transformResult: ManifestTransformResult | null = null;
+    if (isPythonReq) {
+      transformResult = updatePythonRequirementsContent(sourceContent, pkgName, fixedVersion);
+    } else if (isPackageJson) {
+      transformResult = updatePackageJsonContent(sourceContent, pkgName, fixedVersion);
+    }
+
+    if (!transformResult) {
+      throw new Error(
+        `Cannot generate automated patch for ${cleanFile}: Dependency "${pkgName}" declaration was not found in manifest. Manual review is required.`
+      );
+    }
+
+    const lineNum = transformResult.lineIndex + 1;
     const diff = [
       `--- a/${cleanFile}`,
       `+++ b/${cleanFile}`,
-      `@@ -1,3 +1,3 @@`,
-      `-"${pkgName}": "${oldVer}"`,
-      `+"${pkgName}": "^${newVer}"`,
+      `@@ -${lineNum},1 +${lineNum},1 @@`,
+      `-${transformResult.oldLine}`,
+      `+${transformResult.newLine}`,
       "",
     ].join("\n");
 
     const validation = validateUnifiedDiff(diff);
     if (!validation.valid) throw new Error(validation.error);
 
+    // Verify patch applies cleanly to sourceContent
+    const applied = applyUnifiedDiffString(sourceContent, diff);
+    if (applied !== transformResult.updatedContent) {
+      throw new Error(`Patch verification failed: diff does not apply cleanly to ${cleanFile}. Manual review is required.`);
+    }
+
     return {
       unifiedDiff: diff,
-      patchSummary: `Bump ${pkgName} from ${oldVer} to secure patched release ${newVer}`,
+      patchSummary: `Bump ${pkgName} from ${transformResult.oldVersion || pkg?.version || "current version"} to secure release ${fixedVersion} in ${cleanFile}`,
       affectedFiles: validation.affectedFiles,
       eligibility,
     };

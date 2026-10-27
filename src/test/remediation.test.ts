@@ -1,6 +1,13 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { validateUnifiedDiff, generateRemediationPatch, verifyJsonSourceProof } from "@/server/remediation/patch";
-import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
+import {
+  validateUnifiedDiff,
+  generateRemediationPatch,
+  verifyJsonSourceProof,
+  updatePythonRequirementsContent,
+  updatePackageJsonContent,
+  applyUnifiedDiffString,
+} from "@/server/remediation/patch";
+import { classifyRemediationEligibility, resolveFindingFixedVersion } from "@/lib/remediation-eligibility";
 import { InMemoryJobStore } from "@/test/mock-store";
 import {
   createPreview,
@@ -11,7 +18,8 @@ import {
 import { createRemediationPullRequest } from "@/server/remediation/github-pr";
 import type { LlmProvider } from "@/server/ai/client";
 import type { FindingRecord, JobRecord } from "@/server/job-store";
-import type { NormalizedFinding } from "@/server/scanners/types";
+import type { NormalizedFinding, ScanEngineResult } from "@/server/scanners/types";
+import { toPublicFinding } from "@/server/api";
 
 function makeFinding(overrides: Partial<NormalizedFinding> = {}): NormalizedFinding {
   return {
@@ -2464,4 +2472,300 @@ export function getSafeComputedNonJsonConfig() {
       });
     });
   });
+
+  describe("8. Manifest-Aware Dependency Auto-Fix & OSV Fixed Version Suite (Phase 3)", () => {
+    it("consistently resolves OSV fixed version across metadata and packageInfo", () => {
+      // 1. Fixed version in packageInfo
+      const findingWithPkgInfo = makeFinding({
+        category: "Dependencies",
+        scanner: "osv-scanner",
+        filePath: "backend/requirements.txt",
+        packageInfo: { name: "pytest", version: "7.1.0", fixedVersion: "7.4.4" },
+      });
+      expect(resolveFindingFixedVersion(findingWithPkgInfo)).toBe("7.4.4");
+      const elig1 = classifyRemediationEligibility(findingWithPkgInfo);
+      expect(elig1.canAutoFix).toBe(true);
+      expect(elig1.eligibility).toBe("potentially_breaking");
+
+      // 2. Fixed version in metadata (legacy OSV output)
+      const findingWithMetadata = makeFinding({
+        category: "Dependencies",
+        scanner: "osv-scanner",
+        filePath: "backend/requirements.txt",
+        packageInfo: { name: "pytest", version: "7.1.0" },
+        metadata: { fixedVersion: "7.4.4" },
+      });
+      expect(resolveFindingFixedVersion(findingWithMetadata)).toBe("7.4.4");
+      const elig2 = classifyRemediationEligibility(findingWithMetadata);
+      expect(elig2.canAutoFix).toBe(true);
+      expect(elig2.eligibility).toBe("potentially_breaking");
+
+      // 3. No fixed version
+      const unpatchedFinding = makeFinding({
+        category: "Dependencies",
+        scanner: "osv-scanner",
+        filePath: "backend/requirements.txt",
+        packageInfo: { name: "pytest", version: "7.1.0" },
+      });
+      expect(resolveFindingFixedVersion(unpatchedFinding)).toBeNull();
+      const elig3 = classifyRemediationEligibility(unpatchedFinding);
+      expect(elig3.canAutoFix).toBe(false);
+      expect(elig3.eligibility).toBe("unsuitable");
+      expect(elig3.reason).toMatch(/No upstream patched version/i);
+
+      // 4. Parity test: verify pytest finding projected to client via toPublicFinding produces identical classification
+      const storeRecord: FindingRecord = {
+        id: "find-pytest-parity",
+        scanJobId: "job-parity",
+        fingerprint: "fp-pytest-parity",
+        scanner: "osv-scanner",
+        ruleId: "GHSA-4567",
+        category: "Dependencies",
+        severity: "high",
+        originalSeverity: "HIGH",
+        title: "Pytest vulnerable",
+        description: "Vulnerable pytest package",
+        filePath: "backend/requirements.txt",
+        startLine: 2,
+        endLine: 2,
+        redactedEvidence: "pytest==7.1.0",
+        vulnerabilityId: "GHSA-4567",
+        remediation: "Upgrade pytest to 7.4.4",
+        packageInfo: { name: "pytest", version: "7.1.0", fixedVersion: "7.4.4", ecosystem: "PyPI" },
+        metadata: { fixedVersion: "7.4.4" },
+        aiExplanation: null,
+        createdAt: new Date(),
+      };
+
+      const serverClassification = classifyRemediationEligibility(storeRecord);
+      const publicFinding = toPublicFinding(storeRecord);
+      const clientClassification = classifyRemediationEligibility(publicFinding);
+
+      expect(serverClassification.canAutoFix).toBe(true);
+      expect(clientClassification.canAutoFix).toBe(true);
+      expect(clientClassification.eligibility).toBe("potentially_breaking");
+      expect(clientClassification).toEqual(serverClassification);
+    });
+
+    it("generates a valid Python requirements.txt patch for pytest without npm JSON syntax", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-owner",
+        repo: "test-repo",
+        repositoryUrl: "https://github.com/test-owner/test-repo",
+        expiresAt: new Date(Date.now() + 86400000),
+      });
+      await store.update(job.id, { commitSha: "sha-pytest-fixture-001" });
+
+      const initialRequirements = [
+        "flask==2.2.5",
+        "pytest==7.1.0",
+        "requests==2.31.0",
+        "",
+      ].join("\n");
+
+      const pytestFinding = makeFinding({
+        scanner: "osv-scanner",
+        ruleId: "osv:GHSA-4567",
+        category: "Dependencies",
+        severity: "high",
+        title: "Pytest vulnerable to improper temporary directory handling",
+        filePath: "backend/requirements.txt",
+        packageInfo: {
+          name: "pytest",
+          version: "7.1.0",
+          fixedVersion: "7.4.4",
+          ecosystem: "PyPI",
+        },
+        metadata: {
+          fixedVersion: "7.4.4",
+        },
+        fingerprint: "fp-pytest-001",
+      });
+
+      await store.saveFindings(job.id, [pytestFinding]);
+      const [savedPytest] = (await store.getFindings(job.id)).findings;
+
+      const sourceFiles: Record<string, string> = {
+        "backend/requirements.txt": initialRequirements,
+      };
+
+      const scanEngine = async (): Promise<ScanEngineResult> => {
+        // Mock scanner: once pytest is upgraded to 7.4.4, vulnerability is resolved
+        return {
+          status: "completed" as const,
+          findings: [],
+          gitleaksStatus: "completed",
+          gitleaksDurationMs: 5,
+          gitleaksError: null,
+          semgrepStatus: "completed",
+          semgrepDurationMs: 10,
+          semgrepError: null,
+          osvStatus: "completed",
+          osvDurationMs: 10,
+          osvError: null,
+          scannerVersions: { gitleaks: "8.18", semgrep: "1.182", osvScanner: "2.7" },
+          scanCoverage: { lockfilesFound: ["backend/requirements.txt"], scannersRun: ["osv-scanner"], limitations: [] },
+          counts: { critical: 0, high: 0, medium: 0, low: 0, info: 0, total: 0 },
+        };
+      };
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles,
+        scanEngine,
+      };
+
+      // 1. Preview generation
+      const preview = await createPreview(job.id, savedPytest.id, deps);
+      expect(preview.status).toBe("preview");
+      expect(preview.eligibility).toBe("potentially_breaking");
+      expect(preview.affectedFiles).toEqual(["backend/requirements.txt"]);
+
+      // Diff must contain valid Python requirements syntax and NOT npm JSON syntax
+      expect(preview.unifiedDiff).toContain("--- a/backend/requirements.txt");
+      expect(preview.unifiedDiff).toContain("+++ b/backend/requirements.txt");
+      expect(preview.unifiedDiff).toContain("-pytest==7.1.0");
+      expect(preview.unifiedDiff).toContain("+pytest==7.4.4");
+      expect(preview.unifiedDiff).not.toContain('"pytest":');
+      expect(preview.unifiedDiff).not.toContain('"1.0.1"');
+
+      // 2. Read-only preview: base source content is NOT mutated
+      expect(sourceFiles["backend/requirements.txt"]).toBe(initialRequirements);
+
+      // 3. Unapproved apply is rejected
+      await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toThrow(
+        /Explicit user approval is required/
+      );
+
+      // 4. User approves patch
+      const approved = await approveRemediation(job.id, preview.id, deps, "user-auditor");
+      expect(approved.status).toBe("approved");
+
+      // 5. Sandboxed execution applies patch and rescan verifies resolution
+      const verified = await applyAndVerify(job.id, preview.id, deps);
+      expect(verified.status).toBe("verified");
+      expect(verified.rescanStatus).toBe("verified");
+      expect(verified.rescanSummary?.targetResolved).toBe(true);
+      expect(verified.rescanSummary?.resolvedFingerprints).toContain("fp-pytest-001");
+      expect(verified.rescanSummary?.newFindingsCount).toBe(0);
+    });
+
+    it("preserves Python environment markers, extras, and comments during requirements patch", () => {
+      const manifest = [
+        "# Core dependencies",
+        "flask==2.2.5 # web framework",
+        "  pytest[testing] == 7.1.0 ; python_version >= '3.8' # test suite",
+        "requests==2.31.0",
+      ].join("\n");
+
+      const result = updatePythonRequirementsContent(manifest, "pytest", "7.4.4");
+      expect(result).not.toBeNull();
+      expect(result?.newLine).toBe("  pytest[testing] == 7.4.4 ; python_version >= '3.8' # test suite");
+      expect(result?.oldLine).toBe("  pytest[testing] == 7.1.0 ; python_version >= '3.8' # test suite");
+
+      const diff = [
+        "--- a/requirements.txt",
+        "+++ b/requirements.txt",
+        `@@ -${result!.lineIndex + 1},1 +${result!.lineIndex + 1},1 @@`,
+        `-${result!.oldLine}`,
+        `+${result!.newLine}`,
+        "",
+      ].join("\n");
+
+      const applied = applyUnifiedDiffString(manifest, diff);
+      expect(applied).toBe(result?.updatedContent);
+      expect(applied).toContain("pytest[testing] == 7.4.4 ; python_version >= '3.8' # test suite");
+    });
+
+    it("updates Node.js package.json preserving prefix and formatting", () => {
+      const pkgJson = JSON.stringify(
+        {
+          name: "test-app",
+          dependencies: {
+            express: "^4.18.2",
+            lodash: "^4.17.20",
+          },
+        },
+        null,
+        2
+      );
+
+      const result = updatePackageJsonContent(pkgJson, "lodash", "4.17.21");
+      expect(result).not.toBeNull();
+      expect(result?.newLine).toContain('"lodash": "^4.17.21"');
+      expect(result?.oldLine).toContain('"lodash": "^4.17.20"');
+      expect(result?.updatedContent).toContain('"lodash": "^4.17.21"');
+      expect(result?.updatedContent).toContain('"express": "^4.18.2"');
+    });
+
+    it("refuses auto-fixing with explicit manual-review reason when dependency is not declared in manifest", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-owner",
+        repo: "test-repo",
+        repositoryUrl: "https://github.com/test-owner/test-repo",
+        expiresAt: new Date(Date.now() + 86400000),
+      });
+      await store.update(job.id, { commitSha: "sha-dep-missing" });
+
+      const finding = makeFinding({
+        scanner: "osv-scanner",
+        ruleId: "osv:GHSA-9999",
+        category: "Dependencies",
+        filePath: "backend/requirements.txt",
+        packageInfo: { name: "urllib3", version: "1.26.4", fixedVersion: "1.26.5" },
+        metadata: { fixedVersion: "1.26.5" },
+      });
+
+      await store.saveFindings(job.id, [finding]);
+      const [savedFinding] = (await store.getFindings(job.id)).findings;
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles: {
+          "backend/requirements.txt": "requests==2.31.0\npytest==7.4.4\n",
+        },
+      };
+
+      const preview = await createPreview(job.id, savedFinding.id, deps);
+      expect(preview.unifiedDiff).toBe("");
+      expect(preview.eligibility).toBe("unsuitable");
+      expect(preview.eligibilityReason).toMatch(/not found in manifest/i);
+    });
+
+    it("refuses auto-fixing with explicit manual-review reason when manifest content is unavailable", async () => {
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-owner",
+        repo: "test-repo",
+        repositoryUrl: "https://github.com/test-owner/test-repo",
+        expiresAt: new Date(Date.now() + 86400000),
+      });
+      await store.update(job.id, { commitSha: "sha-no-source" });
+
+      const finding = makeFinding({
+        scanner: "osv-scanner",
+        ruleId: "osv:GHSA-pytest",
+        category: "Dependencies",
+        filePath: "backend/requirements.txt",
+        packageInfo: { name: "pytest", version: "7.1.0", fixedVersion: "7.4.4" },
+        metadata: { fixedVersion: "7.4.4" },
+      });
+
+      await store.saveFindings(job.id, [finding]);
+      const [savedFinding2] = (await store.getFindings(job.id)).findings;
+
+      const deps: RemediationDeps = {
+        store,
+        // No sourceFiles and no fetchImpl
+      };
+
+      const preview = await createPreview(job.id, savedFinding2.id, deps);
+      expect(preview.unifiedDiff).toBe("");
+      expect(preview.eligibility).toBe("unsuitable");
+      expect(preview.eligibilityReason).toMatch(/source content is unavailable/i);
+    });
+  });
 });
+

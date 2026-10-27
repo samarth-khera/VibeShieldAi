@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { FindingRecord } from "../job-store";
 import { redactEvidence, redactText } from "../scanners/redact";
 
-export const AI_PROMPT_VERSION = "2026.10.1";
+export const AI_PROMPT_VERSION = "2026.10.2";
 
 export const SYSTEM_PROMPT = `You are VibeShield AI's Senior Application Security Analyst.
 Your role is to analyze automated security findings (from Gitleaks, Semgrep, and OSV-Scanner) and provide clear, actionable explanations and remediation guidance for software engineers.

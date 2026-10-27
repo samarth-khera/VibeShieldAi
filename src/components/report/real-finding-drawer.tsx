@@ -62,10 +62,11 @@ export function RealFindingDrawer({
         ? {
             explanation: finding.aiExplanation.explanation,
             isCached: true,
-            model: finding.aiExplanation.model || "qwen3.5:4b-q4_K_M",
+            model: finding.aiExplanation.model || "configured AI provider",
           }
         : null)
     : null;
+
 
   const aiExplanation = activeAi?.explanation ?? null;
   const isCached = activeAi?.isCached ?? false;
@@ -261,7 +262,9 @@ export function RealFindingDrawer({
             {isExplaining && (
               <div className="mt-4 flex flex-col items-center justify-center rounded-lg border border-line bg-background/50 py-8 text-center">
                 <RefreshCw className="size-6 animate-spin text-accent" />
-                <p className="mt-3 text-xs font-medium text-foreground">Analyzing finding with local AI (Qwen 3.5)...</p>
+                <p className="mt-3 text-xs font-medium text-foreground">
+                  Analyzing finding with AI Security Analyst{modelUsed ? ` (${modelUsed})` : ""}...
+                </p>
                 <p className="mt-1 text-[11px] text-muted">
                   Grounding guidance in scanner evidence and evaluating exploitability prerequisites.
                 </p>
@@ -274,9 +277,9 @@ export function RealFindingDrawer({
                 <div className="flex items-start gap-3">
                   <HelpCircle className="size-5 shrink-0 text-muted" />
                   <div>
-                    <h4 className="text-xs font-semibold text-foreground">Local AI Unavailable</h4>
+                    <h4 className="text-xs font-semibold text-foreground">AI Security Analyst Unavailable</h4>
                     <p className="mt-1 text-xs leading-relaxed text-muted">
-                      Local AI inference via Ollama is currently offline or disabled on the server.
+                      The configured AI inference provider is currently offline or not configured on the server.
                       Automated scanner findings and static remediation remain fully accessible below.
                     </p>
                   </div>
@@ -290,14 +293,22 @@ export function RealFindingDrawer({
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex items-start gap-2.5">
                     <AlertTriangle className="size-4 shrink-0 text-sev-critical" />
-                    <p className="text-xs text-sev-critical leading-relaxed">{aiError}</p>
+                    <div>
+                      <p className="text-xs text-sev-critical leading-relaxed">{aiError}</p>
+                      <p className="mt-1 text-[11px] text-muted">
+                        Automated scanner findings and code evidence remain fully available.
+                      </p>
+                    </div>
                   </div>
-                  <button
-                    onClick={handleExplain}
-                    className="shrink-0 rounded border border-sev-critical/40 px-2.5 py-1 text-[11px] font-semibold text-sev-critical hover:bg-sev-critical/10"
-                  >
-                    Retry
-                  </button>
+                  {!aiError.toLowerCase().includes("quota") && (
+                    <button
+                      onClick={handleExplain}
+                      disabled={isExplaining}
+                      className="shrink-0 rounded border border-sev-critical/40 px-2.5 py-1 text-[11px] font-semibold text-sev-critical hover:bg-sev-critical/10 disabled:opacity-50"
+                    >
+                      Retry
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -308,7 +319,7 @@ export function RealFindingDrawer({
                 {/* Meta header (model & cache badge) */}
                 <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-muted">
                   <span className="flex items-center gap-1.5">
-                    <Terminal className="size-3 text-accent" /> {modelUsed || "qwen3.5:4b-q4_K_M"}
+                    <Terminal className="size-3 text-accent" /> {modelUsed || "configured AI provider"}
                   </span>
                   {isCached && (
                     <span className="inline-flex items-center gap-1 rounded bg-accent/10 px-2 py-0.5 text-accent font-semibold">
