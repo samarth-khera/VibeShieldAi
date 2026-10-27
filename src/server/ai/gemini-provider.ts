@@ -144,7 +144,8 @@ export class GeminiProvider implements LlmProvider {
     const maxAttempts = 2;
     let lastError: unknown = null;
 
-    const schema = params.responseSchema ?? (params.format === "json" ? AiExplanationJsonSchema : undefined);
+    const schema =
+      params.responseJsonSchema ?? params.responseSchema ?? (params.format === "json" ? AiExplanationJsonSchema : undefined);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -160,7 +161,6 @@ export class GeminiProvider implements LlmProvider {
             systemInstruction: params.system ? { parts: [{ text: params.system }] } : undefined,
             responseMimeType: params.format === "json" ? "application/json" : undefined,
             responseJsonSchema: schema,
-            responseSchema: schema,
             temperature: 0.1,
             maxOutputTokens: params.maxTokens ?? 1500,
           },

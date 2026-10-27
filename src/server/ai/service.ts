@@ -170,7 +170,7 @@ export async function explainFinding(
       system: SYSTEM_PROMPT,
       userPrompt,
       format: "json",
-      responseSchema: AiExplanationJsonSchema,
+      responseJsonSchema: AiExplanationJsonSchema,
       maxTokens:
         deps.maxTokens ??
         Number.parseInt(process.env.AI_MAX_OUTPUT_TOKENS || "1500", 10),

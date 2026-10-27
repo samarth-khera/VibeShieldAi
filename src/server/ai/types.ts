@@ -46,8 +46,7 @@ export const AiExplanationJsonSchema: Record<string, unknown> = {
       description: "Concrete remediation steps to resolve the finding.",
     },
     codeExample: {
-      type: "object",
-      nullable: true,
+      type: ["object", "null"],
       description: "Optional safe illustrative replacement code or unified diff.",
       properties: {
         language: { type: "string", description: "Programming language (e.g. typescript, python, javascript)." },

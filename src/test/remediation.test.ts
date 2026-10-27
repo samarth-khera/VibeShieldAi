@@ -19,6 +19,8 @@ import { createRemediationPullRequest } from "@/server/remediation/github-pr";
 import type { LlmProvider } from "@/server/ai/client";
 import type { FindingRecord, JobRecord } from "@/server/job-store";
 import type { NormalizedFinding, ScanEngineResult } from "@/server/scanners/types";
+import { runOsvScan } from "@/server/scanners/osv";
+import { runSubprocess } from "@/server/scanners/runner";
 import { toPublicFinding } from "@/server/api";
 
 function makeFinding(overrides: Partial<NormalizedFinding> = {}): NormalizedFinding {
@@ -2649,6 +2651,135 @@ export function getSafeComputedNonJsonConfig() {
       expect(verified.rescanSummary?.targetResolved).toBe(true);
       expect(verified.rescanSummary?.resolvedFingerprints).toContain("fp-pytest-001");
       expect(verified.rescanSummary?.newFindingsCount).toBe(0);
+    });
+
+    it("proves pytest vulnerability resolution with real OSV-Scanner binary and sandbox rescan", async () => {
+      // 1. Verify OSV-Scanner is available in this environment
+      const osvAvailable = await runSubprocess("osv-scanner", ["--version"], { cwd: process.cwd(), timeoutMs: 5000 })
+        .then((r) => r.exitCode === 0)
+        .catch(() => false);
+
+      if (!osvAvailable) {
+        console.warn("[BLOCKED/NOT TESTED] osv-scanner binary not available in environment; skipping scanner-backed test");
+        return;
+      }
+
+      // 2. Controlled fixture with vulnerable pytest declaration retaining markers and extras
+      const initialRequirements = [
+        "# Controlled fixture dependencies",
+        "pytest[testing]==7.1.0; python_version >= '3.8' # test runner",
+        "",
+      ].join("\n");
+
+      const fs = await import("node:fs/promises");
+      const os = await import("node:os");
+      const path = await import("node:path");
+
+      // Verify real scanner detects vulnerable pytest on initial manifest
+      const tmpFixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibe-osv-pre-"));
+      await fs.mkdir(path.join(tmpFixtureDir, "backend"), { recursive: true });
+      await fs.writeFile(path.join(tmpFixtureDir, "backend/requirements.txt"), initialRequirements);
+
+      const preScan = await runOsvScan(tmpFixtureDir);
+      await fs.rm(tmpFixtureDir, { recursive: true, force: true });
+
+      expect(preScan.status).toBe("completed");
+      const pytestFinding = preScan.findings.find(
+        (f) => f.packageInfo?.name?.toLowerCase() === "pytest" && f.packageInfo?.fixedVersion
+      );
+
+      expect(pytestFinding).toBeDefined();
+      const realFixedVersion = pytestFinding!.packageInfo!.fixedVersion!;
+      expect(realFixedVersion).toBe("9.0.3"); // Confirmed by official OSV PyPI advisory GHSA-6w46-j5rx-g56g
+
+      // 3. Set up store and job
+      const store = new InMemoryJobStore();
+      const job = await store.create({
+        owner: "test-owner",
+        repo: "test-repo",
+        repositoryUrl: "https://github.com/test-owner/test-repo",
+        expiresAt: new Date(Date.now() + 86400000),
+      });
+      await store.update(job.id, { commitSha: "sha-real-osv-001" });
+      await store.saveFindings(job.id, preScan.findings);
+      const { findings: savedFindings } = await store.getFindings(job.id);
+      const savedFinding = savedFindings.find(
+        (f) => f.fingerprint === pytestFinding!.fingerprint
+      )!;
+
+      const sourceFiles: Record<string, string> = {
+        "backend/requirements.txt": initialRequirements,
+      };
+
+      // Real OSV-Scanner rescan engine executing the actual binary against the patched workspace
+      const realScannerEngine = async (workspaceDir: string): Promise<ScanEngineResult> => {
+        const osvRes = await runOsvScan(workspaceDir);
+        return {
+          status: osvRes.status === "failed" ? "failed" : "completed",
+          findings: osvRes.findings,
+          gitleaksStatus: "completed",
+          gitleaksDurationMs: 0,
+          gitleaksError: null,
+          semgrepStatus: "completed",
+          semgrepDurationMs: 0,
+          semgrepError: null,
+          osvStatus: osvRes.status,
+          osvDurationMs: osvRes.durationMs,
+          osvError: osvRes.error ?? null,
+          scannerVersions: { gitleaks: "8.18", semgrep: "1.182", osvScanner: "2.7.0" },
+          scanCoverage: {
+            lockfilesFound: osvRes.coverage?.lockfilesFound ?? ["backend/requirements.txt"],
+            scannersRun: ["osv-scanner"],
+            limitations: [],
+          },
+          counts: {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            info: 0,
+            total: osvRes.findings.length,
+          },
+        };
+      };
+
+      const deps: RemediationDeps = {
+        store,
+        sourceFiles,
+        scanEngine: realScannerEngine,
+      };
+
+      // 4. Generate preview
+      const preview = await createPreview(job.id, savedFinding.id, deps);
+      expect(preview.status).toBe("preview");
+      expect(preview.eligibility).toBe("potentially_breaking");
+      expect(preview.affectedFiles).toEqual(["backend/requirements.txt"]);
+
+      // Diff must contain valid requirements.txt syntax with real fixed version and preserved extras/markers
+      expect(preview.unifiedDiff).toContain("-pytest[testing]==7.1.0; python_version >= '3.8' # test runner");
+      expect(preview.unifiedDiff).toContain(`+pytest[testing]==${realFixedVersion}; python_version >= '3.8' # test runner`);
+
+      // Read-only: base source not mutated
+      expect(sourceFiles["backend/requirements.txt"]).toBe(initialRequirements);
+
+      // 5. Unapproved apply is rejected
+      await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toThrow(
+        /Explicit user approval is required/
+      );
+
+      // 6. User approval
+      const approved = await approveRemediation(job.id, preview.id, deps, "sec-admin");
+      expect(approved.status).toBe("approved");
+
+      // 7. Apply patch in sandbox and execute REAL OSV-Scanner rescan
+      const verified = await applyAndVerify(job.id, preview.id, deps);
+      expect(verified.status).toBe("verified");
+      expect(verified.rescanStatus).toBe("verified");
+      expect(verified.rescanSummary?.targetResolved).toBe(true);
+      expect(verified.rescanSummary?.resolvedFingerprints).toContain(pytestFinding!.fingerprint);
+      expect(verified.rescanSummary?.newFindingsCount).toBe(0);
+      expect(verified.rescanSummary?.remainingFingerprints).toHaveLength(0);
+      expect(verified.rescanSummary?.postRescanFindingsCount).toBe(0);
     });
 
     it("preserves Python environment markers, extras, and comments during requirements patch", () => {

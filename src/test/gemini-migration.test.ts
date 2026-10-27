@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { GeminiProvider, isQuotaExhaustedError, redactSecrets, GeminiQuotaExceededError } from "../server/ai/gemini-provider";
+import {
+  GeminiProvider,
+  isQuotaExhaustedError,
+  redactSecrets,
+  GeminiQuotaExceededError,
+  GeminiTruncatedOutputError,
+} from "../server/ai/gemini-provider";
 import { checkAiQuotaAndCircuitBreaker } from "../server/ai/circuit-breaker";
 import { explainFinding } from "../server/ai/service";
 import { InMemoryJobStore } from "./mock-store";
@@ -113,9 +119,21 @@ describe("Phase 7: Production Gemini Migration & Zero-Billing Security Test Suit
       expect(capturedConfig).not.toBeNull();
       expect(capturedConfig!.responseMimeType).toBe("application/json");
       expect(capturedConfig!.responseJsonSchema).toBeDefined();
-      expect(capturedConfig!.responseSchema).toBeDefined();
-      expect((capturedConfig!.responseJsonSchema as { type?: string }).type).toBe("object");
-      expect((capturedConfig!.responseJsonSchema as { required?: string[] }).required).toContain("summary");
+      expect(capturedConfig!.responseSchema).toBeUndefined();
+
+      const schema = capturedConfig!.responseJsonSchema as {
+        type?: string;
+        required?: string[];
+        properties?: Record<string, { type?: unknown; nullable?: unknown }>;
+      };
+      expect(schema.type).toBe("object");
+      expect(schema.required).toContain("summary");
+      expect(schema.required).toContain("whyItMatters");
+      expect(schema.required).not.toContain("codeExample");
+
+      // Valid JSON Schema nullability: type is ["object", "null"], OpenAPI "nullable" keyword absent
+      expect(schema.properties?.codeExample?.type).toEqual(["object", "null"]);
+      expect(schema.properties?.codeExample?.nullable).toBeUndefined();
     });
   });
 
@@ -433,6 +451,171 @@ describe("Phase 7: Production Gemini Migration & Zero-Billing Security Test Suit
         expect(result.code).toBe("quota_exhausted");
         expect(result.message).toContain("upstream daily quota limits");
       }
+    });
+
+    it("produces safe diagnostics for truncation, schema failure, and timeout with correlation IDs", async () => {
+      const mockFinding: FindingRecord = {
+        id: "finding-gemini-diag",
+        scanJobId: "job-123",
+        fingerprint: "fp-gemini-diag",
+        scanner: "semgrep",
+        ruleId: "javascript.audit.eval",
+        category: "sast",
+        severity: "high",
+        originalSeverity: "high",
+        title: "Eval injection",
+        description: "Eval injection",
+        filePath: "src/eval.js",
+        startLine: 1,
+        endLine: 1,
+        redactedEvidence: "eval(x)",
+        vulnerabilityId: "CWE-95",
+        remediation: "Avoid eval",
+        packageInfo: null,
+        metadata: null,
+        aiExplanation: null,
+        createdAt: new Date(),
+      };
+      await mockStore.saveFindings("job-123", [mockFinding as never]);
+
+      // 1. Truncated output
+      const truncProvider = {
+        isConfigured: () => true,
+        getModelName: () => "gemini-2.5-flash",
+        generateText: vi.fn().mockRejectedValue(new GeminiTruncatedOutputError("output token limit exceeded")),
+      };
+      const truncRes = await explainFinding("job-123", "finding-gemini-diag", {
+        store: mockStore,
+        provider: truncProvider,
+      });
+      expect(truncRes.available).toBe(false);
+      if (!truncRes.available) {
+        expect(truncRes.code).toBe("output_truncated");
+        expect(truncRes.diagnostic?.category).toBe("output_truncated");
+        expect(truncRes.diagnostic?.correlationId).toBeDefined();
+      }
+
+      // 2. Schema validation failure
+      const invalidSchemaProvider = {
+        isConfigured: () => true,
+        getModelName: () => "gemini-2.5-flash",
+        generateText: vi.fn().mockResolvedValue(JSON.stringify({ summary: "too short" })),
+      };
+      const schemaRes = await explainFinding("job-123", "finding-gemini-diag", {
+        store: mockStore,
+        provider: invalidSchemaProvider,
+      });
+      expect(schemaRes.available).toBe(false);
+      if (!schemaRes.available) {
+        expect(schemaRes.code).toBe("schema_validation_failed");
+        expect(schemaRes.diagnostic?.category).toBe("schema_validation_failed");
+      }
+
+      // 3. Timeout
+      const timeoutProvider = {
+        isConfigured: () => true,
+        getModelName: () => "gemini-2.5-flash",
+        generateText: vi.fn().mockRejectedValue(new Error("Gemini AI inference request timed out after 30000ms.")),
+      };
+      const timeRes = await explainFinding("job-123", "finding-gemini-diag", {
+        store: mockStore,
+        provider: timeoutProvider,
+      });
+      expect(timeRes.available).toBe(false);
+      if (!timeRes.available) {
+        expect(timeRes.code).toBe("timeout");
+        expect(timeRes.diagnostic?.category).toBe("timeout");
+      }
+    });
+
+    it("returns cached explanation on repeat calls without invoking Gemini model", async () => {
+      const mockFinding: FindingRecord = {
+        id: "finding-gemini-cached",
+        scanJobId: "job-123",
+        fingerprint: "fp-gemini-cached",
+        scanner: "semgrep",
+        ruleId: "javascript.lang.security.audit.eval",
+        category: "sast",
+        severity: "high",
+        originalSeverity: "high",
+        title: "Dangerous eval() used",
+        description: "Executing arbitrary code via eval() is hazardous.",
+        filePath: "src/utils.js",
+        startLine: 12,
+        endLine: 12,
+        redactedEvidence: "eval(userInput);",
+        vulnerabilityId: "CWE-95",
+        remediation: "Use JSON.parse instead.",
+        packageInfo: null,
+        metadata: null,
+        aiExplanation: null,
+        createdAt: new Date(),
+      };
+      await mockStore.saveFindings("job-123", [mockFinding as never]);
+
+      const validJsonResponse = JSON.stringify({
+        summary: "Use of eval() introduces arbitrary code execution risks.",
+        whyItMatters: "Untrusted input executed by eval runs with application privileges.",
+        impact: "Remote code execution or sensitive data theft.",
+        exploitabilityConditions: "Attacker controls userInput argument.",
+        remediationSteps: ["Replace eval() with JSON.parse()"],
+        codeExample: null,
+        verificationSteps: ["Run test with malformed payload to verify safe rejection"],
+        uncertainties: [],
+        disclaimer: "Review before merging.",
+      });
+
+      const spyProvider = {
+        isConfigured: () => true,
+        getModelName: () => "gemini-2.5-flash",
+        generateText: vi.fn().mockResolvedValue(validJsonResponse),
+      };
+
+      // Call 1: uncached
+      const res1 = await explainFinding("job-123", "finding-gemini-cached", {
+        store: mockStore,
+        provider: spyProvider,
+      });
+      expect(res1.available).toBe(true);
+      if (res1.available) {
+        expect(res1.cached).toBe(false);
+      }
+      expect(spyProvider.generateText).toHaveBeenCalledTimes(1);
+
+      // Call 2: cached
+      const res2 = await explainFinding("job-123", "finding-gemini-cached", {
+        store: mockStore,
+        provider: spyProvider,
+      });
+      expect(res2.available).toBe(true);
+      if (res2.available) {
+        expect(res2.cached).toBe(true);
+      }
+      // Zero additional model calls!
+      expect(spyProvider.generateText).toHaveBeenCalledTimes(1);
+    });
+
+    it("verifies live Gemini provider request if GEMINI_API_KEY is available or gracefully marks skipped", async () => {
+      const apiKey = process.env.GEMINI_API_KEY?.trim();
+      if (!apiKey) {
+        // Transparent disclosure when running in an environment without live credentials
+        console.warn("[BLOCKED/NOT TESTED] GEMINI_API_KEY not set in local test environment; skipping live provider call");
+        return;
+      }
+
+      const liveProvider = new GeminiProvider({ apiKey });
+      expect(liveProvider.isConfigured()).toBe(true);
+
+      const raw = await liveProvider.generateText({
+        system: "You are an AI Security Analyst. Respond with valid JSON matching the schema.",
+        userPrompt: "Explain finding: eval(x) in src/test.js: line 5",
+        format: "json",
+      });
+
+      expect(typeof raw).toBe("string");
+      const parsed = JSON.parse(raw);
+      expect(parsed.summary).toBeDefined();
+      expect(parsed.whyItMatters).toBeDefined();
     });
   });
 });
