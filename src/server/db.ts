@@ -1,7 +1,13 @@
 import { Prisma, PrismaClient } from "@prisma/client";
+import type { ServerConfig } from "./config";
+import { countActiveHeavyWork, evaluateQuota, type QuotaCounts } from "./quota";
 import {
+  ACTIVE_STATUSES,
   newJobId,
   RETRYABLE_STATUSES,
+  STALE_JOB_PATCH,
+  type SlotReservation,
+  type VerificationReservation,
   type CreateJobWithQuotaResult,
   type FindingRecord,
   type FindingsFilter,
@@ -60,117 +66,65 @@ export const prismaJobStore: JobStore = {
     withDbRetry(() => prisma.scanJob.create({ data: { id: newJobId(), ...data } }) as Promise<JobRecord>),
 
   async createWithQuota(data: NewJob, config, now = new Date()): Promise<CreateJobWithQuotaResult> {
-    return withDbRetry(async () => {
-      return await prisma.$transaction(
-        async (tx) => {
-          // Lock key: 84239105 (VibeShield scan creation mutex).
-          // PostgreSQL advisory xact lock provides transaction-scoped mutual exclusion
-          // across all web instances/connections without blocking concurrent SELECT queries on ScanJob.
-          const txAny = tx as unknown as { $executeRaw?: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown> };
-          if (typeof txAny.$executeRaw === "function") {
-            await txAny.$executeRaw`SELECT pg_advisory_xact_lock(84239105)`;
-          }
+    return withHeavySlotLock(config, now, async (tx, active) => {
+      const counts: QuotaCounts = { active };
+      let limit = evaluateQuota(counts, config);
+      if (!limit.allowed) return { ok: false, rateLimit: limit };
 
-          const activeThreshold = new Date(now.getTime() - config.jobTimeoutMs);
-          const oneHourAgo = new Date(now.getTime() - 3600_000);
-          const oneDayAgo = new Date(now.getTime() - 86400_000);
+      if (data.clientIpHash) {
+        counts.ipHourly = await tx.scanJob.count({
+          where: { clientIpHash: data.clientIpHash, createdAt: { gte: new Date(now.getTime() - 3600_000) } },
+        });
+        limit = evaluateQuota(counts, config);
+        if (!limit.allowed) return { ok: false, rateLimit: limit };
 
-          // 1. Active scan concurrency check (1 active scan at a time)
-          const activeCount = await tx.scanJob.count({
-            where: {
-              status: { in: ["queued", "retrieving", "ready_for_scan", "scanning"] },
-              createdAt: { gte: activeThreshold },
-            },
-          });
+        counts.ipDaily = await tx.scanJob.count({
+          where: { clientIpHash: data.clientIpHash, createdAt: { gte: new Date(now.getTime() - 86400_000) } },
+        });
+        limit = evaluateQuota(counts, config);
+        if (!limit.allowed) return { ok: false, rateLimit: limit };
+      }
 
-          if (activeCount >= config.maxConcurrentHeavyScans) {
-            return {
-              ok: false,
-              rateLimit: {
-                allowed: false,
-                retryAfterSeconds: 60,
-                reason: "concurrency_limit" as const,
-                message:
-                  "A security scan is currently running. Free-tier quota allows 1 active scan at a time. Please retry in 1 minute.",
-              },
-            };
-          }
+      counts.globalDaily = await tx.scanJob.count({ where: { createdAt: { gte: new Date(now.getTime() - 86400_000) } } });
+      limit = evaluateQuota(counts, config);
+      if (!limit.allowed) return { ok: false, rateLimit: limit };
 
-          // 2. Per-IP hourly check
-          if (data.clientIpHash) {
-            const ipHourlyCount = await tx.scanJob.count({
-              where: {
-                clientIpHash: data.clientIpHash,
-                createdAt: { gte: oneHourAgo },
-              },
-            });
-
-            if (ipHourlyCount >= config.maxScansPerIpHourly) {
-              return {
-                ok: false,
-                rateLimit: {
-                  allowed: false,
-                  retryAfterSeconds: 1800,
-                  reason: "hourly_ip_limit" as const,
-                  message: `Free-tier quota: maximum ${config.maxScansPerIpHourly} scan submissions per client IP per hour reached.`,
-                },
-              };
-            }
-
-            // 3. Per-IP daily check
-            const ipDailyCount = await tx.scanJob.count({
-              where: {
-                clientIpHash: data.clientIpHash,
-                createdAt: { gte: oneDayAgo },
-              },
-            });
-
-            if (ipDailyCount >= config.maxScansPerIpDaily) {
-              return {
-                ok: false,
-                rateLimit: {
-                  allowed: false,
-                  retryAfterSeconds: 3600,
-                  reason: "daily_ip_limit" as const,
-                  message: `Free-tier quota: maximum ${config.maxScansPerIpDaily} scan submissions per client IP per day reached.`,
-                },
-              };
-            }
-          }
-
-          // 4. Global daily cap check
-          const globalDailyCount = await tx.scanJob.count({
-            where: {
-              createdAt: { gte: oneDayAgo },
-            },
-          });
-
-          if (globalDailyCount >= config.globalDailyScanCap) {
-            return {
-              ok: false,
-              rateLimit: {
-                allowed: false,
-                retryAfterSeconds: 7200,
-                reason: "global_daily_limit" as const,
-                message: `Global daily free-tier scan limit (${config.globalDailyScanCap} scans) reached. The queue resets in 24 hours.`,
-              },
-            };
-          }
-
-          // 5. Quota check passed: create scan job row atomically within this locked transaction
-          const id = newJobId();
-          const job = (await tx.scanJob.create({
-            data: { id, status: "queued", ...data },
-          })) as unknown as JobRecord;
-
-          return { ok: true, job };
-        },
-        {
-          timeout: 15000,
-          isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
-        },
-      );
+      // Created inside the locked transaction, so the next reservation counts this job.
+      const job = (await tx.scanJob.create({ data: { id: newJobId(), status: "queued", ...data } })) as unknown as JobRecord;
+      return { ok: true, job };
     });
+  },
+
+  async requeueWithQuota(id, from, maxAttempts, config, now = new Date()) {
+    return withHeavySlotLock(config, now, async (tx, active): Promise<SlotReservation> => {
+      const job = await tx.scanJob.findUnique({ where: { id }, select: { status: true, attempts: true } });
+      if (!job || !from.includes(job.status) || job.attempts >= maxAttempts) return { ok: false };
+
+      // A job that already holds a slot (e.g. ready_for_scan) keeps it rather than needing a second one.
+      const holdsSlot = ACTIVE_STATUSES.includes(job.status);
+      const limit = evaluateQuota({ active: holdsSlot ? active - 1 : active }, config);
+      if (!limit.allowed) return { ok: false, rateLimit: limit };
+
+      await tx.scanJob.update({
+        where: { id },
+        data: { status: "queued", failureCategory: null, errorMessage: null, completedAt: null, startedAt: null },
+      });
+      return { ok: true };
+    });
+  },
+
+  async transition(id, from, patch) {
+    return withDbRetry(async () => {
+      const r = await prisma.scanJob.updateMany({
+        where: { id, status: { in: [...from] } },
+        data: patch as Prisma.ScanJobUpdateManyMutationInput,
+      });
+      return r.count === 1;
+    });
+  },
+
+  async reapStale(now, timeoutMs) {
+    return withDbRetry(() => reapStaleWork(prisma, now, timeoutMs));
   },
 
   get: (id) =>
@@ -356,20 +310,105 @@ export const prismaJobStore: JobStore = {
     });
   },
 
+  async transitionRemediation(scanJobId, remediationId, from, patch) {
+    return withDbRetry(async () => {
+      const r = await prisma.remediation.updateMany({
+        where: { id: remediationId, scanJobId, status: { in: [...from] } },
+        data: remediationPatchData(patch) as Prisma.RemediationUpdateManyMutationInput,
+      });
+      if (r.count !== 1) return null;
+      const updated = await prisma.remediation.findUnique({ where: { id: remediationId } });
+      return updated as unknown as import("./remediation/types").RemediationRecord;
+    });
+  },
+
+  async beginRemediationVerification(scanJobId, remediationId, config, now = new Date()) {
+    return withHeavySlotLock(config, now, async (tx, active): Promise<VerificationReservation> => {
+      const limit = evaluateQuota({ active }, config);
+      if (!limit.allowed) return { ok: false, rateLimit: limit };
+
+      const r = await tx.remediation.updateMany({
+        where: { id: remediationId, scanJobId, status: "approved", approvedAt: { not: null } },
+        data: { status: "applied", rescanStatus: null, rescanSummary: Prisma.DbNull },
+      });
+      if (r.count !== 1) return { ok: false };
+      const remediation = await tx.remediation.findUnique({ where: { id: remediationId } });
+      return { ok: true, remediation: remediation as unknown as import("./remediation/types").RemediationRecord };
+    });
+  },
+
   async updateRemediation(scanJobId, remediationId, patch) {
     return withDbRetry(async () => {
       const updated = await prisma.remediation.update({
-        where: { id: remediationId },
-        data: {
-          ...patch,
-          findingFingerprints: patch.findingFingerprints ? (patch.findingFingerprints as Prisma.InputJsonValue) : undefined,
-          affectedFiles: patch.affectedFiles ? (patch.affectedFiles as Prisma.InputJsonValue) : undefined,
-          warnings: patch.warnings ? (patch.warnings as Prisma.InputJsonValue) : undefined,
-          approvedOperations: patch.approvedOperations ? (patch.approvedOperations as Prisma.InputJsonValue) : undefined,
-          rescanSummary: patch.rescanSummary ? (patch.rescanSummary as Prisma.InputJsonValue) : undefined,
-        } as Prisma.RemediationUpdateInput,
+        where: { id: remediationId, scanJobId },
+        data: remediationPatchData(patch) as Prisma.RemediationUpdateInput,
       });
       return updated as unknown as import("./remediation/types").RemediationRecord;
     });
   },
 };
+
+function remediationPatchData(patch: Partial<import("./remediation/types").RemediationRecord>) {
+  return {
+    ...patch,
+    findingFingerprints: patch.findingFingerprints ? (patch.findingFingerprints as Prisma.InputJsonValue) : undefined,
+    affectedFiles: patch.affectedFiles ? (patch.affectedFiles as Prisma.InputJsonValue) : undefined,
+    warnings: patch.warnings ? (patch.warnings as Prisma.InputJsonValue) : undefined,
+    approvedOperations: patch.approvedOperations ? (patch.approvedOperations as Prisma.InputJsonValue) : undefined,
+    rescanSummary: patch.rescanSummary ? (patch.rescanSummary as Prisma.InputJsonValue) : undefined,
+  };
+}
+
+type Tx = Prisma.TransactionClient;
+
+/** Fails scans and verifications that stopped reporting progress, so they release their worker slot. */
+async function reapStaleWork(client: Tx | PrismaClient, now: Date, timeoutMs: number): Promise<number> {
+  const staleBefore = new Date(now.getTime() - timeoutMs);
+  const scans = await client.scanJob.updateMany({
+    where: { status: { in: [...ACTIVE_STATUSES] }, updatedAt: { lt: staleBefore } },
+    data: { ...STALE_JOB_PATCH, completedAt: now },
+  });
+  const verifications = await client.remediation.updateMany({
+    where: { status: "applied", updatedAt: { lt: staleBefore } },
+    data: {
+      status: "failed",
+      rescanStatus: "failed",
+      rescanSummary: {
+        targetResolved: false,
+        originalFindingsCount: 0,
+        postRescanFindingsCount: 0,
+        newFindingsCount: 0,
+        resolvedFingerprints: [],
+        remainingFingerprints: [],
+        regressions: [],
+        reason: "verification_timeout",
+        detail: "The verification worker did not report a result in time. Nothing was verified.",
+      },
+    },
+  });
+  return scans.count + verifications.count;
+}
+
+/**
+ * Runs `fn` while holding the global heavy-work advisory lock (key 84239105) inside one transaction.
+ * Stale work is reaped first, then `fn` receives the number of slots in use. Because every slot
+ * reservation goes through this lock and commits before releasing it, concurrent requests cannot
+ * both observe a free slot.
+ */
+async function withHeavySlotLock<T>(
+  config: Pick<ServerConfig, "jobTimeoutMs">,
+  now: Date,
+  fn: (tx: Tx, activeSlots: number) => Promise<T>,
+): Promise<T> {
+  return withDbRetry(() =>
+    prisma.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(84239105)`;
+        await reapStaleWork(tx, now, config.jobTimeoutMs);
+        const active = await countActiveHeavyWork(tx, new Date(now.getTime() - config.jobTimeoutMs));
+        return fn(tx, active);
+      },
+      { timeout: 15000, isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
+    ),
+  );
+}

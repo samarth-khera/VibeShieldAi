@@ -126,7 +126,8 @@ export function RealFindingDrawer({
         if (res.code === "ai_not_configured") {
           setAiUnavailable(true);
         } else {
-          setAiError(res.message);
+          const ref = res.diagnostic?.correlationId;
+          setAiError(ref ? `${res.message} (reference ${ref}, ${res.diagnostic?.category ?? res.code})` : res.message);
         }
       }
     } catch (err: unknown) {

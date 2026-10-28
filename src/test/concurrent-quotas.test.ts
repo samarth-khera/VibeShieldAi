@@ -195,6 +195,11 @@ describe("Atomic Quota Reservation & Concurrency Hardening", () => {
       scanJob: {
         count: mockCount,
         create: mockCreate,
+        updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+      },
+      remediation: {
+        count: vi.fn().mockResolvedValue(0),
+        updateMany: vi.fn().mockResolvedValue({ count: 0 }),
       },
     };
 

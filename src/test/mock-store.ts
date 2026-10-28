@@ -1,5 +1,13 @@
+import type { ScanStatus } from "@prisma/client";
+import { evaluateQuota } from "@/server/quota";
+import type { RemediationRecord, RemediationStatus } from "@/server/remediation/types";
 import {
+  ACTIVE_STATUSES,
+  STALE_JOB_PATCH,
   newJobId,
+  type QuotaConfig,
+  type SlotReservation,
+  type VerificationReservation,
   type JobRecord,
   type JobStore,
   type NewJob,
@@ -8,111 +16,131 @@ import {
   type CreateJobWithQuotaResult,
 } from "@/server/job-store";
 import type { NormalizedFinding } from "@/server/scanners/types";
-import type { ServerConfig } from "@/server/config";
 
 export class InMemoryJobStore implements JobStore {
   private jobs = new Map<string, JobRecord>();
   private findings = new Map<string, FindingRecord[]>();
   private mutex = Promise.resolve();
+  private remediations = new Map<string, RemediationRecord[]>();
 
-  async createWithQuota(
-    data: NewJob,
-    config: Pick<
-      ServerConfig,
-      "maxScansPerIpHourly" | "maxScansPerIpDaily" | "globalDailyScanCap" | "maxConcurrentHeavyScans" | "jobTimeoutMs"
-    >,
-    now: Date = new Date(),
-  ): Promise<CreateJobWithQuotaResult> {
+  /** Serializes slot reservations exactly like the Postgres advisory lock does in production. */
+  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     let release: () => void;
     const nextMutex = new Promise<void>((resolve) => {
       release = resolve;
     });
     const currentMutex = this.mutex;
     this.mutex = nextMutex;
-
     await currentMutex;
     try {
-      const activeThreshold = new Date(now.getTime() - config.jobTimeoutMs);
-      const oneHourAgo = new Date(now.getTime() - 3600_000);
-      const oneDayAgo = new Date(now.getTime() - 86400_000);
-
-      let activeCount = 0;
-      let ipHourlyCount = 0;
-      let ipDailyCount = 0;
-      let globalDailyCount = 0;
-
-      for (const job of this.jobs.values()) {
-        const createdAt = job.createdAt;
-        if (
-          ["queued", "retrieving", "ready_for_scan", "scanning"].includes(job.status) &&
-          createdAt >= activeThreshold
-        ) {
-          activeCount++;
-        }
-        if (createdAt >= oneDayAgo) {
-          globalDailyCount++;
-          if (data.clientIpHash && job.clientIpHash === data.clientIpHash) {
-            ipDailyCount++;
-            if (createdAt >= oneHourAgo) {
-              ipHourlyCount++;
-            }
-          }
-        }
-      }
-
-      if (activeCount >= config.maxConcurrentHeavyScans) {
-        return {
-          ok: false,
-          rateLimit: {
-            allowed: false,
-            retryAfterSeconds: 60,
-            reason: "concurrency_limit",
-            message:
-              "A security scan is currently running. Free-tier quota allows 1 active scan at a time. Please retry in 1 minute.",
-          },
-        };
-      }
-
-      if (data.clientIpHash && ipHourlyCount >= config.maxScansPerIpHourly) {
-        return {
-          ok: false,
-          rateLimit: {
-            allowed: false,
-            retryAfterSeconds: 1800,
-            reason: "hourly_ip_limit",
-            message: `Free-tier quota: maximum ${config.maxScansPerIpHourly} scan submissions per client IP per hour reached.`,
-          },
-        };
-      }
-
-      if (data.clientIpHash && ipDailyCount >= config.maxScansPerIpDaily) {
-        return {
-          ok: false,
-          rateLimit: {
-            allowed: false,
-            retryAfterSeconds: 3600,
-            reason: "daily_ip_limit",
-            message: `Free-tier quota: maximum ${config.maxScansPerIpDaily} scan submissions per client IP per day reached.`,
-          },
-        };
-      }
-
-      if (globalDailyCount >= config.globalDailyScanCap) {
-        return {
-          ok: false,
-          rateLimit: {
-            allowed: false,
-            retryAfterSeconds: 7200,
-            reason: "global_daily_limit",
-            message: `Global daily free-tier scan limit (${config.globalDailyScanCap} scans) reached. The queue resets in 24 hours.`,
-          },
-        };
-      }
-
-      const job = await this.create(data);
-      return { ok: true, job };
+      return await fn();
     } finally {
       release!();
+    }
+  }
+
+  private activeSlots(now: Date, timeoutMs: number): number {
+    const since = new Date(now.getTime() - timeoutMs);
+    let active = 0;
+    for (const job of this.jobs.values()) {
+      if (ACTIVE_STATUSES.includes(job.status) && job.updatedAt >= since) active++;
+    }
+    for (const list of this.remediations.values()) {
+      for (const r of list) if (r.status === "applied" && r.updatedAt >= since) active++;
+    }
+    return active;
+  }
+
+  async createWithQuota(data: NewJob, config: QuotaConfig, now: Date = new Date()): Promise<CreateJobWithQuotaResult> {
+    return this.withLock(async () => {
+      await this.reapStale(now, config.jobTimeoutMs);
+      const oneHourAgo = new Date(now.getTime() - 3600_000);
+      const oneDayAgo = new Date(now.getTime() - 86400_000);
+      const counts = { active: this.activeSlots(now, config.jobTimeoutMs), ipHourly: 0, ipDaily: 0, globalDaily: 0 };
+
+      for (const job of this.jobs.values()) {
+        if (job.createdAt < oneDayAgo) continue;
+        counts.globalDaily++;
+        if (data.clientIpHash && job.clientIpHash === data.clientIpHash) {
+          counts.ipDaily++;
+          if (job.createdAt >= oneHourAgo) counts.ipHourly++;
+        }
+      }
+
+      const limit = evaluateQuota(data.clientIpHash ? counts : { active: counts.active, globalDaily: counts.globalDaily }, config);
+      if (!limit.allowed) return { ok: false, rateLimit: limit };
+      const job = await this.create(data);
+      return { ok: true, job };
+    });
+  }
+
+  async requeueWithQuota(
+    id: string,
+    from: readonly ScanStatus[],
+    maxAttempts: number,
+    config: QuotaConfig,
+    now: Date = new Date(),
+  ): Promise<SlotReservation> {
+    return this.withLock(async () => {
+      await this.reapStale(now, config.jobTimeoutMs);
+      const job = this.jobs.get(id);
+      if (!job || !from.includes(job.status) || job.attempts >= maxAttempts) return { ok: false };
+      const holdsSlot = ACTIVE_STATUSES.includes(job.status);
+      const active = this.activeSlots(now, config.jobTimeoutMs) - (holdsSlot ? 1 : 0);
+      const limit = evaluateQuota({ active }, config);
+      if (!limit.allowed) return { ok: false, rateLimit: limit };
+      Object.assign(job, { status: "queued", failureCategory: null, errorMessage: null, completedAt: null, startedAt: null, updatedAt: now });
+      return { ok: true };
+    });
+  }
+
+  async transition(id: string, from: readonly ScanStatus[], patch: JobPatch): Promise<boolean> {
+    const job = this.jobs.get(id);
+    if (!job || !from.includes(job.status)) return false;
+    Object.assign(job, patch, { updatedAt: new Date() });
+    return true;
+  }
+
+  async reapStale(now: Date, timeoutMs: number): Promise<number> {
+    const staleBefore = new Date(now.getTime() - timeoutMs);
+    let reaped = 0;
+    for (const job of this.jobs.values()) {
+      if (ACTIVE_STATUSES.includes(job.status) && job.updatedAt < staleBefore) {
+        Object.assign(job, STALE_JOB_PATCH, { completedAt: now, updatedAt: now });
+        reaped++;
+      }
+    }
+    for (const list of this.remediations.values()) {
+      for (const r of list) {
+        if (r.status === "applied" && r.updatedAt < staleBefore) {
+          Object.assign(r, {
+            status: "failed",
+            rescanStatus: "failed",
+            rescanSummary: {
+              targetResolved: false,
+              originalFindingsCount: 0,
+              postRescanFindingsCount: 0,
+              newFindingsCount: 0,
+              resolvedFingerprints: [],
+              remainingFingerprints: [],
+              regressions: [],
+              reason: "verification_timeout",
+            },
+            updatedAt: now,
+          });
+          reaped++;
+        }
+      }
+    }
+    return reaped;
+  }
+
+  /** Test helper: pretend a job or remediation last reported progress at `at`. */
+  backdate(id: string, at: Date): void {
+    const job = this.jobs.get(id);
+    if (job) job.updatedAt = at;
+    for (const list of this.remediations.values()) {
+      for (const r of list) if (r.id === id) r.updatedAt = at;
     }
   }
 
@@ -255,7 +283,7 @@ export class InMemoryJobStore implements JobStore {
     if (item) item.aiExplanation = aiExplanation;
   }
 
-  private remediations = new Map<string, import("@/server/remediation/types").RemediationRecord[]>();
+
 
   async createRemediation(data: import("@/server/remediation/types").NewRemediation) {
     const record: import("@/server/remediation/types").RemediationRecord = {
@@ -293,5 +321,37 @@ export class InMemoryJobStore implements JobStore {
     };
     list[index] = updated;
     return updated;
+  }
+
+  async transitionRemediation(
+    scanJobId: string,
+    remediationId: string,
+    from: readonly RemediationStatus[],
+    patch: Partial<RemediationRecord>,
+  ) {
+    const current = await this.getRemediation(scanJobId, remediationId);
+    if (!current || !from.includes(current.status)) return null;
+    return this.updateRemediation(scanJobId, remediationId, patch);
+  }
+
+  async beginRemediationVerification(
+    scanJobId: string,
+    remediationId: string,
+    config: QuotaConfig,
+    now: Date = new Date(),
+  ): Promise<VerificationReservation> {
+    return this.withLock(async () => {
+      await this.reapStale(now, config.jobTimeoutMs);
+      const limit = evaluateQuota({ active: this.activeSlots(now, config.jobTimeoutMs) }, config);
+      if (!limit.allowed) return { ok: false, rateLimit: limit };
+      const current = await this.getRemediation(scanJobId, remediationId);
+      if (!current || current.status !== "approved" || !current.approvedAt) return { ok: false };
+      const remediation = await this.updateRemediation(scanJobId, remediationId, {
+        status: "applied",
+        rescanStatus: null,
+        rescanSummary: null,
+      });
+      return { ok: true, remediation };
+    });
   }
 }

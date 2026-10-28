@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { log } from "../errors";
 import type { JobStore, FindingRecord } from "../job-store";
 import {
   AiExplanationSchema,
@@ -119,9 +120,14 @@ export async function explainFinding(
     timeoutMs?: number;
     maxTokens?: number;
     clientIpHash?: string;
+    /** Finding already loaded and scoped to `jobId` by the caller; skips a second database read. */
+    finding?: FindingRecord;
   }
 ): Promise<AiExplainResult> {
-  const finding: FindingRecord | null = await deps.store.getFinding(jobId, findingId).catch(() => null);
+  const finding: FindingRecord | null =
+    deps.finding && deps.finding.id === findingId && deps.finding.scanJobId === jobId
+      ? deps.finding
+      : await deps.store.getFinding(jobId, findingId).catch(() => null);
   if (!finding) {
     throw new Error("Finding not found");
   }
@@ -164,9 +170,11 @@ export async function explainFinding(
   // Not in cache: call provider
   const userPrompt = buildUserPrompt(finding);
   let rawText: string;
+  const tInference = Date.now();
 
   try {
     rawText = await provider.generateText({
+      correlationId,
       system: SYSTEM_PROMPT,
       userPrompt,
       format: "json",
@@ -179,6 +187,13 @@ export async function explainFinding(
         Number.parseInt(process.env.AI_REQUEST_TIMEOUT_MS || "30000", 10),
     });
   } catch (err: unknown) {
+    log("warn", "ai_explain_failed", {
+      correlationId,
+      jobId,
+      model: modelName,
+      inferenceMs: Date.now() - tInference,
+      quotaExhausted: isQuotaExhaustedError(err),
+    });
     if (isQuotaExhaustedError(err)) {
       await tripAiCircuitBreaker({
         reason: "quota_exhausted",
@@ -240,6 +255,7 @@ export async function explainFinding(
     };
   }
 
+  const inferenceMs = Date.now() - tInference;
   let parsedJson: unknown;
   try {
     const cleanJson = extractJson(rawText);
@@ -299,6 +315,14 @@ export async function explainFinding(
       success: true,
     }).catch(() => undefined);
   }
+
+  log("info", "ai_explain_completed", {
+    correlationId,
+    jobId,
+    model: modelName,
+    inferenceMs,
+    outputChars: rawText.length,
+  });
 
   return {
     available: true,

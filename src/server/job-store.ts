@@ -1,6 +1,9 @@
 import { randomBytes } from "node:crypto";
 import type { ScanStatus } from "@prisma/client";
 import type { NormalizedFinding } from "./scanners/types";
+import type { ServerConfig } from "./config";
+import type { RateLimitResult } from "./rate-limit";
+import type { NewRemediation, RemediationRecord, RemediationStatus } from "./remediation/types";
 
 export type FindingRecord = {
   id: string;
@@ -90,19 +93,51 @@ export type FindingsFilter = {
 
 export type CreateJobWithQuotaResult =
   | { ok: true; job: JobRecord }
-  | { ok: false; rateLimit: import("./rate-limit").RateLimitResult };
+  | { ok: false; rateLimit: RateLimitResult };
+
+export type QuotaConfig = Pick<
+  ServerConfig,
+  "maxScansPerIpHourly" | "maxScansPerIpDaily" | "globalDailyScanCap" | "maxConcurrentHeavyScans" | "jobTimeoutMs"
+>;
+
+/** Outcome of reserving one of the `maxConcurrentHeavyScans` slots. `rateLimit` is absent when the status did not allow it. */
+export type SlotReservation =
+  | { ok: true }
+  | { ok: false; rateLimit?: RateLimitResult };
+
+export type VerificationReservation =
+  | { ok: true; remediation: RemediationRecord }
+  | { ok: false; rateLimit?: RateLimitResult };
+
+/** Statuses that hold a heavy-work slot (scan dispatched or running). */
+export const ACTIVE_STATUSES: readonly ScanStatus[] = ["queued", "retrieving", "ready_for_scan", "scanning"];
+
+/** Sanitized state written when an active job stops reporting progress for longer than `jobTimeoutMs`. */
+export const STALE_JOB_PATCH = {
+  status: "failed",
+  failureCategory: "worker_timeout",
+  errorMessage: "The scan worker stopped reporting progress before finishing. Please retry the scan.",
+} as const;
 
 /** Persistence port. Implemented by Prisma in production and in-memory in tests. */
 export interface JobStore {
   create(data: NewJob): Promise<JobRecord>;
-  createWithQuota?(
-    data: NewJob,
-    config: Pick<
-      import("./config").ServerConfig,
-      "maxScansPerIpHourly" | "maxScansPerIpDaily" | "globalDailyScanCap" | "maxConcurrentHeavyScans" | "jobTimeoutMs"
-    >,
+  createWithQuota?(data: NewJob, config: QuotaConfig, now?: Date): Promise<CreateJobWithQuotaResult>;
+  /**
+   * Atomically re-queues an existing job (retry or explicit rescan) only if its status is in `from`,
+   * it has attempts left, and a heavy-work slot is free under the same lock as `createWithQuota`.
+   */
+  requeueWithQuota?(
+    id: string,
+    from: readonly ScanStatus[],
+    maxAttempts: number,
+    config: QuotaConfig,
     now?: Date,
-  ): Promise<CreateJobWithQuotaResult>;
+  ): Promise<SlotReservation>;
+  /** Moves a job from one of `from` to `patch.status` (or just applies `patch`). Returns false if it was not in `from`. */
+  transition(id: string, from: readonly ScanStatus[], patch: JobPatch): Promise<boolean>;
+  /** Fails active jobs and verifications whose last progress is older than `timeoutMs`. Returns the number reaped. */
+  reapStale(now: Date, timeoutMs: number): Promise<number>;
   get(id: string): Promise<JobRecord | null>;
   /** Atomically moves queued (or a stale `retrieving`) job to `retrieving`. Returns false if not claimable. */
   claim(id: string, staleBefore: Date): Promise<boolean>;
@@ -118,10 +153,27 @@ export interface JobStore {
   getFinding(jobId: string, findingId: string): Promise<FindingRecord | null>;
   saveFindingAiExplanation(jobId: string, findingId: string, aiExplanation: unknown): Promise<void>;
 
-  createRemediation(data: import("./remediation/types").NewRemediation): Promise<import("./remediation/types").RemediationRecord>;
-  getRemediation(scanJobId: string, remediationId: string): Promise<import("./remediation/types").RemediationRecord | null>;
-  listRemediations(scanJobId: string): Promise<import("./remediation/types").RemediationRecord[]>;
-  updateRemediation(scanJobId: string, remediationId: string, patch: Partial<import("./remediation/types").RemediationRecord>): Promise<import("./remediation/types").RemediationRecord>;
+  createRemediation(data: NewRemediation): Promise<RemediationRecord>;
+  getRemediation(scanJobId: string, remediationId: string): Promise<RemediationRecord | null>;
+  listRemediations(scanJobId: string): Promise<RemediationRecord[]>;
+  updateRemediation(scanJobId: string, remediationId: string, patch: Partial<RemediationRecord>): Promise<RemediationRecord>;
+  /** Applies `patch` only if the remediation's status is in `from`; returns null otherwise. */
+  transitionRemediation(
+    scanJobId: string,
+    remediationId: string,
+    from: readonly RemediationStatus[],
+    patch: Partial<RemediationRecord>,
+  ): Promise<RemediationRecord | null>;
+  /**
+   * Atomically moves an approved remediation to `applied` (verification pending) if a heavy-work
+   * slot is free, counting both active scans and in-flight verifications.
+   */
+  beginRemediationVerification?(
+    scanJobId: string,
+    remediationId: string,
+    config: QuotaConfig,
+    now?: Date,
+  ): Promise<VerificationReservation>;
 }
 
 /** 192 bits of CSPRNG output → 32 URL-safe chars. Unguessable; acts as the access capability. */

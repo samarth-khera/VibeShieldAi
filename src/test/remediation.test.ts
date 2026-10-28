@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   validateUnifiedDiff,
   generateRemediationPatch,
@@ -209,7 +209,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       });
       await store.update(testJob.id, {
         status: "completed",
-        commitSha: "sha-1234567890",
+        commitSha: "b6da814997f805087d933c7a36b32ac7e8559127",
         defaultBranch: "main",
       });
 
@@ -259,7 +259,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
 
       // Ensure job record is still intact
       const job = await store.get(testJob.id);
-      expect(job?.commitSha).toBe("sha-1234567890");
+      expect(job?.commitSha).toBe("b6da814997f805087d933c7a36b32ac7e8559127");
     });
 
     it("Auto-fix execution rejects unapproved patches (requires explicit user authorization)", async () => {
@@ -321,7 +321,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       });
       await store.update(job.id, {
         status: "completed",
-        commitSha: "sha-abc",
+        commitSha: "978bf64bb60c272d98db160f08c6f1a35c428cb0",
         defaultBranch: "main",
       });
 
@@ -345,7 +345,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         scanJobId: job.id,
         findingFingerprints: ["fp-eval-1"],
         affectedFiles: ["src/calc.ts"],
-        commitSha: "sha-abc",
+        commitSha: "978bf64bb60c272d98db160f08c6f1a35c428cb0",
         eligibility: "safe",
         eligibilityReason: "Localized safe fix",
         requiresRotation: false,
@@ -390,7 +390,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       });
       await store.update(job.id, {
         status: "completed",
-        commitSha: "sha-base-001",
+        commitSha: "1ce018972d914b2c2020b6760f2cf19d69bbc0d7",
         defaultBranch: "main",
       });
 
@@ -399,7 +399,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         scanJobId: job.id,
         findingFingerprints: ["fp-1"],
         affectedFiles: ["src/file.ts"],
-        commitSha: "sha-base-001",
+        commitSha: "1ce018972d914b2c2020b6760f2cf19d69bbc0d7",
         eligibility: "safe",
         eligibilityReason: "Safe patch",
         requiresRotation: false,
@@ -412,7 +412,9 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         pullRequestUrl: null,
       });
 
-      // Call without write token to test graceful fallback
+      // Call without write token to test graceful fallback; never let ambient credentials reach GitHub.
+      vi.stubEnv("GITHUB_TOKEN", "");
+      vi.stubEnv("GITHUB_WRITE_TOKEN", "");
       const result = await createRemediationPullRequest({
         owner: job.owner,
         repo: job.repo,
@@ -443,7 +445,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       });
       await store.update(job.id, {
         status: "completed",
-        commitSha: "sha-eval-001",
+        commitSha: "d826c48a412ac34642454fff1e6c06e96169e990",
         defaultBranch: "main",
       });
 
@@ -496,7 +498,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       });
       await store.update(job.id, {
         status: "completed",
-        commitSha: "sha-eval-001",
+        commitSha: "d826c48a412ac34642454fff1e6c06e96169e990",
         defaultBranch: "main",
       });
 
@@ -545,7 +547,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       });
       await store.update(job.id, {
         status: "completed",
-        commitSha: "sha-eval-001",
+        commitSha: "d826c48a412ac34642454fff1e6c06e96169e990",
         defaultBranch: "main",
       });
 
@@ -632,7 +634,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         generateRemediationPatch({
           finding: unknownFinding,
           scanJobId: "job-1",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
         })
       ).rejects.toThrow(/Cannot generate automated patch.*Manual code review is required/);
     });
@@ -654,7 +656,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         generateRemediationPatch({
           finding: arbitraryScriptFinding,
           scanJobId: "job-1",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
         })
       ).rejects.toThrow(/Cannot safely replace eval\(\) with JSON\.parse\(\) where arbitrary JavaScript execution semantics must be preserved/);
     });
@@ -669,7 +671,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       });
       await store.update(job.id, {
         status: "completed",
-        commitSha: "sha-eval-001",
+        commitSha: "d826c48a412ac34642454fff1e6c06e96169e990",
         defaultBranch: "main",
       });
 
@@ -744,7 +746,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         generateRemediationPatch({
           finding,
           scanJobId: "job-reg-1",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
         })
       ).rejects.toThrow(
         /Cannot safely replace eval\(\) with JSON\.parse\(\) where arbitrary JavaScript execution semantics must be preserved/
@@ -766,7 +768,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         generateRemediationPatch({
           finding,
           scanJobId: "job-reg-2",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
         })
       ).rejects.toThrow(
         /Cannot safely replace eval\(\) with JSON\.parse\(\) where arbitrary JavaScript execution semantics must be preserved/
@@ -788,7 +790,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         generateRemediationPatch({
           finding,
           scanJobId: "job-reg-3",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
         })
       ).rejects.toThrow(
         /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
@@ -816,7 +818,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       const patchResult = await generateRemediationPatch({
         finding: verifiedFinding,
         scanJobId: "job-reg-4",
-        commitSha: "sha-1",
+        commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
         sourceContent,
       });
 
@@ -843,7 +845,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       const idiomPatchResult = await generateRemediationPatch({
         finding: idiomFinding,
         scanJobId: "job-reg-4",
-        commitSha: "sha-1",
+        commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
         sourceContent: idiomSource,
       });
 
@@ -871,7 +873,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         generateRemediationPatch({
           finding,
           scanJobId: "job-bypass-1",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
           llmProvider: mockLlm,
         })
       ).rejects.toThrow(
@@ -903,7 +905,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         generateRemediationPatch({
           finding,
           scanJobId: "job-llm-call-1",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
           llmProvider: mockLlm,
         })
       ).rejects.toThrow();
@@ -924,7 +926,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         generateRemediationPatch({
           finding,
           scanJobId: "job-no-ctx",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
         })
       ).rejects.toThrow(
         /Cannot automatically replace eval\(\) with JSON\.parse\(\) without verified JSON source context/
@@ -955,7 +957,7 @@ export function executeUserPayload(rawData: string) {
         generateRemediationPatch({
           finding,
           scanJobId: "job-unrelated-ctx",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
           sourceContent: unrelatedSource,
         })
       ).rejects.toThrow(
@@ -986,7 +988,7 @@ export function executeUserPayload(rawData: string) {
       const patch = await generateRemediationPatch({
         finding,
         scanJobId: "job-unrelated-llm",
-        commitSha: "sha-1",
+        commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
         llmProvider: mockLlm,
       });
 
@@ -1005,7 +1007,7 @@ export function executeUserPayload(rawData: string) {
       });
       await store.update(job.id, {
         status: "completed",
-        commitSha: "sha-stale-001",
+        commitSha: "7f5068b388c2f799e4eed94853a4331f9c0defe2",
         defaultBranch: "main",
       });
 
@@ -1027,7 +1029,7 @@ export function executeUserPayload(rawData: string) {
         scanJobId: job.id,
         findingFingerprints: ["fp-eval-stale"],
         affectedFiles: ["src/config.ts"],
-        commitSha: "sha-stale-001",
+        commitSha: "7f5068b388c2f799e4eed94853a4331f9c0defe2",
         eligibility: "safe",
         eligibilityReason: "Localized safe fix",
         requiresRotation: false,
@@ -1065,9 +1067,12 @@ export function executeUserPayload(rawData: string) {
       };
 
       const result = await applyAndVerify(job.id, staleRem.id, deps);
-      expect(result.status).toBe("needs_review");
-      expect(result.rescanStatus).toBe("needs_review");
+      // A patch that does not apply to the scanned revision is an explicit failure, never a resolution.
+      expect(result.status).toBe("failed");
+      expect(result.rescanStatus).toBe("failed");
       expect(result.rescanSummary?.targetResolved).toBe(false);
+      expect(result.rescanSummary?.reason).toBe("patch_does_not_apply");
+      expect(result.rescanSummary?.resolvedFingerprints).toEqual([]);
     });
 
     it("case 6: an unapproved apply request is rejected", async () => {
@@ -1080,7 +1085,7 @@ export function executeUserPayload(rawData: string) {
       });
       await store.update(job.id, {
         status: "completed",
-        commitSha: "sha-001",
+        commitSha: "a79cd73d35dea77eaead8954951688d38f4fc45d",
         defaultBranch: "main",
       });
 
@@ -1121,7 +1126,7 @@ export function executeUserPayload(rawData: string) {
       });
       await store.update(job.id, {
         status: "completed",
-        commitSha: "sha-001",
+        commitSha: "a79cd73d35dea77eaead8954951688d38f4fc45d",
         defaultBranch: "main",
       });
 
@@ -1206,8 +1211,10 @@ export function executeUserPayload(rawData: string) {
         scanEngine: failingEngine,
       });
 
-      expect(failedRescanResult.status).toBe("needs_review");
+      expect(failedRescanResult.status).toBe("failed");
       expect(failedRescanResult.rescanStatus).toBe("failed");
+      expect(failedRescanResult.rescanSummary?.reason).toBe("scanner_failed");
+      expect(failedRescanResult.rescanSummary?.targetResolved).toBe(false);
     });
 
     it("regression: rejects nearby function with JSON-related name that passes arbitrary user-controlled script to eval()", async () => {
@@ -1230,7 +1237,7 @@ export function executeUserPayload(rawData: string) {
         generateRemediationPatch({
           finding,
           scanJobId: "job-misleading-fn",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
           sourceContent: misleadingFnSource,
         })
       ).rejects.toThrow(
@@ -1259,7 +1266,7 @@ export function executeUserPayload(rawData: string) {
         generateRemediationPatch({
           finding,
           scanJobId: "job-misleading-var",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
           sourceContent: misleadingVarSource,
         })
       ).rejects.toThrow(
@@ -1290,7 +1297,7 @@ export function executeUserPayload(rawData: string) {
         generateRemediationPatch({
           finding,
           scanJobId: "job-conflicting-flow",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
           sourceContent: conflictingFlowSource,
         })
       ).rejects.toThrow(
@@ -1318,7 +1325,7 @@ export function executeUserPayload(rawData: string) {
         generateRemediationPatch({
           finding,
           scanJobId: "job-ambiguous-ctx",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
           sourceContent: ambiguousSource,
         })
       ).rejects.toThrow(
@@ -1351,7 +1358,7 @@ export function executeUserPayload(rawData: string) {
           generateRemediationPatch({
             finding,
             scanJobId: "job-reproduced-bypass",
-            commitSha: "sha-repro-1",
+            commitSha: "dede029882a4ac6ef53646cf8df5b5bbe4f6366d",
             sourceContent: reproducedSource,
           })
         ).rejects.toThrow(
@@ -1405,7 +1412,7 @@ export function executeUserPayload(rawData: string) {
           generateRemediationPatch({
             finding,
             scanJobId: "job-destruct-param",
-            commitSha: "sha-1",
+            commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
             sourceContent: objDestructSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1439,7 +1446,7 @@ export function executeUserPayload(rawData: string) {
           generateRemediationPatch({
             finding,
             scanJobId: "job-post-assign",
-            commitSha: "sha-1",
+            commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
             sourceContent: postEvalAssignSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1479,7 +1486,7 @@ export function executeUserPayload(rawData: string) {
           generateRemediationPatch({
             finding,
             scanJobId: "job-shadowed",
-            commitSha: "sha-1",
+            commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
             sourceContent: shadowedBlockSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1524,7 +1531,7 @@ export function executeUserPayload(rawData: string) {
           generateRemediationPatch({
             finding,
             scanJobId: "job-multi-decl",
-            commitSha: "sha-1",
+            commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
             sourceContent: reassignSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1565,7 +1572,7 @@ function process() {
           generateRemediationPatch({
             finding,
             scanJobId: "job-external-scope",
-            commitSha: "sha-1",
+            commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
             sourceContent: externalScopeSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1592,7 +1599,7 @@ function process() {
         const patch1 = await generateRemediationPatch({
           finding: stringifyFinding,
           scanJobId: "job-valid-stringify",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
           sourceContent: validStringifySource,
         });
         expect(patch1.unifiedDiff).toContain("+  return JSON.parse(data);");
@@ -1618,7 +1625,7 @@ function process() {
         const patch2 = await generateRemediationPatch({
           finding: literalFinding,
           scanJobId: "job-valid-literal",
-          commitSha: "sha-1",
+          commitSha: "b710a299818728a4e4cb4851fca1607ae797a07b",
           sourceContent: validLiteralSource,
         });
         expect(patch2.unifiedDiff).toContain("+  return JSON.parse(data);");
@@ -1651,7 +1658,7 @@ export function getShadowedConfig() {
           generateRemediationPatch({
             finding: shadowedFinding,
             scanJobId: "job-shadowed-json",
-            commitSha: "sha-shadowed",
+            commitSha: "4ccc63d101e0252858875be307c6e50c71e3fe68",
             sourceContent: shadowedJsonSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1701,7 +1708,7 @@ export function getComputedGlobalThisConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-computed-globalthis",
-            commitSha: "sha-computed-1",
+            commitSha: "914e232a57a9f6175b7155dd128478a42f2944e2",
             sourceContent: computedGlobalThisSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1727,7 +1734,7 @@ export function getComputedWindowConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-computed-window",
-            commitSha: "sha-computed-2",
+            commitSha: "597df2956fbb5aa5a07daa3222aa351c65cda9ce",
             sourceContent: computedWindowSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1753,7 +1760,7 @@ export function getComputedGlobalConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-computed-global",
-            commitSha: "sha-computed-3",
+            commitSha: "8fbe68991b63bc048d15b8813f8431c83a71313b",
             sourceContent: computedGlobalSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1780,7 +1787,7 @@ export function getDefinePropConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-define-prop-globalthis",
-            commitSha: "sha-define-prop-1",
+            commitSha: "7667452d6fd28d88db387cd9e9f444f20c64a714",
             sourceContent: definePropGlobalThisSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1825,7 +1832,7 @@ export function getDefinePropertiesConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-define-props-globalthis",
-            commitSha: "sha-define-props-1",
+            commitSha: "00616282095b9b7cf31a1171327a584f38f10a4c",
             sourceContent: definePropertiesGlobalThisSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1861,7 +1868,7 @@ export function getAssignGlobalThisConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-assign-globalthis",
-            commitSha: "sha-assign-1",
+            commitSha: "f966442f9b129d272b933cb19ad855dd443c2da0",
             sourceContent: assignGlobalThisSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1906,7 +1913,7 @@ export function getReflectDefinePropConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-reflect-globalthis",
-            commitSha: "sha-reflect-1",
+            commitSha: "11530fd6b3d9d6c68b2c88465536e472a320e530",
             sourceContent: reflectDefinePropGlobalThisSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -1961,7 +1968,7 @@ export function getReflectSetConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-reflect-set-globalthis",
-            commitSha: "sha-reflect-set-1",
+            commitSha: "b1239da346b012cc13f11467d50b950c791ed01e",
             sourceContent: reflectSetGlobalThisSource,
             llmProvider: mockLlmForReflectSet,
           })
@@ -2071,7 +2078,7 @@ export function getIndirectAssignConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-indirect-assign",
-            commitSha: "sha-indirect-assign",
+            commitSha: "6bedaf20e5d1dd79caed680ca1d634977ad4cd02",
             sourceContent: indirectAssignGlobalThisSource,
             llmProvider: mockLlmForIndirectAssign,
           })
@@ -2136,7 +2143,7 @@ export function getIndirectDefinePropsConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-indirect-define-props",
-            commitSha: "sha-indirect-define-props",
+            commitSha: "36813142bf31cca3eea088f64d58f4683d32d5ab",
             sourceContent: indirectDefinePropertiesSource,
             llmProvider: mockLlmForIndirectDefineProps,
           })
@@ -2199,7 +2206,7 @@ export function getSpreadAssignConfig() {
               redactedEvidence: '  return eval("(" + data + ")");',
             }),
             scanJobId: "job-spread-assign",
-            commitSha: "sha-spread-assign",
+            commitSha: "f2a8df492b87efd051a482d45c1b1eab1e928165",
             sourceContent: spreadAssignSource,
             llmProvider: mockLlmForSpreadAssign,
           })
@@ -2280,7 +2287,7 @@ export function getSafeComputedNonJsonConfig() {
         const headerPatch = await generateRemediationPatch({
           finding: headerFinding,
           scanJobId: "job-header",
-          commitSha: "sha-header",
+          commitSha: "39c110af561d754551bebc5c20df780f94f43d09",
         });
         expect(headerPatch.eligibility.canAutoFix).toBe(true);
         expect(headerPatch.unifiedDiff).toContain("res.headers.set('X-Content-Type-Options', 'nosniff');");
@@ -2309,7 +2316,7 @@ export function getSafeComputedNonJsonConfig() {
           generateRemediationPatch({
             finding: malformedFinding,
             scanJobId: "job-malformed-syntax",
-            commitSha: "sha-malformed",
+            commitSha: "0d16892e4c33c8c3283e86af96a90bde3b887cbc",
             sourceContent: syntaxErrorSource,
           })
         ).rejects.toThrow(/Cannot automatically replace eval\(\) with JSON\.parse\(\)/);
@@ -2356,7 +2363,7 @@ export function getSafeComputedNonJsonConfig() {
         });
         await store.update(job.id, {
           status: "completed",
-          commitSha: "sha-e2e-fixture",
+          commitSha: "03d932328cb48710e459041d44c6e8ccac2e3d95",
           defaultBranch: "main",
         });
 
@@ -2430,7 +2437,7 @@ export function getSafeComputedNonJsonConfig() {
           generateRemediationPatch({
             finding: persistedBypass,
             scanJobId: job.id,
-            commitSha: "sha-e2e-fixture",
+            commitSha: "03d932328cb48710e459041d44c6e8ccac2e3d95",
             sourceContent: bypassSource,
           })
         ).rejects.toThrow(
@@ -2557,7 +2564,7 @@ export function getSafeComputedNonJsonConfig() {
         repositoryUrl: "https://github.com/test-owner/test-repo",
         expiresAt: new Date(Date.now() + 86400000),
       });
-      await store.update(job.id, { commitSha: "sha-pytest-fixture-001" });
+      await store.update(job.id, { status: "completed", commitSha: "0ab17293d0cd91dd0de67f78a876a12f9066f0cc" });
 
       const initialRequirements = [
         "flask==2.2.5",
@@ -2653,15 +2660,16 @@ export function getSafeComputedNonJsonConfig() {
       expect(verified.rescanSummary?.newFindingsCount).toBe(0);
     });
 
-    it("proves pytest vulnerability resolution with real OSV-Scanner binary and sandbox rescan", async () => {
+    it("proves pytest vulnerability resolution with real OSV-Scanner binary and sandbox rescan", async (ctx) => {
       // 1. Verify OSV-Scanner is available in this environment
       const osvAvailable = await runSubprocess("osv-scanner", ["--version"], { cwd: process.cwd(), timeoutMs: 5000 })
         .then((r) => r.exitCode === 0)
         .catch(() => false);
 
       if (!osvAvailable) {
-        console.warn("[BLOCKED/NOT TESTED] osv-scanner binary not available in environment; skipping scanner-backed test");
-        return;
+        // Reported as skipped (never as passed); `npm run test:scanners` makes this a failure instead.
+        if (process.env.REQUIRE_REAL_SCANNERS === "1") throw new Error("osv-scanner is required but not installed");
+        ctx.skip();
       }
 
       // 2. Controlled fixture with vulnerable pytest declaration retaining markers and extras
@@ -2700,7 +2708,7 @@ export function getSafeComputedNonJsonConfig() {
         repositoryUrl: "https://github.com/test-owner/test-repo",
         expiresAt: new Date(Date.now() + 86400000),
       });
-      await store.update(job.id, { commitSha: "sha-real-osv-001" });
+      await store.update(job.id, { status: "completed", commitSha: "776b42ead4e72e55ff90cb2bdc0ac63a6a55a2e0" });
       await store.saveFindings(job.id, preScan.findings);
       const { findings: savedFindings } = await store.getFindings(job.id);
       const savedFinding = savedFindings.find(
@@ -2838,7 +2846,7 @@ export function getSafeComputedNonJsonConfig() {
         repositoryUrl: "https://github.com/test-owner/test-repo",
         expiresAt: new Date(Date.now() + 86400000),
       });
-      await store.update(job.id, { commitSha: "sha-dep-missing" });
+      await store.update(job.id, { commitSha: "48d02bf682e591b1f2b85dea908fe1f412501664" });
 
       const finding = makeFinding({
         scanner: "osv-scanner",
@@ -2873,7 +2881,7 @@ export function getSafeComputedNonJsonConfig() {
         repositoryUrl: "https://github.com/test-owner/test-repo",
         expiresAt: new Date(Date.now() + 86400000),
       });
-      await store.update(job.id, { commitSha: "sha-no-source" });
+      await store.update(job.id, { commitSha: "b63bd3d9320b6eb0908bf9561cdf5a35fd65e947" });
 
       const finding = makeFinding({
         scanner: "osv-scanner",

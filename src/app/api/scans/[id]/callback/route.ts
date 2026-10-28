@@ -5,7 +5,7 @@ import { verifyCallbackSignature } from "@/server/callback-auth";
 import { redactText } from "@/server/scanners/redact";
 import { fail, ok } from "@/server/api";
 import { JOB_ID_RE } from "@/server/job-store";
-import { Prisma } from "@prisma/client";
+import { Prisma, type ScanStatus } from "@prisma/client";
 
 const MAX_CALLBACK_BYTES = 5 * 1024 * 1024; // 5 MB max body size
 
@@ -86,6 +86,62 @@ const CallbackPayloadSchema = z.object({
     .optional(),
 });
 
+const PROGRESS_PHASES = ["worker_started", "retrieving", "extracting", "scanning"] as const;
+
+/** Non-terminal heartbeat from the worker. Timestamps are ISO strings recorded on the runner. */
+const ProgressPayloadSchema = z.object({
+  type: z.literal("progress"),
+  jobId: z.string().max(32),
+  phase: z.enum(PROGRESS_PHASES),
+  at: z.string().max(40),
+  workflowRunId: z.string().max(100).optional(),
+  workflowRunUrl: z.string().max(300).optional(),
+  commitSha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
+  defaultBranch: z.string().max(255).optional(),
+});
+
+/** Job status for each phase, and the statuses a job may be in to move forward to it. */
+const PHASE_TRANSITIONS: Record<(typeof PROGRESS_PHASES)[number], { status: "queued" | "retrieving" | "scanning"; from: ScanStatus[] }> = {
+  worker_started: { status: "queued", from: ["queued"] },
+  retrieving: { status: "retrieving", from: ["queued"] },
+  extracting: { status: "retrieving", from: ["queued", "retrieving"] },
+  scanning: { status: "scanning", from: ["queued", "retrieving", "ready_for_scan"] },
+};
+
+/** Keeps heartbeat timestamps recorded earlier when the final payload replaces scan coverage. */
+function mergeProgress(existing: unknown, next: Record<string, unknown> | null | undefined) {
+  const earlier = (existing as { progress?: Record<string, unknown> } | null)?.progress;
+  if (!next) return earlier ? ({ progress: earlier } as Prisma.InputJsonValue) : Prisma.DbNull;
+  const later = (next.progress as Record<string, unknown> | undefined) ?? {};
+  return { ...next, progress: { ...earlier, ...later } } as Prisma.InputJsonValue;
+}
+
+async function handleProgress(id: string, payload: z.infer<typeof ProgressPayloadSchema>): Promise<Response> {
+  const job = await withDbRetry(() => prisma.scanJob.findUnique({ where: { id } }));
+  if (!job) return fail(404, "not_found", "Scan job not found.");
+
+  const step = PHASE_TRANSITIONS[payload.phase];
+  const previous = ((job.scanCoverage as { progress?: Record<string, string> } | null)?.progress ?? {}) as Record<string, string>;
+  const progress = { ...previous, phase: payload.phase, [`${payload.phase}At`]: payload.at };
+
+  // Forward-only: a late or replayed heartbeat can never move a job backwards or out of a final state.
+  const moved = await withDbRetry(() =>
+    prisma.scanJob.updateMany({
+      where: { id, status: { in: step.from } },
+      data: {
+        status: step.status,
+        startedAt: job.startedAt ?? new Date(),
+        workflowRunId: payload.workflowRunId ?? job.workflowRunId,
+        workflowRunUrl: payload.workflowRunUrl ?? job.workflowRunUrl,
+        commitSha: payload.commitSha ?? job.commitSha,
+        defaultBranch: payload.defaultBranch ?? job.defaultBranch,
+        scanCoverage: { ...((job.scanCoverage as object | null) ?? {}), progress } as Prisma.InputJsonValue,
+      },
+    }),
+  );
+  return ok({ accepted: moved.count === 1, phase: payload.phase });
+}
+
 export async function POST(
   req: Request,
   props: { params: Promise<{ id: string }> },
@@ -128,6 +184,13 @@ export async function POST(
     parsedJson = JSON.parse(rawBody);
   } catch {
     return fail(400, "invalid_json", "Callback body must be valid JSON.");
+  }
+
+  if ((parsedJson as { type?: unknown } | null)?.type === "progress") {
+    const progress = ProgressPayloadSchema.safeParse(parsedJson);
+    if (!progress.success) return fail(400, "validation_failed", "Progress payload does not match schema.");
+    if (progress.data.jobId !== id) return fail(400, "job_id_mismatch", "Payload job ID does not match route parameter.");
+    return handleProgress(id, progress.data);
   }
 
   const validation = CallbackPayloadSchema.safeParse(parsedJson);
@@ -246,7 +309,7 @@ export async function POST(
           osvError: payload.osvError ?? null,
 
           scannerVersions: (payload.scannerVersions ?? Prisma.DbNull) as Prisma.InputJsonValue,
-          scanCoverage: (payload.scanCoverage ?? Prisma.DbNull) as Prisma.InputJsonValue,
+          scanCoverage: mergeProgress(existingJob.scanCoverage, payload.scanCoverage),
 
           criticalCount: payload.counts?.critical ?? 0,
           highCount: payload.counts?.high ?? 0,

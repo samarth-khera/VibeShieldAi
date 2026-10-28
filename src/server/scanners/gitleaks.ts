@@ -28,12 +28,17 @@ export async function runGitleaksScan(
       {
         cwd: targetDir,
         timeoutMs: options?.timeoutMs ?? 60_000,
-        allowedExitCodes: [0, 1],
+        // With --exit-code 0 a non-zero exit only means Gitleaks itself failed (e.g. an unsupported
+        // subcommand on an old binary), which must never be reported as a clean scan.
+        allowedExitCodes: [0],
       },
     );
 
     const stdout = res.stdout.trim();
-    if (!stdout || stdout === "[]" || stdout === "null") {
+    if (!stdout) {
+      throw new Error("Gitleaks produced no JSON report.");
+    }
+    if (stdout === "[]" || stdout === "null") {
       return {
         scanner: "gitleaks",
         status: "completed",

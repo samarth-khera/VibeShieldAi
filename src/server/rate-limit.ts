@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import type IORedis from "ioredis";
-import type { PrismaClient } from "@prisma/client";
 import type { ServerConfig } from "./config";
 import { withDbRetry } from "./db";
+import { countActiveHeavyWork, evaluateQuota, type QuotaClient, type QuotaCounts, type QuotaLimits } from "./quota";
+
+export { countActiveHeavyWork, evaluateQuota, type QuotaCounts } from "./quota";
 
 export type RateLimitResult = {
   allowed: boolean;
@@ -66,92 +68,37 @@ export async function checkRateLimit(
 }
 
 /**
- * Checks free-tier database quotas and global concurrency limits (Rule 8).
- * Powered entirely by PostgreSQL (Neon Free), eliminating Redis dependency in serverless production.
+ * Fast, unlocked pre-check of free-tier quotas (Rule 8) so obviously over-quota requests are rejected
+ * before Turnstile and GitHub calls. The authoritative check runs again inside `createWithQuota`.
  */
 export async function checkDatabaseQuotas(
-  prismaClient: Pick<PrismaClient, "scanJob">,
+  prismaClient: QuotaClient,
   ipHash: string,
-  config: Pick<
-    ServerConfig,
-    "maxScansPerIpHourly" | "maxScansPerIpDaily" | "globalDailyScanCap" | "maxConcurrentHeavyScans" | "jobTimeoutMs"
-  >,
+  config: QuotaLimits & Pick<ServerConfig, "jobTimeoutMs">,
   now: Date = new Date(),
 ): Promise<RateLimitResult> {
   return withDbRetry(async () => {
-    const activeThreshold = new Date(now.getTime() - config.jobTimeoutMs);
-    const oneHourAgo = new Date(now.getTime() - 3600_000);
-    const oneDayAgo = new Date(now.getTime() - 86400_000);
+    const counts: QuotaCounts = {
+      active: await countActiveHeavyWork(prismaClient, new Date(now.getTime() - config.jobTimeoutMs)),
+    };
+    let result = evaluateQuota(counts, config);
+    if (!result.allowed) return result;
 
-    // 1. Check active heavy scan concurrency (Rule 8: 1 active scan at a time)
-    const activeCount = await prismaClient.scanJob.count({
-      where: {
-        status: { in: ["queued", "retrieving", "ready_for_scan", "scanning"] },
-        createdAt: { gte: activeThreshold },
-      },
+    counts.ipHourly = await prismaClient.scanJob.count({
+      where: { clientIpHash: ipHash, createdAt: { gte: new Date(now.getTime() - 3600_000) } },
     });
+    result = evaluateQuota(counts, config);
+    if (!result.allowed) return result;
 
-    if (activeCount >= config.maxConcurrentHeavyScans) {
-      return {
-        allowed: false,
-        retryAfterSeconds: 60,
-        reason: "concurrency_limit",
-        message:
-          "A security scan is currently running. Free-tier quota allows 1 active scan at a time. Please retry in 1 minute.",
-      };
-    }
-
-    // 2. Check per-IP hourly limit (Rule 8: 3 per IP per hour)
-    const ipHourlyCount = await prismaClient.scanJob.count({
-      where: {
-        clientIpHash: ipHash,
-        createdAt: { gte: oneHourAgo },
-      },
+    counts.ipDaily = await prismaClient.scanJob.count({
+      where: { clientIpHash: ipHash, createdAt: { gte: new Date(now.getTime() - 86400_000) } },
     });
+    result = evaluateQuota(counts, config);
+    if (!result.allowed) return result;
 
-    if (ipHourlyCount >= config.maxScansPerIpHourly) {
-      return {
-        allowed: false,
-        retryAfterSeconds: 1800,
-        reason: "hourly_ip_limit",
-        message: `Free-tier quota: maximum ${config.maxScansPerIpHourly} scan submissions per client IP per hour reached.`,
-      };
-    }
-
-    // 3. Check per-IP daily limit (Rule 8: 5 per IP per day)
-    const ipDailyCount = await prismaClient.scanJob.count({
-      where: {
-        clientIpHash: ipHash,
-        createdAt: { gte: oneDayAgo },
-      },
+    counts.globalDaily = await prismaClient.scanJob.count({
+      where: { createdAt: { gte: new Date(now.getTime() - 86400_000) } },
     });
-
-    if (ipDailyCount >= config.maxScansPerIpDaily) {
-      return {
-        allowed: false,
-        retryAfterSeconds: 3600,
-        reason: "daily_ip_limit",
-        message: `Free-tier quota: maximum ${config.maxScansPerIpDaily} scan submissions per client IP per day reached.`,
-      };
-    }
-
-    // 4. Check global daily cap (Rule 8: 20 scans per day)
-    const globalDailyCount = await prismaClient.scanJob.count({
-      where: {
-        createdAt: { gte: oneDayAgo },
-      },
-    });
-
-    if (globalDailyCount >= config.globalDailyScanCap) {
-      return {
-        allowed: false,
-        retryAfterSeconds: 7200,
-        reason: "global_daily_limit",
-        message: `Global daily free-tier scan limit (${config.globalDailyScanCap} scans) reached. The queue resets in 24 hours.`,
-      };
-    }
-
-    return { allowed: true, retryAfterSeconds: 0 };
+    return evaluateQuota(counts, config);
   });
 }
-

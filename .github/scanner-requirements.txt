@@ -1,0 +1,3 @@
+# Semgrep version used by the scanner worker. Keep in sync with SEMGREP_VERSION in
+# .github/workflows/scanner-worker.yml; changing this file also rotates the tool cache key.
+semgrep==1.182.0

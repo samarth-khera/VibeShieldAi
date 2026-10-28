@@ -3,6 +3,8 @@ export type LlmMessageParams = {
   userPrompt: string;
   maxTokens?: number;
   timeoutMs?: number;
+  /** Request correlation ID for metadata-only logs. */
+  correlationId?: string;
   format?: "json";
   responseJsonSchema?: Record<string, unknown>;
   /** @deprecated use responseJsonSchema */

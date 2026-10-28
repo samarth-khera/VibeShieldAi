@@ -71,3 +71,8 @@ export function verifyCallbackSignature(
 
   return { valid: true, timestamp };
 }
+
+/** Canonical string the verification worker signs when requesting an approved remediation spec. */
+export function verificationSpecSigningPayload(scanJobId: string, remediationId: string): string {
+  return `verification-spec:${scanJobId}:${remediationId}`;
+}

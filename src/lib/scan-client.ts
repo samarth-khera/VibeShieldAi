@@ -86,6 +86,8 @@ export type PublicScanJob = {
       scanningMs?: number;
       callbackMs?: number;
     };
+    /** ISO timestamps reported by the worker as it moves through each phase. */
+    progress?: ScanProgress;
   } | null;
   summary?: {
     critical: number;
@@ -104,6 +106,14 @@ export type PublicScanJob = {
   startedAt?: string | null;
   completedAt: string | null;
   expiresAt: string;
+};
+
+export type ScanProgress = {
+  phase?: "worker_started" | "retrieving" | "extracting" | "scanning";
+  worker_startedAt?: string;
+  retrievingAt?: string;
+  extractingAt?: string;
+  scanningAt?: string;
 };
 
 export const TERMINAL_STATUSES: ReadonlySet<ScanStatus> = new Set([
@@ -223,6 +233,8 @@ export type AiExplainResult =
       available: false;
       code: string;
       message: string;
+      /** Safe diagnostics: matches the server's structured log line for this request. */
+      diagnostic?: { correlationId?: string; category?: string };
     };
 
 export const explainFindingWithAi = (id: string, findingId: string) =>
@@ -254,6 +266,13 @@ export type PublicRemediation = {
     resolvedFingerprints: string[];
     remainingFingerprints: string[];
     regressions: string[];
+    reason?: string;
+    detail?: string;
+    scannerStatuses?: { gitleaks: string; semgrep: string; osvScanner: string };
+    timings?: Record<string, number | undefined>;
+    runtime?: "github-actions" | "local";
+    snapshot?: { commitSha: string; fileCount: number };
+    workflowRunUrl?: string;
   } | null;
   branchName: string | null;
   pullRequestUrl: string | null;

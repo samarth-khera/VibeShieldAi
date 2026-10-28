@@ -29,10 +29,108 @@ import {
   type PublicScanJob,
 } from "@/lib/scan-client";
 import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
+import { useAdaptivePoll } from "@/lib/use-adaptive-poll";
 import { cn } from "@/lib/utils";
 import { RealFindingDrawer } from "./real-finding-drawer";
 
 type Severity = "critical" | "high" | "medium" | "low" | "info";
+const ACTIVE_SCAN_STATUSES: PublicScanJob["status"][] = ["queued", "retrieving", "scanning"];
+
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+  const s = ms / 1000;
+  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+}
+
+const between = (from?: string | null, to?: string | null) =>
+  from && to ? Math.max(0, Date.parse(to) - Date.parse(from)) : null;
+
+/** One line of real stage timings; queue wait is reported separately from active scan time. */
+function describeStageTimings(job: PublicScanJob): string {
+  const d = job.scanCoverage?.stageDurations ?? {};
+  const p = job.scanCoverage?.progress ?? {};
+  const parts: string[] = [];
+  const queue = between(job.createdAt, p.worker_startedAt);
+  const setup = between(p.worker_startedAt, p.retrievingAt);
+  if (queue != null) parts.push(`Queue wait ${formatMs(queue)}`);
+  if (setup != null) parts.push(`Runner setup ${formatMs(setup)}`);
+  parts.push(`Retrieval ${formatMs((d.metadataMs ?? 0) + (d.downloadMs ?? 0))}`);
+  parts.push(`Extraction ${formatMs(d.extractionMs ?? 0)}`);
+  const sc = job.scanners;
+  const perScanner = sc
+    ? ` (Gitleaks ${formatMs(sc.gitleaks.durationMs ?? 0)}, Semgrep ${formatMs(sc.semgrep.durationMs ?? 0)}, OSV ${formatMs(sc.osvScanner.durationMs ?? 0)})`
+    : "";
+  parts.push(`Scanning ${formatMs(d.scanningMs ?? 0)}${perScanner}`);
+  if (d.callbackMs) parts.push(`Callback ${formatMs(d.callbackMs)}`);
+  return parts.join(" · ");
+}
+
+function useNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
+
+const PHASES = [
+  { key: "queued", label: "Queued", title: "Queued — waiting for a GitHub Actions runner" },
+  { key: "worker_started", label: "Runner started", title: "Runner started — preparing scanners" },
+  { key: "retrieving", label: "Retrieving", title: "Retrieving repository metadata and archive" },
+  { key: "extracting", label: "Extracting", title: "Extracting repository snapshot" },
+  { key: "scanning", label: "Scanning", title: "Running Gitleaks, Semgrep, and OSV-Scanner" },
+] as const;
+
+function ScanProgressBanner({ job, repoName }: { job: PublicScanJob; repoName: string }) {
+  const now = useNow(1000);
+  const p = job.scanCoverage?.progress ?? {};
+  const reached: Record<string, string | undefined> = {
+    queued: job.createdAt,
+    worker_started: p.worker_startedAt,
+    retrieving: p.retrievingAt,
+    extracting: p.extractingAt,
+    scanning: p.scanningAt,
+  };
+  let current = 0;
+  PHASES.forEach((phase, i) => {
+    if (reached[phase.key]) current = i;
+  });
+  const created = Date.parse(job.createdAt);
+  const workerStarted = p.worker_startedAt ? Date.parse(p.worker_startedAt) : null;
+  const queueWait = (workerStarted ?? now) - created;
+
+  return (
+    <div className="mt-6 rounded-xl border border-accent/40 bg-accent/5 p-6 sm:p-8" role="status" aria-live="polite">
+      <div className="flex flex-col items-center justify-center gap-4 text-center">
+        <Loader2 className="size-8 animate-spin text-accent" aria-hidden />
+        <div>
+          <h2 className="font-display text-2xl font-bold">{PHASES[current].title}…</h2>
+          <p className="mt-1 font-mono text-xs text-muted">{repoName}</p>
+        </div>
+        <ol className="flex flex-wrap items-center justify-center gap-2 font-mono text-[11px]">
+          {PHASES.map((phase, i) => (
+            <li
+              key={phase.key}
+              className={cn(
+                "rounded-full border px-2.5 py-1",
+                i < current && "border-accent/40 text-accent",
+                i === current && "border-accent bg-accent/15 font-semibold text-accent",
+                i > current && "border-line text-muted",
+              )}
+            >
+              {phase.label}
+            </li>
+          ))}
+        </ol>
+        <p className="font-mono text-xs text-muted">
+          Queue wait {formatMs(queueWait)}
+          {workerStarted != null && ` · Worker active ${formatMs(now - workerStarted)}`}
+        </p>
+      </div>
+    </div>
+  );
+}
 const sevOrder: Severity[] = ["critical", "high", "medium", "low", "info"];
 
 export function RealReportView({ jobId }: { jobId: string }) {
@@ -66,25 +164,12 @@ export function RealReportView({ jobId }: { jobId: string }) {
     }
   }, [jobId]);
 
-  useEffect(() => {
-    let active = true;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    async function poll() {
-      const current = await loadData();
-      if (!active) return;
-      if (current && ["queued", "retrieving", "scanning"].includes(current.status)) {
-        timer = setTimeout(poll, 2000);
-      }
-    }
-
-    void poll();
-
-    return () => {
-      active = false;
-      if (timer) clearTimeout(timer);
-    };
+  // Findings are only fetched once the scan reaches a final state (see loadData).
+  const poll = useCallback(async () => {
+    const current = await loadData();
+    return Boolean(current && ACTIVE_SCAN_STATUSES.includes(current.status));
   }, [loadData]);
+  useAdaptivePoll(poll, true);
 
   const counts = useMemo(() => {
     const c: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
@@ -182,7 +267,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
     );
   }
 
-  const isScanning = ["queued", "retrieving", "scanning"].includes(job.status);
+  const isScanning = ACTIVE_SCAN_STATUSES.includes(job.status);
   const isCompletedWithWarnings = job.status === "completed_with_warnings";
   const repoName = `${job.repository.owner}/${job.repository.name}`;
 
@@ -195,29 +280,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
         </Link>
 
         {/* Live scanning progress banner if scan is still active */}
-        {isScanning && (
-          <div className="mt-6 rounded-xl border border-accent/40 bg-accent/5 p-6 sm:p-8">
-            <div className="flex flex-col items-center justify-center gap-4 text-center">
-              <Loader2 className="size-8 animate-spin text-accent" />
-              <div>
-                <h2 className="font-display text-2xl font-bold">
-                  {job.status === "scanning"
-                    ? "Running Security Scanners…"
-                    : job.status === "retrieving"
-                      ? "Downloading & Extracting Repository Snapshot…"
-                      : "Queued — Waiting for GitHub Actions Runner…"}
-                </h2>
-                <p className="mt-1 font-mono text-xs text-muted">
-                  {job.status === "scanning"
-                    ? `Scanning ${repoName} across Gitleaks secrets, Semgrep code rules, and OSV-Scanner dependencies.`
-                    : job.status === "retrieving"
-                      ? `Fetching repository snapshot and commit SHA for ${repoName}.`
-                      : `Job is queued in GitHub Actions. Waiting for an available runner (free-tier runner queue).`}
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
+        {isScanning && <ScanProgressBanner job={job} repoName={repoName} />}
 
         {/* Header */}
         <header className="mt-6 flex flex-col gap-6 rounded-xl border border-line-bright bg-surface p-6 sm:flex-row sm:items-start sm:justify-between sm:p-8">
@@ -330,10 +393,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
               <span>Engines: Gitleaks · Semgrep · OSV-Scanner</span>
             </div>
             {job.scanCoverage.stageDurations && (
-              <p className="mt-2 text-[11px] text-muted">
-                Pipeline Stages: Retrieval {(job.scanCoverage.stageDurations.metadataMs ?? 0) + (job.scanCoverage.stageDurations.downloadMs ?? 0) + (job.scanCoverage.stageDurations.extractionMs ?? 0)}ms · Scanning {job.scanCoverage.stageDurations.scanningMs ?? 0}ms
-                {job.scanCoverage.stageDurations.callbackMs ? ` · Callback ${job.scanCoverage.stageDurations.callbackMs}ms` : ""}
-              </p>
+              <p className="mt-2 text-[11px] text-muted">{describeStageTimings(job)}</p>
             )}
             {job.scanCoverage.limitations.length > 0 && (
               <p className="mt-2 text-[11px] text-sev-medium">

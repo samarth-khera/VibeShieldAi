@@ -3,6 +3,7 @@ export type RemediationEligibilityType = "safe" | "potentially_breaking" | "unsu
 export type RemediationStatus =
   | "preview"
   | "approved"
+  /** Approved patch handed to the verification worker; result pending. */
   | "applied"
   | "verified"
   | "needs_review"
@@ -17,6 +18,31 @@ export type RemediationEligibility = {
   warnings: string[];
 };
 
+export type VerificationFailureReason =
+  | "source_snapshot_unavailable"
+  | "commit_unknown"
+  | "patch_target_missing"
+  | "patch_tool_unavailable"
+  | "patch_does_not_apply"
+  | "scanner_failed"
+  | "target_not_resolved"
+  | "new_findings_introduced"
+  | "verification_timeout"
+  | "worker_failed";
+
+export type VerificationTimings = {
+  queueMs?: number;
+  specFetchMs?: number;
+  downloadMs?: number;
+  extractionMs?: number;
+  applyMs?: number;
+  scanMs?: number;
+  gitleaksMs?: number;
+  semgrepMs?: number;
+  osvMs?: number;
+  totalMs?: number;
+};
+
 export type RescanComparison = {
   targetResolved: boolean;
   originalFindingsCount: number;
@@ -25,6 +51,15 @@ export type RescanComparison = {
   resolvedFingerprints: string[];
   remainingFingerprints: string[];
   regressions: string[];
+  /** Why the result is not `verified`. Absent on success. */
+  reason?: VerificationFailureReason;
+  detail?: string;
+  scannerStatuses?: { gitleaks: string; semgrep: string; osvScanner: string };
+  timings?: VerificationTimings;
+  /** Where verification ran and what it ran against. */
+  runtime?: "github-actions" | "local";
+  snapshot?: { commitSha: string; fileCount: number };
+  workflowRunUrl?: string;
 };
 
 export type RemediationRecord = {

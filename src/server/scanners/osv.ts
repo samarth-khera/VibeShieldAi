@@ -161,17 +161,8 @@ export async function runOsvScan(
 
     const stdout = res.stdout.trim();
     if (!stdout) {
-      return {
-        scanner: "osv-scanner",
-        status: "completed",
-        durationMs: res.durationMs,
-        findings: [],
-        coverage: {
-          scanned: true,
-          lockfilesFound: [],
-          limitations: ["No supported dependency lockfiles were found in the repository."],
-        },
-      };
+      // `--format json` prints a report (possibly with no results) whenever the scan ran.
+      throw new Error("OSV-Scanner produced no JSON report.");
     }
 
     const jsonStart = stdout.indexOf("{");

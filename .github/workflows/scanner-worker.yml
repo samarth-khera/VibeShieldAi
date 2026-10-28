@@ -1,4 +1,5 @@
 name: VibeShield Security Scanner Worker
+run-name: VibeShield ${{ inputs.mode || 'scan' }} ${{ inputs.job_id }}
 
 on:
   workflow_dispatch:
@@ -15,11 +16,37 @@ on:
         description: 'Signed results callback endpoint'
         required: true
         type: string
+      mode:
+        description: 'scan, or verify an approved Auto-Fix remediation'
+        required: false
+        default: scan
+        type: choice
+        options: [scan, verify]
+      remediation_id:
+        description: 'Remediation ID (verify mode only). The diff itself is fetched from the signed API.'
+        required: false
+        default: ''
+        type: string
 
-# Free-tier concurrency limit (Rule 8: 1 active scan at a time)
+# One group per job/remediation instead of one global group: a shared group keeps a single pending
+# run and cancels older pending runs, which stranded their jobs. Bounded parallelism is enforced
+# before dispatch by the database slot reservation (MAX_CONCURRENT_HEAVY_SCANS).
 concurrency:
-  group: vibeshield-scanner-worker
+  group: vibeshield-${{ inputs.mode || 'scan' }}-${{ inputs.job_id }}-${{ inputs.remediation_id || 'none' }}
   cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: 8.30.1 # 8.18.x has no `dir` subcommand, so it silently scanned nothing
+  OSV_SCANNER_VERSION: 2.7.0
+  SEMGREP_VERSION: 1.182.0 # keep in sync with .github/scanner-requirements.txt
+  WORKER_MODE: ${{ inputs.mode || 'scan' }}
+  JOB_ID: ${{ inputs.job_id }}
+  REMEDIATION_ID: ${{ inputs.remediation_id }}
+  REPOSITORY_URL: ${{ inputs.repository_url }}
+  CALLBACK_URL: ${{ inputs.callback_url }}
 
 jobs:
   scan:
@@ -28,86 +55,75 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      - name: Record runner start
+        run: echo "RUNNER_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" >> "$GITHUB_ENV"
+
       - name: Checkout VibeShield AI
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Uses only Node built-ins, so it runs before any dependency is installed.
+      - name: Report worker started
+        env:
+          CALLBACK_SECRET: ${{ secrets.SCAN_CALLBACK_SECRET }}
+        run: node scripts/ci/post-worker-status.mjs started
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'npm'
 
       - name: Set up Python for Semgrep
+        id: py
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: pip
+          cache-dependency-path: .github/scanner-requirements.txt
 
-      - name: Cache Scanner Binaries
-        id: cache-scanner-binaries
+      # Runner-owned path: the cache action cannot restore into root-owned system directories.
+      # The key pins tool versions and the exact Python build the Semgrep venv links against.
+      - name: Restore scanner tool cache
         uses: actions/cache@v4
         with:
           path: |
-            /usr/local/bin/gitleaks
-            /usr/local/bin/osv-scanner
-          key: scanner-binaries-gitleaks-v8.18.2-osv-v2.7.0
+            ~/.vibeshield/bin
+            ~/.vibeshield/semgrep-venv
+          key: scanner-tools-v2-${{ runner.os }}-${{ runner.arch }}-py${{ steps.py.outputs.python-version }}-gitleaks${{ env.GITLEAKS_VERSION }}-osv${{ env.OSV_SCANNER_VERSION }}-${{ hashFiles('.github/scanner-requirements.txt', 'scripts/ci/install-scanners.sh') }}
 
-      - name: Install Scanner Binaries (Gitleaks, Semgrep, OSV-Scanner)
-        run: |
-          set -e
-          if [ ! -f /usr/local/bin/gitleaks ]; then
-            echo "Installing Gitleaks v8.18.2..."
-            curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz | sudo tar -xz -C /usr/local/bin gitleaks
-            sudo chmod +x /usr/local/bin/gitleaks
-          else
-            echo "Gitleaks restored from cache."
-          fi
+      # Verifies pinned SHA-256s on every run, so a stale or tampered cache entry is reinstalled.
+      - name: Install or verify scanners
+        run: bash scripts/ci/install-scanners.sh
 
-          echo "Installing Semgrep pinned version 1.182.0..."
-          pip install semgrep==1.182.0
+      # OSV-Scanner queries the live OSV API (always-current advisories). No offline database is
+      # cached: OSV runs in parallel with the slower Semgrep pass, so it is not on the critical path.
 
-          if [ ! -f /usr/local/bin/osv-scanner ]; then
-            echo "Installing OSV-Scanner v2.7.0..."
-            sudo curl -sSL https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
-            sudo chmod +x /usr/local/bin/osv-scanner
-          else
-            echo "OSV-Scanner restored from cache."
-          fi
-
-          echo "Verifying scanner versions:"
-          gitleaks version
-          semgrep --version
-          osv-scanner --version
-
-      - name: Get Date for OSV DB Cache
-        id: osv-date
-        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
-
-      - name: Cache OSV Vulnerability Database
+      # node_modules is produced only by `npm ci` from this exact lockfile; the key changes with it.
+      - name: Restore worker dependencies
+        id: node-modules
         uses: actions/cache@v4
         with:
-          path: ~/.cache/osv-scanner
-          key: osv-db-${{ runner.os }}-${{ steps.osv-date.outputs.date }}
-          restore-keys: |
-            osv-db-${{ runner.os }}-
+          path: node_modules
+          key: worker-node-modules-v1-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json') }}
 
-      - name: Pre-cache OSV Vulnerability Database
-        run: |
-          osv-scanner scan source --download-offline-databases . || osv-scanner --download-offline-databases || true
+      # --ignore-scripts: no third-party install scripts run, and the worker does not use Prisma.
+      - name: Install worker dependencies
+        if: steps.node-modules.outputs.cache-hit != 'true'
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
-      - name: Install NPM Dependencies
-        run: npm ci
+      - name: Report dependency cache status
+        run: echo "CACHE_STATUS node_modules=${{ steps.node-modules.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
 
-      - name: Generate Prisma Client
+      - name: Execute scanner worker
         env:
-          DATABASE_URL: "postgresql://dummy:dummy@localhost:5432/dummy"
-          DATABASE_URL_UNPOOLED: "postgresql://dummy:dummy@localhost:5432/dummy"
-        run: npx prisma generate
-
-      - name: Execute Scanner Worker Pipeline
-        env:
-          JOB_ID: ${{ github.event.inputs.job_id }}
-          REPOSITORY_URL: ${{ github.event.inputs.repository_url }}
-          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
           CALLBACK_SECRET: ${{ secrets.SCAN_CALLBACK_SECRET }}
-        run: npx tsx scripts/run-actions-worker.ts
+        run: npx --no-install tsx scripts/run-actions-worker.ts
+
+      # Ensures a job is never left pending when setup breaks or the run is cancelled. The API
+      # ignores this if the worker already reported a final result.
+      - name: Report failure or cancellation
+        if: failure() || cancelled()
+        env:
+          CALLBACK_SECRET: ${{ secrets.SCAN_CALLBACK_SECRET }}
+        run: node scripts/ci/post-worker-status.mjs failed worker_failed "The scanner worker failed or was cancelled before reporting a result."

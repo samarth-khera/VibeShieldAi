@@ -29,7 +29,50 @@ export async function dispatchScanJob(
     }
   }
 
-  // GitHub Actions Workflow Dispatch
+  const appUrl = config.appUrl.replace(/\/+$/, "");
+  return dispatchWorkflow(
+    {
+      mode: "scan",
+      job_id: jobId,
+      repository_url: repositoryUrl,
+      callback_url: `${appUrl}/api/scans/${encodeURIComponent(jobId)}/callback`,
+    },
+    config,
+    fetchImpl,
+  );
+}
+
+/**
+ * Starts the verification worker for an approved remediation. Only identifiers travel as workflow
+ * inputs: the worker fetches the approved diff and the commit SHA from the signed verification
+ * endpoint, so an arbitrary patch can never be injected through the workflow form.
+ */
+export async function dispatchRemediationVerification(
+  jobId: string,
+  remediationId: string,
+  repositoryUrl: string,
+  config: ServerConfig,
+  fetchImpl: typeof fetch = fetch,
+): Promise<DispatchResult> {
+  const appUrl = config.appUrl.replace(/\/+$/, "");
+  return dispatchWorkflow(
+    {
+      mode: "verify",
+      job_id: jobId,
+      remediation_id: remediationId,
+      repository_url: repositoryUrl,
+      callback_url: `${appUrl}/api/scans/${encodeURIComponent(jobId)}/remediation/${encodeURIComponent(remediationId)}/verification`,
+    },
+    config,
+    fetchImpl,
+  );
+}
+
+async function dispatchWorkflow(
+  inputs: Record<string, string>,
+  config: ServerConfig,
+  fetchImpl: typeof fetch,
+): Promise<DispatchResult> {
   if (!config.githubDispatchToken) {
     return {
       success: false,
@@ -37,18 +80,8 @@ export async function dispatchScanJob(
     };
   }
 
-  const cleanAppUrl = config.appUrl.replace(/\/+$/, "");
-  const callbackUrl = `${cleanAppUrl}/api/scans/${encodeURIComponent(jobId)}/callback`;
   const dispatchUrl = `https://api.github.com/repos/${config.githubRepository}/actions/workflows/scanner-worker.yml/dispatches`;
-
-  const payload = {
-    ref: config.githubWorkflowRef || "main",
-    inputs: {
-      job_id: jobId,
-      repository_url: repositoryUrl,
-      callback_url: callbackUrl,
-    },
-  };
+  const payload = { ref: config.githubWorkflowRef || "main", inputs };
 
   try {
     const res = await fetchImpl(dispatchUrl, {
@@ -71,7 +104,7 @@ export async function dispatchScanJob(
     return {
       success: false,
       statusCode: res.status,
-      error: `GitHub Actions dispatch failed (HTTP ${res.status}): ${errorBody || "Unknown error"}`,
+      error: `GitHub Actions dispatch failed (HTTP ${res.status}): ${errorBody.slice(0, 200) || "Unknown error"}`,
     };
   } catch (netErr) {
     return {

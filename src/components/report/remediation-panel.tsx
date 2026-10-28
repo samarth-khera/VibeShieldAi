@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import {
   AlertCircle,
   AlertTriangle,
@@ -19,11 +19,81 @@ import {
   approveRemediation,
   createRemediationPreview,
   createRemediationPr,
+  listRemediations,
   type PublicFinding,
   type PublicRemediation,
 } from "@/lib/scan-client";
 import { DiffViewer } from "./diff-viewer";
 import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
+import { useAdaptivePoll } from "@/lib/use-adaptive-poll";
+
+const FAILURE_REASONS: Record<string, string> = {
+  source_snapshot_unavailable: "The repository snapshot for the scanned commit could not be rebuilt.",
+  commit_unknown: "The scanned commit is unknown, so the patch could not be tied to a revision.",
+  patch_target_missing: "A file in the patch does not exist at the scanned commit.",
+  patch_tool_unavailable: "The patch tool was unavailable in the verification runtime.",
+  patch_does_not_apply: "The patch does not apply cleanly to the scanned commit.",
+  scanner_failed: "At least one required scanner did not complete, so nothing was verified.",
+  target_not_resolved: "The targeted finding is still reported after the patch.",
+  new_findings_introduced: "The patched repository has findings the original scan did not.",
+  verification_timeout: "The verification worker did not report a result in time.",
+  worker_failed: "The verification worker failed before finishing.",
+};
+
+function VerificationDetails({ summary }: { summary: NonNullable<PublicRemediation["rescanSummary"]> }) {
+  const t = summary.timings ?? {};
+  const fmt = (ms?: number) => (ms == null ? "—" : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
+  return (
+    <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 font-mono text-[11px] text-muted">
+      {summary.runtime && (
+        <>
+          <dt>Runtime</dt>
+          <dd>{summary.runtime === "github-actions" ? "GitHub Actions scanner worker" : "Local scanner runtime"}</dd>
+        </>
+      )}
+      {summary.snapshot && (
+        <>
+          <dt>Snapshot</dt>
+          <dd>
+            commit {summary.snapshot.commitSha.slice(0, 7)} · {summary.snapshot.fileCount} files
+          </dd>
+        </>
+      )}
+      {summary.scannerStatuses && (
+        <>
+          <dt>Scanners</dt>
+          <dd>
+            Gitleaks {summary.scannerStatuses.gitleaks} · Semgrep {summary.scannerStatuses.semgrep} · OSV{" "}
+            {summary.scannerStatuses.osvScanner}
+          </dd>
+        </>
+      )}
+      {summary.timings && (
+        <>
+          <dt>Timings</dt>
+          <dd>
+            queue {fmt(t.queueMs)} · download {fmt(t.downloadMs)} · extract {fmt(t.extractionMs)} · apply{" "}
+            {fmt(t.applyMs)} · scan {fmt(t.scanMs)} · total {fmt(t.totalMs)}
+          </dd>
+        </>
+      )}
+      <dt>Findings</dt>
+      <dd>
+        {summary.originalFindingsCount} before · {summary.postRescanFindingsCount} after · {summary.newFindingsCount} new
+      </dd>
+      {summary.workflowRunUrl && (
+        <>
+          <dt>Run</dt>
+          <dd>
+            <a href={summary.workflowRunUrl} target="_blank" rel="noreferrer" className="underline">
+              workflow log
+            </a>
+          </dd>
+        </>
+      )}
+    </dl>
+  );
+}
 
 export function RemediationPanel({
   jobId,
@@ -79,6 +149,20 @@ export function RemediationPanel({
       setIsApproving(false);
     }
   };
+
+  // Verification runs on the scanner worker; poll until it reports a final result.
+  const pollVerification = useCallback(async () => {
+    if (!remediation) return false;
+    const list = await listRemediations(jobId);
+    const fresh = list.find((r) => r.id === remediation.id);
+    if (!fresh) return false;
+    if (fresh.status !== remediation.status || fresh.updatedAt !== remediation.updatedAt) {
+      setRemediation(fresh);
+      onRemediationUpdated?.(fresh);
+    }
+    return fresh.status === "applied";
+  }, [jobId, remediation, onRemediationUpdated]);
+  useAdaptivePoll(pollVerification, remediation?.status === "applied", { initialMs: 3000, maxMs: 10_000 });
 
   const onApplyAndVerify = async () => {
     if (!remediation) return;
@@ -282,19 +366,50 @@ export function RemediationPanel({
                 <CheckCircle2 className="size-4 text-accent" /> Patch Approved by User
               </div>
               <p className="text-xs text-muted">
-                Run security rescan in an isolated sandbox to verify whether <strong>{finding.ruleId}</strong> is resolved
-                without introducing regressions.
+                Rebuild the scanned commit, apply this patch in an isolated workspace, and rescan the whole repository to
+                verify whether <strong>{finding.ruleId}</strong> is resolved without introducing new findings.
               </p>
               <Button onClick={onApplyAndVerify} disabled={isApplying} size="sm">
                 {isApplying ? (
                   <>
-                    <Loader2 className="size-3.5 animate-spin" /> Testing &amp; Rescanning…
+                    <Loader2 className="size-3.5 animate-spin" /> Starting verification…
                   </>
                 ) : (
                   <>
-                    <ShieldCheck className="size-3.5" /> Verify Fix in Sandbox
+                    <ShieldCheck className="size-3.5" /> Verify Fix on Full Repository
                   </>
                 )}
+              </Button>
+            </div>
+          )}
+
+          {/* Verification running on the worker */}
+          {remediation.status === "applied" && (
+            <div className="rounded-lg border border-accent/40 bg-accent/5 p-3 space-y-1 text-xs" role="status" aria-live="polite">
+              <div className="flex items-center gap-2 font-semibold text-foreground">
+                <Loader2 className="size-4 animate-spin text-accent" /> Verifying on the scanner worker…
+              </div>
+              <p className="text-muted">
+                The full repository at commit <code>{remediation.commitSha.slice(0, 7)}</code> is being rebuilt, patched,
+                and rescanned with Gitleaks, Semgrep, and OSV-Scanner. This usually takes under a minute.
+              </p>
+            </div>
+          )}
+
+          {remediation.status === "failed" && (
+            <div className="rounded-lg border border-sev-high/40 bg-sev-high/10 p-3 text-xs space-y-2">
+              <div className="flex items-center gap-2 font-bold text-sev-high">
+                <AlertCircle className="size-4" /> Verification Failed — Nothing Was Verified
+              </div>
+              <p className="text-muted">
+                {FAILURE_REASONS[remediation.rescanSummary?.reason ?? ""] ??
+                  remediation.rescanSummary?.detail ??
+                  "Verification could not complete."}
+              </p>
+              {remediation.rescanSummary && <VerificationDetails summary={remediation.rescanSummary} />}
+              <Button onClick={onApprove} disabled={isApproving} size="sm" variant="secondary">
+                {isApproving ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldCheck className="size-3.5" />}
+                Approve Again to Retry
               </Button>
             </div>
           )}
@@ -308,8 +423,10 @@ export function RemediationPanel({
                     <ShieldCheck className="size-4" /> Fix Verified by Security Rescan
                   </div>
                   <p className="text-muted">
-                    Target finding was successfully resolved in sandbox. Zero new security regressions detected.
+                    The patched repository was rescanned by all three scanners: the target finding is resolved and no new
+                    findings were introduced.
                   </p>
+                  {remediation.rescanSummary && <VerificationDetails summary={remediation.rescanSummary} />}
                 </div>
               ) : (
                 <div className="rounded-lg border border-sev-medium/40 bg-sev-medium/10 p-3 text-xs space-y-1">
@@ -317,8 +434,10 @@ export function RemediationPanel({
                     <AlertTriangle className="size-4" /> Verification Incomplete or Regressions Detected
                   </div>
                   <p className="text-muted">
-                    Rescan found remaining issues or regressions. Please inspect the patch carefully.
+                    {FAILURE_REASONS[remediation.rescanSummary?.reason ?? ""] ??
+                      "Rescan found remaining issues or regressions. Please inspect the patch carefully."}
                   </p>
+                  {remediation.rescanSummary && <VerificationDetails summary={remediation.rescanSummary} />}
                 </div>
               )}
 

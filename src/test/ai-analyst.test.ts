@@ -134,6 +134,14 @@ class MockJobStore implements JobStore {
   async getRemediation(): Promise<null> { return null; }
   async listRemediations(): Promise<[]> { return []; }
   async updateRemediation(): Promise<never> { throw new Error("not implemented"); }
+  async transitionRemediation(): Promise<null> { return null; }
+  async transition(id: string, from: readonly JobRecord["status"][], patch: Partial<JobRecord>): Promise<boolean> {
+    const job = this.jobs.get(id);
+    if (!job || !from.includes(job.status)) return false;
+    Object.assign(job, patch, { updatedAt: new Date() });
+    return true;
+  }
+  async reapStale(): Promise<number> { return 0; }
 }
 
 class MockLlmProvider implements LlmProvider {

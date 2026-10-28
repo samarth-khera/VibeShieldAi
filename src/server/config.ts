@@ -81,7 +81,9 @@ export function getConfig(): ServerConfig {
     maxScansPerIpHourly: int("MAX_SCANS_PER_IP_HOURLY", 3),
     maxScansPerIpDaily: int("MAX_SCANS_PER_IP_DAILY", 5),
     globalDailyScanCap: int("GLOBAL_DAILY_SCAN_CAP", 20),
-    maxConcurrentHeavyScans: int("MAX_CONCURRENT_HEAVY_SCANS", 1),
+    // Shared by scans and Auto-Fix verifications. Standard runners are free for this public repo
+    // (20 concurrent jobs per account); the database reservation enforces this cap atomically.
+    maxConcurrentHeavyScans: int("MAX_CONCURRENT_HEAVY_SCANS", 2),
     jobTimeoutMs: int("JOB_TIMEOUT_MS", 900_000), // 15 minutes
 
     // Dispatch backend
@@ -101,7 +103,7 @@ export function getConfig(): ServerConfig {
     aiMaxRequestsPerIpHourly: int("AI_MAX_REQUESTS_PER_IP_HOURLY", 5),
     aiMaxRequestsPerIpDaily: int("AI_MAX_REQUESTS_PER_IP_DAILY", 15),
     aiGlobalDailyCap: int("AI_GLOBAL_DAILY_CAP", 50),
-    aiMaxTokens: int("AI_MAX_OUTPUT_TOKENS", 800),
+    aiMaxTokens: int("AI_MAX_OUTPUT_TOKENS", 1500), // same default the explain service applies
     aiCircuitBreakerCooldownHours: int("AI_CIRCUIT_BREAKER_COOLDOWN_HOURS", 24),
     adminSecret: process.env.ADMIN_SECRET?.trim() || process.env.SCAN_CALLBACK_SECRET?.trim() || undefined,
   };

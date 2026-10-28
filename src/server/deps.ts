@@ -1,8 +1,8 @@
-import { getConfig } from "./config";
+import { getConfig, type ServerConfig } from "./config";
 import { prisma, prismaJobStore } from "./db";
 import { enqueueRetrieval, getRedis, isWorkerOnline } from "./queue";
 import { checkDatabaseQuotas, checkRateLimit, clientKey } from "./rate-limit";
-import { dispatchScanJob } from "./dispatch";
+import { dispatchRemediationVerification, dispatchScanJob } from "./dispatch";
 import { fetchRepoMetadata } from "./github";
 import { RetrievalError } from "./errors";
 import type { ScanDeps } from "./scans-service";
@@ -85,11 +85,24 @@ export function getScanDeps(): ScanDeps {
   };
 }
 
-export function getRemediationDeps(): RemediationDeps {
-  return {
+/**
+ * Production wiring for Auto-Fix. Verification never runs against injected files: with the GitHub
+ * Actions backend it is dispatched to the scanner worker (which rebuilds the scanned commit and has
+ * the scanner binaries); otherwise it rebuilds the snapshot and scans in this process.
+ */
+export function getRemediationDeps(config: ServerConfig = getConfig()): RemediationDeps {
+  const deps: RemediationDeps = {
     store: prismaJobStore,
     llmProvider: getLlmProvider(),
     fetchImpl: fetch,
+    config,
   };
+  if (config.scanDispatchBackend === "github-actions") {
+    deps.dispatchVerification = async (job, remediation) => {
+      const res = await dispatchRemediationVerification(job.id, remediation.id, job.repositoryUrl, config);
+      if (!res.success) throw new Error(res.error);
+    };
+  }
+  return deps;
 }
 

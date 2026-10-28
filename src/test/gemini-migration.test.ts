@@ -595,13 +595,9 @@ describe("Phase 7: Production Gemini Migration & Zero-Billing Security Test Suit
       expect(spyProvider.generateText).toHaveBeenCalledTimes(1);
     });
 
-    it("verifies live Gemini provider request if GEMINI_API_KEY is available or gracefully marks skipped", async () => {
-      const apiKey = process.env.GEMINI_API_KEY?.trim();
-      if (!apiKey) {
-        // Transparent disclosure when running in an environment without live credentials
-        console.warn("[BLOCKED/NOT TESTED] GEMINI_API_KEY not set in local test environment; skipping live provider call");
-        return;
-      }
+    // Mocked provider tests above are not live proof; without a key this is reported as skipped.
+    it.skipIf(!process.env.GEMINI_API_KEY?.trim())("verifies a live Gemini provider request (requires GEMINI_API_KEY)", async () => {
+      const apiKey = process.env.GEMINI_API_KEY!.trim();
 
       const liveProvider = new GeminiProvider({ apiKey });
       expect(liveProvider.isConfigured()).toBe(true);

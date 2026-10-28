@@ -2,7 +2,29 @@ import { parseGithubRepoUrl } from "@/lib/github-url";
 import type { ServerConfig } from "./config";
 import { fail, ok, toPublicFinding, toPublicJob } from "./api";
 import { log } from "./errors";
-import { JOB_ID_RE, MAX_ATTEMPTS, type JobStore } from "./job-store";
+import type { ScanStatus } from "@prisma/client";
+import {
+  ACTIVE_STATUSES,
+  JOB_ID_RE,
+  MAX_ATTEMPTS,
+  RETRYABLE_STATUSES,
+  type JobRecord,
+  type JobStore,
+} from "./job-store";
+
+const ALL_STATUSES: readonly ScanStatus[] = [
+  "queued",
+  "retrieving",
+  "ready_for_scan",
+  "scanning",
+  "completed",
+  "completed_with_warnings",
+  "cancelled",
+  "invalid_repository",
+  "download_failed",
+  "rejected_by_limits",
+  "failed",
+];
 import { clientKey, type RateLimitResult } from "./rate-limit";
 import { explainFinding } from "./ai/service";
 import { getLlmProvider, type LlmProvider } from "./ai/client";
@@ -148,6 +170,13 @@ export async function getScan(id: string, deps: ScanDeps): Promise<Response> {
   const job = await deps.store.get(id).catch(() => undefined);
   if (job === undefined) return fail(503, "service_unavailable", "The service is temporarily unavailable.");
   if (!job) return fail(404, "not_found", "Scan job not found.");
+  const now = (deps.now ?? (() => new Date()))();
+  if (ACTIVE_STATUSES.includes(job.status) && job.updatedAt.getTime() < now.getTime() - deps.config.jobTimeoutMs) {
+    // The worker stopped reporting: fail it explicitly instead of showing "queued" forever.
+    await deps.store.reapStale(now, deps.config.jobTimeoutMs).catch(() => undefined);
+    const fresh = await deps.store.get(id).catch(() => null);
+    if (fresh) return ok(toPublicJob(fresh));
+  }
   const online = job.status === "queued" ? await deps.workerOnline() : undefined;
   return ok(toPublicJob(job, online));
 }
@@ -162,30 +191,40 @@ export async function getScanRepository(id: string, deps: ScanDeps): Promise<Res
   return ok({ jobId: job.id, status: job.status, repository: toPublicJob(job).repository });
 }
 
-/** POST /api/scans/:id/scan — explicit action to start or retry security scan */
-export async function startScan(id: string, deps: ScanDeps): Promise<Response> {
-  if (!JOB_ID_RE.test(id)) return fail(404, "not_found", "Scan job not found.");
-  const job = await deps.store.get(id).catch(() => undefined);
-  if (job === undefined) return fail(503, "service_unavailable", "The service is temporarily unavailable.");
-  if (!job) return fail(404, "not_found", "Scan job not found.");
-
-  if (job.status === "scanning" || job.status === "retrieving") {
-    return fail(409, "already_scanning", "A scan is already in progress for this repository.");
+/** Reserves a worker slot for an existing job and dispatches it; shared by rescan and retry. */
+async function requeueAndDispatch(
+  job: JobRecord,
+  from: readonly ScanStatus[],
+  deps: ScanDeps,
+  notAllowed: () => Response,
+): Promise<Response> {
+  const now = (deps.now ?? (() => new Date()))();
+  let reserved;
+  if (deps.store.requeueWithQuota) {
+    try {
+      reserved = await deps.store.requeueWithQuota(job.id, from, MAX_ATTEMPTS, deps.config, now);
+    } catch (err) {
+      console.error("Job store requeueWithQuota failed:", err);
+      return fail(503, "service_unavailable", "The service is temporarily unavailable. Please try again shortly.");
+    }
+  } else {
+    reserved = { ok: await deps.store.transition(job.id, from, { status: "queued", failureCategory: null, errorMessage: null, completedAt: null }) };
+  }
+  if (!reserved.ok) {
+    if ("rateLimit" in reserved && reserved.rateLimit) {
+      const limit = reserved.rateLimit;
+      return fail(429, limit.reason || "rate_limited", limit.message || "All scan worker slots are busy.", {
+        "Retry-After": String(limit.retryAfterSeconds),
+      });
+    }
+    return notAllowed();
   }
 
-  const now = (deps.now ?? (() => new Date()))();
-  await deps.store.update(id, {
-    status: "queued",
-    failureCategory: null,
-    errorMessage: null,
-    completedAt: null,
-  });
-
   try {
-    await deps.enqueue(id, job.attempts + 1);
+    await deps.enqueue(job.id, job.attempts + 1, job.repositoryUrl);
   } catch {
     await deps.store
-      .update(id, {
+      .update(job.id, {
         status: "failed",
         failureCategory: "queue_unavailable",
         errorMessage: "The scan queue is unavailable.",
@@ -194,9 +233,23 @@ export async function startScan(id: string, deps: ScanDeps): Promise<Response> {
       .catch(() => undefined);
     return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
   }
-
-  const fresh = (await deps.store.get(id)) ?? job;
+  const fresh = (await deps.store.get(job.id)) ?? job;
   return ok(toPublicJob(fresh), 202);
+}
+
+/** POST /api/scans/:id/scan — explicit action to start or retry security scan */
+export async function startScan(id: string, deps: ScanDeps): Promise<Response> {
+  if (!JOB_ID_RE.test(id)) return fail(404, "not_found", "Scan job not found.");
+  const job = await deps.store.get(id).catch(() => undefined);
+  if (job === undefined) return fail(503, "service_unavailable", "The service is temporarily unavailable.");
+  if (!job) return fail(404, "not_found", "Scan job not found.");
+
+  // A job that is still queued or running already has a worker; dispatching again would duplicate it.
+  // ready_for_scan (local BullMQ mode) is waiting for exactly this action.
+  const rescannable = ALL_STATUSES.filter((s) => s === "ready_for_scan" || !ACTIVE_STATUSES.includes(s));
+  return requeueAndDispatch(job, rescannable, deps, () =>
+    fail(409, "already_scanning", "A scan is already queued or in progress for this repository."),
+  );
 }
 
 /** POST /api/scans/:id/retry */
@@ -205,24 +258,9 @@ export async function retryScan(id: string, deps: ScanDeps): Promise<Response> {
   const job = await deps.store.get(id).catch(() => undefined);
   if (job === undefined) return fail(503, "service_unavailable", "The service is temporarily unavailable.");
   if (!job) return fail(404, "not_found", "Scan job not found.");
-  if (!(await deps.store.requeue(id, MAX_ATTEMPTS))) {
-    return fail(409, "not_retryable", "This job cannot be retried.");
-  }
-  try {
-    await deps.enqueue(id, job.attempts + 1);
-  } catch {
-    await deps.store
-      .update(id, {
-        status: "failed",
-        failureCategory: "queue_unavailable",
-        errorMessage: "The scan queue is unavailable.",
-        completedAt: (deps.now ?? (() => new Date()))(),
-      })
-      .catch(() => undefined);
-    return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
-  }
-  const fresh = (await deps.store.get(id)) ?? job;
-  return ok(toPublicJob(fresh), 202);
+  return requeueAndDispatch(job, [...RETRYABLE_STATUSES], deps, () =>
+    fail(409, "not_retryable", "This job cannot be retried."),
+  );
 }
 
 /** GET /api/scans/:id/findings */
@@ -342,6 +380,7 @@ export async function explainScanFinding(
       store: deps.store,
       provider,
       clientIpHash: ipHash,
+      finding,
     });
     return ok(result);
   } catch (err: unknown) {

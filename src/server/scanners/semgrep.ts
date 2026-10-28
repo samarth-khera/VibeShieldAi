@@ -72,13 +72,8 @@ export async function runSemgrepScan(
 
     const stdout = res.stdout.trim();
     if (!stdout) {
-      return {
-        scanner: "semgrep",
-        status: "completed",
-        durationMs: res.durationMs,
-        findings: [],
-        coverage: { scanned: true },
-      };
+      // `semgrep --json` always prints a report when it actually ran.
+      throw new Error("Semgrep produced no JSON report.");
     }
 
     const jsonStart = stdout.indexOf("{");
