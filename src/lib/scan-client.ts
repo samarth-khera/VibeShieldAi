@@ -76,9 +76,10 @@ export type PublicScanJob = {
   } | null;
   scanCoverage?: {
     filesAnalyzed?: number;
-    lockfilesFound: string[];
-    scannersRun: string[];
-    limitations: string[];
+    // Absent while a scan is running: the worker only reports `progress` until it finishes.
+    lockfilesFound?: string[];
+    scannersRun?: string[];
+    limitations?: string[];
     stageDurations?: {
       metadataMs?: number;
       downloadMs?: number;

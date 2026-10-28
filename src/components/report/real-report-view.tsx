@@ -383,19 +383,19 @@ export function RealReportView({ jobId }: { jobId: string }) {
           </div>
         )}
 
-        {/* Coverage & Limitations Note */}
-        {job.scanCoverage && (
+        {/* Coverage & Limitations Note (mid-scan, scanCoverage only carries progress heartbeats) */}
+        {job.scanCoverage?.scannersRun && (
           <div className="mt-4 rounded-xl border border-line-bright bg-surface/60 p-4 font-mono text-xs text-muted">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span>
-                Coverage: {job.scanCoverage.lockfilesFound.length > 0 ? `Manifests analyzed (${job.scanCoverage.lockfilesFound.join(", ")})` : "No dependency lockfiles in snapshot"}
+                Coverage: {job.scanCoverage.lockfilesFound?.length ? `Manifests analyzed (${job.scanCoverage.lockfilesFound.join(", ")})` : "No dependency lockfiles in snapshot"}
               </span>
               <span>Engines: Gitleaks · Semgrep · OSV-Scanner</span>
             </div>
             {job.scanCoverage.stageDurations && (
               <p className="mt-2 text-[11px] text-muted">{describeStageTimings(job)}</p>
             )}
-            {job.scanCoverage.limitations.length > 0 && (
+            {!!job.scanCoverage.limitations?.length && (
               <p className="mt-2 text-[11px] text-sev-medium">
                 Note: {job.scanCoverage.limitations.join(" · ")}
               </p>
