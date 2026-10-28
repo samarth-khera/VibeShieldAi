@@ -228,16 +228,19 @@ export function RealReportView({ jobId }: { jobId: string }) {
   const loadData = useCallback(async () => {
     try {
       const j = await fetchScan(jobId);
-      setJob(j);
 
       const final = ["completed", "completed_with_warnings"].includes(j.status);
       const partial = j.status === "scanning" && (j.scanCoverage?.progress?.revision ?? 0) > 0;
       const revision = `${j.status}:${j.scanCoverage?.progress?.revision ?? 0}`;
+      // Fetch the findings for a new revision before committing the job, so a finished report is
+      // never rendered with the previous (possibly empty) findings, which would look like "0 findings".
+      let nextFindings: PublicFinding[] | null = null;
       if ((final || partial) && loadedRevision.current !== revision) {
-        const res = await fetchFindings(jobId, { limit: 200 });
+        nextFindings = (await fetchFindings(jobId, { limit: 200 })).findings;
         loadedRevision.current = revision;
-        setFindings(res.findings);
       }
+      setJob(j);
+      if (nextFindings) setFindings(nextFindings);
       setLoading(false);
       if (!returnHandled.current) {
         returnHandled.current = true;

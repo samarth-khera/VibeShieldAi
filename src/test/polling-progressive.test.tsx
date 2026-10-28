@@ -191,3 +191,48 @@ describe("Progressive report", () => {
     expect(screen.queryByText(/No Security Findings Detected/)).toBeNull();
   });
 });
+
+describe("Completed report", () => {
+  it("never shows a finished scan with 0 findings while its findings are still loading", async () => {
+    const completed = {
+      ...scanningJob(3, "completed"),
+      status: "completed",
+      scanners: { gitleaks: scanner("completed", 400), semgrep: scanner("completed", 900), osvScanner: scanner("completed", 300) },
+      summary: { total: 1, bySeverity: { critical: 1, high: 0, medium: 0, low: 0, info: 0 } },
+      scanPerformed: true,
+      completedAt: new Date().toISOString(),
+    };
+    let release!: () => void;
+    const findingsGate = new Promise<void>((r) => (release = r));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.includes("/findings")) {
+          await findingsGate; // slow findings response
+          return Response.json({
+            data: {
+              jobId: JOB_ID, status: "completed", total: 1, limit: 200, offset: 0,
+              findings: [
+                {
+                  id: "f1", fingerprint: "fp", scanner: "osv-scanner", ruleId: "GHSA-x", category: "Dependencies", severity: "critical",
+                  title: "Vulnerable dependency", description: "d", filePath: "requirements.txt", startLine: null, endLine: null,
+                  redactedEvidence: null, vulnerabilityId: "CVE-1", remediation: null, createdAt: new Date().toISOString(),
+                },
+              ],
+            },
+          });
+        }
+        return Response.json({ data: completed });
+      }),
+    );
+    render(<RealReportView jobId={JOB_ID} />);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 300));
+    });
+    // Job already fetched, findings pending: the verified report must not render yet.
+    expect(screen.queryByText(/VERIFIED SCAN REPORT/)).toBeNull();
+    release();
+    expect(await screen.findByText(/VERIFIED SCAN REPORT/)).toBeTruthy();
+    expect(screen.getByText("Vulnerable dependency")).toBeTruthy();
+  });
+});
