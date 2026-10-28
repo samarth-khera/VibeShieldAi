@@ -12,9 +12,12 @@ import { fetchSourceAtCommit } from "./source-cache";
 import { verificationClaimOf, withVerificationClaim } from "./claims";
 import { createRemediationPullRequest, type PullRequestState } from "./github-pr";
 import type { RemediationRecord, RescanComparison } from "./types";
+import type { AuthDeps } from "../auth/service";
 
 export type RemediationDeps = {
   store: JobStore;
+  /** GitHub App user authorization; PR creation and private-repository access need it. */
+  auth?: AuthDeps;
   llmProvider?: LlmProvider;
   fetchImpl?: FetchLike;
   config?: ServerConfig;
@@ -411,7 +414,7 @@ function pullRequestText(
     ...limitations,
     "",
     "---",
-    "Opened by VibeShield AI after explicit human approval. Review before merging; nothing was merged automatically.",
+    "Opened through the VibeShield AI GitHub App with the authorization of the user who approved this exact diff. Review before merging; nothing was merged automatically.",
   ]
     .filter((l): l is string => l !== null)
     .join("\n");
@@ -422,10 +425,23 @@ function pullRequestText(
  * Opens a pull request carrying exactly the approved and verified patch, on a branch whose only
  * parent is the scanned commit. Idempotent: retries find the same branch and PR.
  */
+/** Who is publishing the PR, established by a live GitHub check in the route handler. */
+export type PullRequestActor = {
+  githubUserId: number;
+  login: string;
+  /** The actor's own user-to-server token; never another user's and never an operator token. */
+  token: string;
+  /** Live GitHub repository ID that the handler matched against the scan. */
+  repoId: number;
+  /** SHA-256 of the diff the user confirmed in the dialog; must equal the approved diff. */
+  confirmedDiffSha256: string;
+};
+
 export async function requestPullRequest(
   scanJobId: string,
   remediationId: string,
   deps: RemediationDeps,
+  actor: PullRequestActor,
 ): Promise<{ remediation: RemediationRecord; pullRequest: PullRequestState }> {
   const config = deps.config ?? getConfig();
   const job = await deps.store.get(scanJobId);
@@ -449,14 +465,25 @@ export async function requestPullRequest(
     throw new RemediationError("commit_mismatch", "The remediation does not belong to the scanned commit.", 409);
   }
   const approvedDigest = (remediation.approvedOperations as { diffSha256?: string } | null)?.diffSha256;
-  if (approvedDigest && approvedDigest !== diffDigest(remediation.unifiedDiff)) {
+  const currentDigest = diffDigest(remediation.unifiedDiff);
+  if (approvedDigest && approvedDigest !== currentDigest) {
     throw new RemediationError("patch_mismatch", "The patch differs from the one that was approved.", 409);
   }
+  // The publishing user explicitly confirmed this exact diff, not just "a" fix for the finding.
+  if (actor.confirmedDiffSha256 !== currentDigest) {
+    throw new RemediationError(
+      "diff_confirmation_mismatch",
+      "The diff you confirmed is not the approved and verified diff. Reload and review it again.",
+      409,
+    );
+  }
 
-  // Repeated clicks or scripted calls inside this window reuse the stored outcome instead of
-  // spending the server credential's GitHub API rate limit.
+  // Repeated clicks by the same user inside this window reuse the stored outcome instead of
+  // spending their GitHub API rate limit. Another user always gets a fresh check with their own token.
   const last = pullRequestStateOf(remediation.approvedOperations);
-  if (last && Date.now() - Date.parse(last.at) < PR_RECHECK_MS) return { remediation, pullRequest: last };
+  if (last && last.openedBy?.githubUserId === actor.githubUserId && Date.now() - Date.parse(last.at) < PR_RECHECK_MS) {
+    return { remediation, pullRequest: last };
+  }
 
   const { findings } = await deps.store.getFindings(scanJobId, { limit: 1000 });
   const targeted = findings.filter((f) => remediation.findingFingerprints.includes(f.fingerprint));
@@ -471,11 +498,12 @@ export async function requestPullRequest(
     unifiedDiff: remediation.unifiedDiff,
     title,
     body,
-    token: config.githubWriteToken,
-    allowedRepositories: config.pullRequestRepositories,
+    token: actor.token,
+    expectedRepoId: actor.repoId,
     fetchImpl: deps.fetchImpl,
     timeoutMs: config.githubApiTimeoutMs,
   });
+  pullRequest.openedBy = { githubUserId: actor.githubUserId, login: actor.login };
   log(pullRequest.status === "failed" ? "warn" : "info", "remediation_pull_request", {
     jobId: scanJobId,
     remediationId,

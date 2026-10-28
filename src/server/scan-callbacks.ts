@@ -1,3 +1,6 @@
+import type { AuthDeps } from "./auth/service";
+import { loadScanAccess } from "./auth/repository-access";
+import { resolvePrivateSource } from "./auth/private-source";
 import { z } from "zod";
 import { Prisma, type ScanStatus } from "@prisma/client";
 import { getConfig } from "./config";
@@ -410,4 +413,51 @@ export async function handleScanCallback(
     await onSlotFreed().catch((err) => log("warn", "queue_pump_after_callback_failed", { cause: err instanceof Error ? err.name : "unknown" }));
   }
   return res;
+}
+
+const SourceRequestSchema = z.object({ jobId: z.string(), lease: z.string().max(100).optional() }).strict();
+
+/**
+ * POST /api/scans/:id/source — called only by a scan worker holding the job, for private
+ * repositories. Same signature and lease checks as callbacks. Returns the scanned repository's
+ * identity and a short-lived archive URL; never the user's token.
+ */
+export async function handleScanSource(req: Request, id: string, auth: AuthDeps): Promise<Response> {
+  if (!JOB_ID_RE.test(id)) return fail(404, "not_found", "Scan job not found.");
+  const config = getConfig();
+  const callbackSecret = config.scanCallbackSecret || process.env.SCAN_CALLBACK_SECRET;
+  if (!callbackSecret) return fail(500, "callback_misconfigured", "Callback authentication secret is not configured.");
+  const rawBody = await req.text();
+  if (rawBody.length > 4096) return fail(413, "payload_too_large", "Request too large.");
+  const signatureHeader = req.headers.get("x-vibeshield-signature");
+  let signedBy: "callback" | "warm" = "callback";
+  let authResult = verifyCallbackSignature(rawBody, signatureHeader, callbackSecret);
+  if (!authResult.valid && config.warmWorkerSecret) {
+    const warm = verifyCallbackSignature(rawBody, signatureHeader, config.warmWorkerSecret);
+    if (warm.valid) {
+      authResult = warm;
+      signedBy = "warm";
+    }
+  }
+  if (!authResult.valid) return fail(401, "unauthorized", "Invalid or missing signature.");
+  let parsed;
+  try {
+    parsed = SourceRequestSchema.parse(JSON.parse(rawBody));
+  } catch {
+    return fail(400, "validation_failed", "Request does not match schema.");
+  }
+  if (parsed.jobId !== id) return fail(400, "job_id_mismatch", "Payload job ID does not match route parameter.");
+
+  const job = (await withDbRetry(() => prisma.scanJob.findUnique({ where: { id } }))) as JobRecord | null;
+  if (!job) return fail(404, "not_found", "Scan job not found.");
+  if (TERMINAL.includes(job.status)) return fail(409, "job_finished", "Job is already finished.");
+  const rejected = leaseRejection(job, parsed.lease, signedBy);
+  if (rejected) return rejected;
+
+  const source = await resolvePrivateSource(job, await loadScanAccess(auth, id), "scan", auth, config);
+  if ("code" in source) {
+    log("warn", "private_source_unavailable", { jobId: id, code: source.code });
+    return fail(source.code === "not_private" ? 404 : 403, source.code, "The private repository source is not available to this job.");
+  }
+  return Response.json({ data: source }, { status: 200, headers: { "Cache-Control": "no-store" } });
 }

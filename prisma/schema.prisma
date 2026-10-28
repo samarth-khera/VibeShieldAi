@@ -207,3 +207,83 @@ model WorkerHeartbeat {
   arch              String?  @db.VarChar(40)
   scannerVersions   Json?
 }
+
+// ---------------------------------------------------------------------------------------------
+// GitHub App user authorization. All tables below are only read or written when the GitHub App is
+// configured (GITHUB_APP_CLIENT_ID etc.), so deployments without it never touch them.
+// ---------------------------------------------------------------------------------------------
+
+/// Browser session. The cookie holds a random token; only its SHA-256 is stored here.
+model AuthSession {
+  /// SHA-256 (hex) of the session cookie value.
+  id              String         @id @db.VarChar(64)
+  githubAccountId String?        @db.VarChar(36)
+  githubAccount   GithubAccount? @relation(fields: [githubAccountId], references: [id], onDelete: SetNull)
+  createdAt       DateTime       @default(now())
+  lastSeenAt      DateTime       @default(now())
+  expiresAt       DateTime
+  revokedAt       DateTime?
+
+  @@index([githubAccountId])
+  @@index([expiresAt])
+}
+
+/// A GitHub user who authorized the VibeShield GitHub App. Tokens are AES-256-GCM encrypted.
+model GithubAccount {
+  id                    String        @id @default(cuid()) @db.VarChar(36)
+  githubUserId          BigInt        @unique
+  login                 String        @db.VarChar(39)
+  avatarUrl             String?       @db.VarChar(300)
+  accessTokenEnc        String        @db.Text
+  accessTokenExpiresAt  DateTime?
+  refreshTokenEnc       String?       @db.Text
+  refreshTokenExpiresAt DateTime?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+  sessions              AuthSession[]
+}
+
+/// Single-use OAuth/installation state, bound to the session that started the flow.
+model OAuthState {
+  /// SHA-256 (hex) of the state value sent to GitHub.
+  id              String    @id @db.VarChar(64)
+  sessionId       String    @db.VarChar(64)
+  purpose         String    @db.VarChar(20) // "connect" | "install"
+  returnTo        String    @db.VarChar(300)
+  /// PKCE verifier, encrypted.
+  codeVerifierEnc String?   @db.Text
+  expiresAt       DateTime
+  consumedAt      DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([expiresAt])
+}
+
+/// Canonical repository identity of a scan, and who may see it when the repository is private.
+model ScanAccess {
+  scanJobId    String   @id @db.VarChar(32)
+  githubRepoId BigInt
+  isPrivate    Boolean  @default(false)
+  /// GitHub user whose authorization was used to scan a private repository.
+  githubUserId BigInt?
+  createdAt    DateTime @default(now())
+
+  @@index([githubUserId])
+}
+
+/// Security audit trail. Never contains tokens, codes, state values or secrets.
+model AuditEvent {
+  id            String   @id @default(cuid()) @db.VarChar(36)
+  at            DateTime @default(now())
+  action        String   @db.VarChar(40)
+  outcome       String   @db.VarChar(30)
+  githubUserId  BigInt?
+  githubLogin   String?  @db.VarChar(39)
+  scanJobId     String?  @db.VarChar(32)
+  remediationId String?  @db.VarChar(36)
+  repository    String?  @db.VarChar(140)
+  detail        String?  @db.VarChar(300)
+
+  @@index([at])
+  @@index([githubUserId, at])
+}

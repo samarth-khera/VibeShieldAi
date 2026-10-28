@@ -1,3 +1,5 @@
+import { repositoryUrlForWorker } from "./auth/private-source";
+import { getAuthDeps } from "./deps";
 import { z } from "zod";
 import { fail, ok } from "./api";
 import { verifyCallbackSignature } from "./callback-auth";
@@ -80,7 +82,7 @@ export async function handleWorkerClaim(req: Request, deps: WorkerApiDeps): Prom
     const v = await deps.store.claimNextVerification(body.workerId, deps.config, now);
     if (v) {
       log("info", "warm_worker_claimed", { kind: "verify", jobId: v.job.id, remediationId: v.remediation.id, workerId: body.workerId });
-      return ok({ work: { kind: "verify", lease: v.lease, spec: await buildVerificationSpec(v.job, v.remediation, deps.store) }, pollAfterMs: 0 });
+      return ok({ work: { kind: "verify", lease: v.lease, spec: await buildVerificationSpec(v.job, v.remediation, deps.store, getAuthDeps(deps.config)) }, pollAfterMs: 0 });
     }
   }
   if (body.accept.includes("scan") && deps.store.claimNextScan) {
@@ -89,7 +91,13 @@ export async function handleWorkerClaim(req: Request, deps: WorkerApiDeps): Prom
       const queuedMs = now.getTime() - c.job.createdAt.getTime();
       log("info", "warm_worker_claimed", { kind: "scan", jobId: c.job.id, workerId: body.workerId, queuedMs });
       return ok({
-        work: { kind: "scan", jobId: c.job.id, repositoryUrl: c.job.repositoryUrl, lease: c.lease, acceptedAt: c.job.createdAt.toISOString() },
+        work: {
+          kind: "scan",
+          jobId: c.job.id,
+          repositoryUrl: await repositoryUrlForWorker(c.job.id, c.job.repositoryUrl, getAuthDeps(deps.config)),
+          lease: c.lease,
+          acceptedAt: c.job.createdAt.toISOString(),
+        },
         pollAfterMs: 0,
       });
     }

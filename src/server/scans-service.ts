@@ -1,3 +1,4 @@
+import { newJobId } from "./job-store";
 import { parseGithubRepoUrl } from "@/lib/github-url";
 import type { ServerConfig } from "./config";
 import { fail, ok, toPublicFinding, toPublicJob } from "./api";
@@ -33,6 +34,10 @@ import { computeContextHash, AI_PROMPT_VERSION } from "./ai/prompts";
 import { AiExplanationSchema, type CachedAiExplanation } from "./ai/types";
 import { verifyTurnstileToken } from "./turnstile";
 
+export type RepositoryGate =
+  | { ok: true; repoId: number | null; isPrivate: boolean; githubUserId: number | null }
+  | { ok: false; status: number; code: string; error: string };
+
 export type ScanDeps = {
   store: JobStore;
   config: ServerConfig;
@@ -43,6 +48,13 @@ export type ScanDeps = {
   llmProvider?: LlmProvider;
   verifyTurnstile?: typeof verifyTurnstileToken;
   verifyRepo?: (owner: string, repo: string) => Promise<{ ok: boolean; code?: string; error?: string }>;
+  /**
+   * With the GitHub App configured: resolves the canonical repository ID and, for a repository that
+   * is not public, whether the current session's GitHub user may read it. Supersedes `verifyRepo`.
+   */
+  resolveRepository?: (req: Request, owner: string, repo: string) => Promise<RepositoryGate>;
+  /** Persists the scan's repository identity and visibility (ScanAccess). */
+  recordScanAccess?: (rec: { scanJobId: string; githubRepoId: number; isPrivate: boolean; githubUserId: number | null }) => Promise<void>;
   checkAiQuota?: (clientIpHash: string) => Promise<AiQuotaCheckResult>;
 };
 
@@ -92,8 +104,12 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
     return fail(403, "turnstile_verification_failed", turnstileResult.message);
   }
 
-  // Pre-validate public repository accessibility if verifier provided
-  if (deps.verifyRepo) {
+  // Pre-validate repository accessibility: public, or private and readable by the connected user.
+  let gate: RepositoryGate | null = null;
+  if (deps.resolveRepository) {
+    gate = await deps.resolveRepository(req, parsed.owner, parsed.repo);
+    if (!gate.ok) return fail(gate.status, gate.code, gate.error);
+  } else if (deps.verifyRepo) {
     const repoCheck = await deps.verifyRepo(parsed.owner, parsed.repo);
     if (!repoCheck.ok) {
       return fail(400, repoCheck.code || "invalid_repository", repoCheck.error || "Repository is not accessible.");
@@ -102,12 +118,27 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
 
   const now = (deps.now ?? (() => new Date()))();
   let job;
+  // A private scan's access record is written before its job exists, so no worker can ever be
+  // handed the job (and its repository name) without the private marker.
+  const presetId = gate?.ok && gate.isPrivate ? newJobId() : undefined;
+  if (presetId && gate?.ok) {
+    if (!deps.recordScanAccess || gate.repoId === null) {
+      return fail(503, "service_unavailable", "Private repository scanning is unavailable.");
+    }
+    try {
+      await deps.recordScanAccess({ scanJobId: presetId, githubRepoId: gate.repoId, isPrivate: true, githubUserId: gate.githubUserId });
+    } catch {
+      log("error", "scan_access_record_failed", { private: true });
+      return fail(503, "service_unavailable", "The service is temporarily unavailable. Please try again shortly.");
+    }
+  }
 
   if (deps.store.createWithQuota) {
     let quotaRes;
     try {
       quotaRes = await deps.store.createWithQuota(
         {
+          ...(presetId ? { id: presetId } : {}),
           owner: parsed.owner,
           repo: parsed.repo,
           repositoryUrl: parsed.url,
@@ -133,6 +164,7 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
   } else {
     try {
       job = await deps.store.create({
+        ...(presetId ? { id: presetId } : {}),
         owner: parsed.owner,
         repo: parsed.repo,
         repositoryUrl: parsed.url,
@@ -144,6 +176,13 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
       log("error", "job_create_failed");
       return fail(503, "service_unavailable", "The service is temporarily unavailable. Please try again shortly.");
     }
+  }
+
+  // Public scans: bind the repository's immutable ID so a later PR can't target a recreated repo.
+  if (gate?.ok && !gate.isPrivate && gate.repoId !== null && deps.recordScanAccess) {
+    await deps.recordScanAccess({ scanJobId: job.id, githubRepoId: gate.repoId, isPrivate: false, githubUserId: null }).catch(() =>
+      log("warn", "scan_access_record_failed", { jobId: job.id }),
+    );
   }
 
   if (!deps.store.claimNextScan) {

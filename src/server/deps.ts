@@ -9,6 +9,15 @@ import type { ScanDeps } from "./scans-service";
 import { getLlmProvider } from "./ai/client";
 import { checkAiQuotaAndCircuitBreaker } from "./ai/circuit-breaker";
 import type { RemediationDeps } from "./remediation/service";
+import { createPrismaAuthStore } from "./auth/store";
+import { repositoryUrlForWorker } from "./auth/private-source";
+import { resolveRepositoryForScan } from "./auth/scan-gate";
+import type { AuthDeps } from "./auth/service";
+
+/** GitHub App user authorization. `app` is undefined until the operator configures it. */
+export function getAuthDeps(config: ServerConfig = getConfig()): AuthDeps {
+  return { store: createPrismaAuthStore(prisma), app: config.githubApp, fetchImpl: fetch };
+}
 
 /** Production wiring for the route handlers. */
 export function getScanDeps(): ScanDeps {
@@ -39,6 +48,7 @@ export function getScanDeps(): ScanDeps {
         repoUrl = job?.repositoryUrl;
       }
       if (!repoUrl) throw new Error("Missing repository URL for workflow dispatch");
+      repoUrl = await repositoryUrlForWorker(jobId, repoUrl, getAuthDeps(config));
       const res = await dispatchScanJob(jobId, repoUrl, config);
       if (!res.success) {
         throw new Error(res.error);
@@ -63,9 +73,9 @@ export function getScanDeps(): ScanDeps {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), config.githubApiTimeoutMs);
-      await fetchRepoMetadata(fetch, owner, repo, config, controller.signal);
+      const meta = await fetchRepoMetadata(fetch, owner, repo, config, controller.signal);
       clearTimeout(timer);
-      return { ok: true };
+      return { ok: true, repoId: meta.id || null };
     } catch (err: unknown) {
       if (err instanceof RetrievalError) {
         return { ok: false, code: err.category, error: err.publicMessage };
@@ -74,7 +84,7 @@ export function getScanDeps(): ScanDeps {
     }
   };
 
-  return {
+  const deps: ScanDeps = {
     store: prismaJobStore,
     config,
     enqueue: enqueueFn,
@@ -83,6 +93,12 @@ export function getScanDeps(): ScanDeps {
     verifyRepo: verifyRepoFn,
     checkAiQuota: (clientIpHash: string) => checkAiQuotaAndCircuitBreaker(clientIpHash),
   };
+  if (config.githubApp) {
+    const auth = getAuthDeps(config);
+    deps.resolveRepository = (req, owner, repo) => resolveRepositoryForScan(req, owner, repo, auth, verifyRepoFn);
+    deps.recordScanAccess = (rec) => auth.store.setScanAccess(rec);
+  }
+  return deps;
 }
 
 /**
@@ -93,13 +109,15 @@ export function getScanDeps(): ScanDeps {
 export function getRemediationDeps(config: ServerConfig = getConfig()): RemediationDeps {
   const deps: RemediationDeps = {
     store: prismaJobStore,
+    auth: getAuthDeps(config),
     llmProvider: getLlmProvider(),
     fetchImpl: fetch,
     config,
   };
   if (config.scanDispatchBackend === "github-actions") {
     deps.dispatchVerification = async (job, remediation) => {
-      const res = await dispatchRemediationVerification(job.id, remediation.id, job.repositoryUrl, config);
+      const repoUrl = await repositoryUrlForWorker(job.id, job.repositoryUrl, getAuthDeps(config));
+      const res = await dispatchRemediationVerification(job.id, remediation.id, repoUrl, config);
       if (!res.success) throw new Error(res.error);
     };
   }

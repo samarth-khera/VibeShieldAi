@@ -1,3 +1,4 @@
+import { parseEncryptionKey } from "./auth/crypto";
 export type ServerConfig = {
   maxArchiveBytes: number;
   maxUnpackedBytes: number;
@@ -11,12 +12,10 @@ export type ServerConfig = {
   jobTtlHours: number;
   githubToken?: string;
   /**
-   * Server-only credential for opening Auto-Fix pull requests. Never falls back to the read-only
-   * GITHUB_TOKEN or the workflow dispatch token.
+   * GitHub App used for per-user authorization (private scans, Auto-Fix pull requests). Present
+   * only when every required value is set; otherwise those features report "not configured".
    */
-  githubWriteToken?: string;
-  /** Lower-case "owner/repo" names PRs may be opened in; empty disables PR creation entirely. */
-  pullRequestRepositories: string[];
+  githubApp?: GithubAppConfig;
 
   // Free-tier Quota and Anti-Abuse Guardrails (Rule 8)
   maxScansPerIpHourly: number;
@@ -60,6 +59,37 @@ export type ServerConfig = {
   adminSecret?: string;
 };
 
+export type GithubAppConfig = {
+  clientId: string;
+  clientSecret: string;
+  /** App URL slug, for https://github.com/apps/<slug>/installations/new. */
+  slug: string;
+  /** 32-byte key for encrypting stored user tokens and PKCE verifiers. */
+  encryptionKey: Buffer;
+  /** OAuth callback and installation setup URLs registered on the GitHub App. */
+  callbackUrl: string;
+  setupUrl: string;
+  appOrigin: string;
+};
+
+function githubAppConfig(appUrl: string): GithubAppConfig | undefined {
+  const clientId = process.env.GITHUB_APP_CLIENT_ID?.trim();
+  const clientSecret = process.env.GITHUB_APP_CLIENT_SECRET?.trim();
+  const slug = process.env.GITHUB_APP_SLUG?.trim();
+  const encryptionKey = parseEncryptionKey(process.env.GITHUB_APP_TOKEN_ENCRYPTION_KEY);
+  if (!clientId || !clientSecret || !slug || !/^[a-z0-9-]{1,100}$/i.test(slug) || !encryptionKey) return undefined;
+  const base = appUrl.replace(/\/+$/, "");
+  return {
+    clientId,
+    clientSecret,
+    slug,
+    encryptionKey,
+    callbackUrl: `${base}/api/auth/github/callback`,
+    setupUrl: `${base}/api/auth/github/setup`,
+    appOrigin: new URL(base).origin,
+  };
+}
+
 function int(name: string, fallback: number): number {
   const raw = process.env[name];
   const n = raw ? Number.parseInt(raw, 10) : NaN;
@@ -97,11 +127,7 @@ export function getConfig(): ServerConfig {
     workerConcurrency: int("WORKER_CONCURRENCY", 1),
     jobTtlHours: int("JOB_TTL_HOURS", 24 * 7), // 7-day retention period (Rule 3)
     githubToken: process.env.GITHUB_TOKEN?.trim() || undefined,
-    githubWriteToken: process.env.GITHUB_WRITE_TOKEN?.trim() || undefined,
-    pullRequestRepositories: (process.env.GITHUB_PR_REPOSITORIES ?? "")
-      .split(",")
-      .map((r) => r.trim().toLowerCase())
-      .filter((r) => /^[a-z0-9-]+\/[a-z0-9._-]+$/.test(r)),
+    githubApp: githubAppConfig(appUrl),
 
     // Free-tier quotas. Raised 2x (from 3/5/20): execution stays capped by MAX_CONCURRENT_HEAVY_SCANS,
     // standard Actions runners are free for this public repo, and ~40 scans/day is a small share of

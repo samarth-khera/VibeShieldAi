@@ -1,4 +1,4 @@
-import type { PrAvailability, PullRequestState } from "./github-pr";
+import type { PullRequestState } from "./github-pr";
 export type RemediationEligibilityType = "safe" | "potentially_breaking" | "unsuitable";
 
 export type RemediationStatus =
@@ -113,13 +113,13 @@ export type PublicRemediation = {
   rescanSummary: RescanComparison | null;
   branchName: string | null;
   pullRequestUrl: string | null;
-  /** Whether this deployment can open a PR for the repository, and the last attempt's outcome. */
-  pullRequest: (Partial<PullRequestState> & { availability?: PrAvailability }) | null;
+  /** Outcome of the last pull-request attempt; GitHub authorization state comes from /api/auth/github/status. */
+  pullRequest: PullRequestState | null;
   createdAt: string;
   updatedAt: string;
 };
 
-export function toPublicRemediation(r: RemediationRecord, availability?: PrAvailability): PublicRemediation {
+export function toPublicRemediation(r: RemediationRecord): PublicRemediation {
   const last = (r.approvedOperations as { pullRequest?: PullRequestState } | null)?.pullRequest;
   return {
     id: r.id,
@@ -139,7 +139,7 @@ export function toPublicRemediation(r: RemediationRecord, availability?: PrAvail
     rescanSummary: r.rescanSummary ?? null,
     branchName: r.branchName,
     pullRequestUrl: r.pullRequestUrl,
-    pullRequest: last || availability ? { ...(last ?? {}), availability } : null,
+    pullRequest: last ?? null,
     createdAt: r.createdAt.toISOString(),
     updatedAt: r.updatedAt.toISOString(),
   };

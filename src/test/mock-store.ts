@@ -238,7 +238,7 @@ export class InMemoryJobStore implements JobStore {
   }
 
   async create(data: NewJob): Promise<JobRecord> {
-    const id = newJobId();
+    const id = data.id ?? newJobId();
     const record: JobRecord = {
       id,
       status: "queued",

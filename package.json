@@ -11,7 +11,7 @@
     "worker:warm": "tsx worker/warm-worker.ts",
     "test": "vitest run",
     "test:scanners": "REQUIRE_REAL_SCANNERS=1 vitest run src/test/integration/real-scanners.test.ts src/test/remediation.test.ts",
-    "test:postgres": "REQUIRE_POSTGRES=1 vitest run --no-file-parallelism src/test/integration/postgres-quota.test.ts src/test/integration/postgres-worker.test.ts",
+    "test:postgres": "REQUIRE_POSTGRES=1 vitest run --no-file-parallelism src/test/integration/postgres-quota.test.ts src/test/integration/postgres-worker.test.ts src/test/integration/postgres-auth.test.ts",
     "typecheck": "tsc --noEmit",
     "db:migrate": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",

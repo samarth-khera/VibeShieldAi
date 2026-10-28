@@ -13,16 +13,14 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
-  ApiRequestError,
   applyRemediation,
   approveRemediation,
   createRemediationPreview,
-  createRemediationPr,
   listRemediations,
   type PublicFinding,
   type PublicRemediation,
 } from "@/lib/scan-client";
-import { PullRequestSection } from "./pull-request-section";
+import { GithubPullRequestPanel } from "./github-pr-panel";
 import { DiffViewer } from "./diff-viewer";
 import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
 import { useAdaptivePoll } from "@/lib/use-adaptive-poll";
@@ -118,8 +116,6 @@ export function RemediationPanel({
   const [isGenerating, setIsGenerating] = useState(false);
   const [isApproving, setIsApproving] = useState(false);
   const [isApplying, setIsApplying] = useState(false);
-  const [isOpeningPr, setIsOpeningPr] = useState(false);
-  const [prError, setPrError] = useState<{ code: string; message: string } | null>(null);
   const [approvedChecked, setApprovedChecked] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -200,29 +196,6 @@ export function RemediationPanel({
       setError(err instanceof Error ? err.message : "Application and rescan failed.");
     } finally {
       setIsApplying(false);
-    }
-  };
-
-  const onOpenPr = async () => {
-    if (!remediation || isOpeningPr) return;
-    setIsOpeningPr(true);
-    setPrError(null);
-    try {
-      const res = await createRemediationPr(jobId, remediation.id);
-      setRemediation(res.remediation);
-      onRemediationUpdated?.(res.remediation);
-    } catch (err) {
-      setPrError({
-        code: err instanceof ApiRequestError ? err.code : "network_error",
-        message: err instanceof Error ? err.message : "Failed to create pull request.",
-      });
-      // The server records failed attempts; refresh so the panel shows the stored state.
-      const fresh = await listRemediations(jobId)
-        .then((list) => list.find((r) => r.id === remediation.id))
-        .catch(() => undefined);
-      if (fresh) setRemediation(fresh);
-    } finally {
-      setIsOpeningPr(false);
     }
   };
 
@@ -329,6 +302,19 @@ export function RemediationPanel({
                 ))}
               </ul>
             </div>
+          )}
+
+          {mode === "autofix" && (
+            <GithubPullRequestPanel
+              jobId={jobId}
+              finding={finding}
+              remediation={remediation}
+              onRemediationUpdated={(r) => {
+                setRemediation(r);
+                onRemediationUpdated?.(r);
+              }}
+              patchDownloadUrl={patchDownloadUrl}
+            />
           )}
 
           {/* Status: Preview -> Requires Approval */}
@@ -468,13 +454,6 @@ export function RemediationPanel({
                 </div>
               )}
 
-              <PullRequestSection
-                remediation={remediation}
-                isOpening={isOpeningPr}
-                requestError={prError}
-                onOpen={onOpenPr}
-                patchDownloadUrl={patchDownloadUrl}
-              />
             </div>
           )}
         </div>

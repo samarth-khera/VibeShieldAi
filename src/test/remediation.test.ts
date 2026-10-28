@@ -412,9 +412,8 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         pullRequestUrl: null,
       });
 
-      // Ambient read tokens must never be used as a write credential.
+      // There is no ambient credential: without the user's own token nothing reaches GitHub.
       vi.stubEnv("GITHUB_TOKEN", "ambient-read-token");
-      vi.stubEnv("GITHUB_WRITE_TOKEN", "");
       const fetchSpy = vi.fn();
       const result = await createRemediationPullRequest({
         owner: job.owner,
@@ -425,13 +424,13 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         unifiedDiff: rem.unifiedDiff,
         title: "t",
         body: "b",
-        allowedRepositories: ["acme/webapp"],
+        token: "",
         fetchImpl: fetchSpy,
       });
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(result.status).toBe("failed");
-      expect(result.code).toBe("not_configured");
+      expect(result.code).toBe("credential_invalid");
       expect(result.branch).toMatch(/^vibeshield\/fix-/);
       expect(result.branch).not.toBe(job.defaultBranch);
     });

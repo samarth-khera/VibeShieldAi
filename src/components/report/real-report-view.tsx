@@ -177,6 +177,36 @@ function ScannerChips({ job, now }: { job: PublicScanJob; now: number }) {
 }
 const sevOrder: Severity[] = ["critical", "high", "medium", "low", "info"];
 
+const GITHUB_RETURN_NOTICES: Record<string, string> = {
+  connected: "GitHub connected. Repository access is checked again with GitHub before anything is written.",
+  installed: "GitHub confirmed the VibeShield app installation. Access for this repository is shown in the Auto-Fix panel.",
+  install_requested: "Installation requested. An organization owner must approve the VibeShield app on GitHub before it can be used.",
+  installation_not_verified: "GitHub did not confirm an installation visible to your account. No access was granted.",
+  cancelled: "GitHub authorization was cancelled. Nothing was connected.",
+  connect_first: "Connect GitHub first, then authorize the repository.",
+  authorization_expired: "Your GitHub authorization expired. Connect GitHub again.",
+  error: "GitHub authorization did not complete. Nothing was connected; you can try again.",
+  not_configured: "GitHub authorization is not configured on this deployment yet.",
+};
+
+/** After returning from GitHub: reopen the finding in Auto-Fix mode and report the outcome. */
+function applyGithubReturn(
+  setSelectedId: (id: string) => void,
+  setMode: (m: "review" | "autofix") => void,
+  setNotice: (n: string) => void,
+) {
+  const url = new URL(window.location.href);
+  const finding = url.searchParams.get("finding");
+  const outcome = url.searchParams.get("github");
+  if (url.searchParams.get("mode") === "autofix") setMode("autofix");
+  if (finding && /^[A-Za-z0-9_-]{1,64}$/.test(finding)) setSelectedId(finding);
+  if (outcome) setNotice(GITHUB_RETURN_NOTICES[outcome] ?? GITHUB_RETURN_NOTICES.error);
+  if (finding || outcome) {
+    for (const k of ["finding", "mode", "github", "reason"]) url.searchParams.delete(k);
+    window.history.replaceState(null, "", url.pathname + url.search);
+  }
+}
+
 export function RealReportView({ jobId }: { jobId: string }) {
   const [job, setJob] = useState<PublicScanJob | null>(null);
   const [findings, setFindings] = useState<PublicFinding[]>([]);
@@ -189,6 +219,8 @@ export function RealReportView({ jobId }: { jobId: string }) {
   const [mode, setMode] = useState<"review" | "autofix">("review");
   const [selectedFindingIds, setSelectedFindingIds] = useState<Set<string>>(new Set());
   const lastTrigger = useRef<HTMLElement | null>(null);
+  const [githubNotice, setGithubNotice] = useState<string | null>(null);
+  const returnHandled = useRef(false);
 
   // Findings are refetched only when the worker published new results (revision changed), and
   // once more when the scan reaches its final state.
@@ -207,6 +239,10 @@ export function RealReportView({ jobId }: { jobId: string }) {
         setFindings(res.findings);
       }
       setLoading(false);
+      if (!returnHandled.current) {
+        returnHandled.current = true;
+        applyGithubReturn(setSelectedId, setMode, setGithubNotice);
+      }
       return j;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load scan report.");
@@ -328,6 +364,12 @@ export function RealReportView({ jobId }: { jobId: string }) {
         <Link href="/" className="inline-flex items-center gap-2 font-mono text-xs uppercase tracking-wider text-muted hover:text-accent">
           <ArrowLeft className="size-4" aria-hidden /> Back to homepage
         </Link>
+
+        {githubNotice && (
+          <div role="status" className="mt-4 rounded-lg border border-line bg-surface p-3 text-sm text-foreground">
+            {githubNotice}
+          </div>
+        )}
 
         {/* Live scanning progress banner if scan is still active */}
         {isScanning && <ScanProgressBanner job={job} repoName={repoName} />}

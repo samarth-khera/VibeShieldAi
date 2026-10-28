@@ -4,7 +4,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { parseGithubRepoUrl } from "../../lib/github-url";
 import type { ServerConfig } from "../config";
-import { fetchCommitSha, fetchRepoMetadata, openArchive } from "../github";
+import { fetchCommitSha, fetchRepoMetadata, openArchive, openArchiveUrl } from "../github";
 import { extractArchiveSafely } from "../archive";
 import { runSecurityScanEngine } from "../scanners/engine";
 import { redactText } from "../scanners/redact";
@@ -25,6 +25,11 @@ export const githubArchiveSource: ArchiveSource = async (owner, repo, sha, confi
   const declared = Number.parseInt(res.headers.get("content-length") ?? "", 10);
   return { stream: Readable.fromWeb(res.body as never), bytes: Number.isFinite(declared) ? declared : null, cache: "none" };
 };
+
+import { PRIVATE_REPOSITORY } from "./private-repository";
+export { PRIVATE_REPOSITORY };
+
+type PrivateSourceDescriptor = { owner: string; repo: string; defaultBranch: string; commitSha: string; archiveUrl: string };
 
 export type ScanJobContext = {
   jobId: string;
@@ -65,8 +70,9 @@ export async function executeScanJob(ctx: ScanJobContext): Promise<"completed" |
     await post({ type: "progress", phase, at, ...extra }, 1).catch(() => say(`progress '${phase}' not delivered`));
   };
 
-  const parsed = parseGithubRepoUrl(ctx.repositoryUrl);
-  if (!parsed.ok) {
+  const isPrivate = ctx.repositoryUrl === PRIVATE_REPOSITORY;
+  const parsed = isPrivate ? null : parseGithubRepoUrl(ctx.repositoryUrl);
+  if (parsed && !parsed.ok) {
     await post({ status: "failed", failureCategory: "invalid_repository", errorMessage: parsed.error, findings: [] }).catch(() => undefined);
     return "failed";
   }
@@ -80,12 +86,32 @@ export async function executeScanJob(ctx: ScanJobContext): Promise<"completed" |
     const t0 = Date.now();
     await heartbeat("retrieving");
     const tMeta = Date.now();
-    const meta = await fetchRepoMetadata(fetch, parsed.owner, parsed.repo, config, controller.signal);
-    const commitSha = await fetchCommitSha(fetch, parsed.owner, parsed.repo, meta.defaultBranch, config, controller.signal);
+    let commitSha: string;
+    let defaultBranch: string;
+    let privateSource: PrivateSourceDescriptor | null = null;
+    if (isPrivate) {
+      // Private: identity and a short-lived archive URL come from the app, authorized by the user.
+      const res = await postSigned(ctx.callbackUrl.replace(/\/callback$/, "/source"), ctx.secret, { jobId: ctx.jobId, lease: ctx.lease });
+      if (!res.ok) throw new Error(`Private repository source unavailable (HTTP ${res.status}).`);
+      privateSource = ((await res.json()) as { data: PrivateSourceDescriptor }).data;
+      commitSha = privateSource.commitSha;
+      defaultBranch = privateSource.defaultBranch;
+    } else {
+      const meta = await fetchRepoMetadata(fetch, parsed!.owner, parsed!.repo, config, controller.signal);
+      defaultBranch = meta.defaultBranch;
+      commitSha = await fetchCommitSha(fetch, parsed!.owner, parsed!.repo, meta.defaultBranch, config, controller.signal);
+    }
     const metadataMs = Date.now() - tMeta;
 
     const tDownload = Date.now();
-    const archive = await archives(parsed.owner, parsed.repo, commitSha, config, controller.signal);
+    // Private archives bypass the worker's on-disk cache so their content is not kept after the scan.
+    const archive = privateSource
+      ? await (async () => {
+          const r = await openArchiveUrl(fetch, privateSource!.archiveUrl, config, controller.signal);
+          const declared = Number.parseInt(r.headers.get("content-length") ?? "", 10);
+          return { stream: Readable.fromWeb(r.body as never), bytes: Number.isFinite(declared) ? declared : null, cache: "none" as const };
+        })()
+      : await archives(parsed!.owner, parsed!.repo, commitSha, config, controller.signal);
     const downloadMs = Date.now() - tDownload;
 
     workspace = await mkdtemp(path.join(tmpdir(), "vibeshield-run-"));
@@ -93,7 +119,7 @@ export async function executeScanJob(ctx: ScanJobContext): Promise<"completed" |
     const sourceDir = path.join(workspace, "src");
     controller.signal.addEventListener("abort", () => archive.stream.destroy(new Error("Download timed out.")), { once: true });
 
-    await heartbeat("extracting", { commitSha, defaultBranch: meta.defaultBranch });
+    await heartbeat("extracting", { commitSha, defaultBranch });
     const tExtract = Date.now();
     const stats = await extractArchiveSafely(archive.stream, sourceDir, config);
     clearTimeout(timer);

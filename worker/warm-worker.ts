@@ -105,6 +105,8 @@ type VerifyWork = {
     targetedFingerprints: string[];
     baselineFindings: BaselineFinding[];
     queuedAt: string;
+    /** Private repositories only: short-lived archive URL. Never logged or cached. */
+    archiveUrl?: string;
   };
 };
 
@@ -146,7 +148,8 @@ async function runVerification(work: VerifyWork) {
       targetedFingerprints: spec.targetedFingerprints,
       baselineFindings: spec.baselineFindings,
       config,
-      archives,
+      // Private snapshots are downloaded fresh and never enter the on-disk archive cache.
+      ...(spec.archiveUrl ? { archiveUrl: spec.archiveUrl } : { archives }),
     });
     const queuedAt = Date.parse(spec.queuedAt);
     result.summary.timings = {

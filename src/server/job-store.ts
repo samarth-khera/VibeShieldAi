@@ -80,6 +80,8 @@ export type JobRecord = {
 
 export type NewJob = Pick<JobRecord, "owner" | "repo" | "repositoryUrl" | "expiresAt"> & {
   clientIpHash?: string | null;
+  /** Pre-generated ID, used when access records must exist before the job can be claimed. */
+  id?: string;
 };
 export type JobPatch = Partial<Omit<JobRecord, "id" | "createdAt" | "updatedAt">>;
 

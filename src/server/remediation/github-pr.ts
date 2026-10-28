@@ -3,8 +3,6 @@ import { validateUnifiedDiff } from "./patch";
 import { applyDiffStrict, DiffApplyError } from "./strict-apply";
 
 export type PrFailureCode =
-  | "not_configured"
-  | "repository_not_allowed"
   | "credential_invalid"
   | "access_denied"
   | "repository_not_found"
@@ -28,24 +26,18 @@ export type PullRequestState = {
   number?: number;
   url?: string;
   state?: "open" | "closed" | "merged";
+  /** The default branch has commits after the scanned commit; the PR still targets it. */
+  baseAdvanced?: boolean;
+  /** GitHub user whose authorization opened (or tried to open) the PR, via the VibeShield app. */
+  openedBy?: { githubUserId: number; login: string };
   at: string;
 };
 
-export type PrAvailability = "enabled" | "not_configured" | "repository_not_allowed";
-
-export function pullRequestAvailability(
-  owner: string,
-  repo: string,
-  config: { githubWriteToken?: string; pullRequestRepositories: string[] },
-): PrAvailability {
-  if (!config.githubWriteToken) return "not_configured";
-  return config.pullRequestRepositories.includes(`${owner}/${repo}`.toLowerCase()) ? "enabled" : "repository_not_allowed";
-}
-
 /** One branch per remediation, so retries and double clicks converge on the same branch and PR. */
 export function remediationBranchName(scanJobId: string, remediationId: string): string {
-  const slug = (s: string) => s.replace(/[^a-zA-Z0-9]/g, "").slice(0, 10).toLowerCase();
-  return `vibeshield/fix-${slug(scanJobId)}-${slug(remediationId)}`;
+  const slug = (s: string, n: number) => s.replace(/[^a-zA-Z0-9]/g, "").slice(0, n).toLowerCase();
+  // The full remediation ID: two remediations never share a branch.
+  return `vibeshield/fix-${slug(scanJobId, 10)}-${slug(remediationId, 32)}`;
 }
 
 export type CreatePrParams = {
@@ -58,20 +50,18 @@ export type CreatePrParams = {
   unifiedDiff: string;
   title: string;
   body: string;
-  token?: string;
-  allowedRepositories: string[];
+  /** The requesting user's own GitHub App user-to-server token. */
+  token: string;
+  /** GitHub repository ID recorded for the scan; the live repository must have the same ID. */
+  expectedRepoId?: number;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
 };
 
 const MESSAGES: Record<PrFailureCode, string> = {
-  not_configured:
-    "GitHub write authorization is not configured on this deployment. Download the verified .patch file and apply it with `git apply`.",
-  repository_not_allowed:
-    "This deployment is not authorized to open pull requests in this repository. Download the verified .patch file instead.",
-  credential_invalid: "The server's GitHub credential was rejected (expired or revoked). No branch or pull request was created.",
-  access_denied: "The server's GitHub credential cannot write to this repository. No branch or pull request was created.",
-  repository_not_found: "The repository was not found or is not visible to the server's GitHub credential.",
+  credential_invalid: "GitHub rejected your authorization (expired or revoked). No branch or pull request was created.",
+  access_denied: "GitHub refused the write with your authorization. No branch or pull request was created.",
+  repository_not_found: "The repository was not found or is not visible to your GitHub authorization.",
   repository_mismatch: "The repository on GitHub no longer matches the scanned repository (renamed or transferred).",
   rate_limited: "GitHub API rate limit reached. Try again later.",
   commit_not_found: "The scanned commit no longer exists on GitHub, so the verified patch cannot be committed.",
@@ -111,9 +101,8 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
   });
 
   const token = params.token?.trim();
-  if (!token) return failed(new PrError("not_configured"));
+  if (!token) return failed(new PrError("credential_invalid"));
   const fullName = `${params.owner}/${params.repo}`;
-  if (!params.allowedRepositories.includes(fullName.toLowerCase())) return failed(new PrError("repository_not_allowed"));
 
   const fetchFn = params.fetchImpl ?? fetch;
   const base = `https://api.github.com/repos/${encodeURIComponent(params.owner)}/${encodeURIComponent(params.repo)}`;
@@ -154,8 +143,15 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
     const repoRes = await gh("GET", "");
     if (repoRes.status === 404 || repoRes.status === 403) throw new PrError("repository_not_found");
     if (repoRes.status !== 200) throw new PrError("github_error", ghMessage(repoRes));
-    const repoInfo = repoRes.json as { full_name?: string; default_branch?: string; archived?: boolean; permissions?: { push?: boolean } };
+    const repoInfo = repoRes.json as {
+      id?: number;
+      full_name?: string;
+      default_branch?: string;
+      archived?: boolean;
+      permissions?: { push?: boolean };
+    };
     if (repoInfo.full_name?.toLowerCase() !== fullName.toLowerCase()) throw new PrError("repository_mismatch");
+    if (params.expectedRepoId !== undefined && repoInfo.id !== params.expectedRepoId) throw new PrError("repository_mismatch");
     if (repoInfo.archived) throw new PrError("access_denied", "repository is archived");
     if (repoInfo.permissions && repoInfo.permissions.push === false) throw new PrError("access_denied");
     const baseBranch = repoInfo.default_branch;
@@ -254,6 +250,10 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
       if (!headSha) throw new PrError("github_error", "branch was not created");
     }
 
+    // The PR always targets the default branch; report (not hide) that it moved after the scan.
+    const baseRef = await gh("GET", `/git/ref/heads/${baseBranch}`);
+    const baseAdvanced = baseRef.status === 200 && String((baseRef.json.object as { sha?: string })?.sha) !== params.commitSha;
+
     // 5. One pull request per remediation branch, whatever its state.
     const findExisting = async (): Promise<PullRequestState | null> => {
       const list = await gh("GET", `/pulls?head=${encodeURIComponent(`${params.owner}:${branch}`)}&state=all&per_page=5`);
@@ -271,6 +271,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
         number: pr.number,
         url: pr.html_url,
         state,
+        baseAdvanced,
         at: at(),
       };
     };
@@ -294,6 +295,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
         number: Number(pr.json.number),
         url: String(pr.json.html_url),
         state: "open",
+        baseAdvanced,
         at: at(),
       };
     }

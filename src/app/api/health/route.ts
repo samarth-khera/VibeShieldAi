@@ -68,7 +68,16 @@ export async function GET() {
     warmWorker = { status: "disabled", lastSeenSecondsAgo: null, fallback: "github-actions" };
   }
 
-  // 4. Platform isolation specifications
+  // 4. GitHub App user authorization: whether it is configured and its tables exist. No secrets.
+  let githubApp: "configured" | "not_configured" | "setup_incomplete" = "not_configured";
+  if (config.githubApp) {
+    githubApp = await prisma.oAuthState
+      .count({ where: { expiresAt: { lt: new Date(0) } } })
+      .then(() => "configured" as const)
+      .catch(() => "setup_incomplete" as const);
+  }
+
+  // 5. Platform isolation specifications
   const isolation = getPlatformIsolationInfo();
 
   const status = overallHealthy
@@ -90,6 +99,7 @@ export async function GET() {
         redis: redisStatus,
         worker: workerStatus,
         warmWorker,
+        githubApp,
       },
       isolation: {
         mode: isolation.isolationMode,

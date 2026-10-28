@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       repository_url:
-        description: 'Public GitHub repository URL to scan'
+        description: "Public repository URL, or 'private' (the worker then gets the source from the signed API)"
         required: true
         type: string
       callback_url:

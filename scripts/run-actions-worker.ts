@@ -5,6 +5,7 @@ import { verificationSpecSigningPayload } from "../src/server/callback-auth";
 import { executeScanJob } from "../src/server/worker/scan-executor";
 import { getSigned, postSigned } from "../src/server/worker/signed-http";
 import { verifyRemediationOnSnapshot } from "../src/server/remediation/verify";
+import { PRIVATE_REPOSITORY } from "../src/server/worker/private-repository";
 import type { RescanComparison } from "../src/server/remediation/types";
 import type { BaselineFinding } from "../src/server/remediation/sandbox";
 
@@ -81,6 +82,8 @@ type VerificationSpec = {
   targetedFingerprints: string[];
   baselineFindings: BaselineFinding[];
   queuedAt: string;
+  /** Private repositories only: short-lived archive URL. Never logged. */
+  archiveUrl?: string;
 };
 
 async function runVerification(ctx: RunContext, remediationId: string) {
@@ -101,17 +104,25 @@ async function runVerification(ctx: RunContext, remediationId: string) {
     const spec = ((await res.json()) as { data: VerificationSpec }).data;
     const specFetchMs = Date.now() - tSpec;
 
-    const parsed = parseGithubRepoUrl(ctx.repoUrl);
+    // Private repositories are dispatched with a placeholder; their name stays out of public logs.
+    const isPrivate = ctx.repoUrl === PRIVATE_REPOSITORY;
+    const parsed = isPrivate ? null : parseGithubRepoUrl(ctx.repoUrl);
     if (
       spec.scanJobId !== jobId ||
       spec.remediationId !== remediationId ||
-      !parsed.ok ||
-      parsed.owner.toLowerCase() !== spec.owner.toLowerCase() ||
-      parsed.repo.toLowerCase() !== spec.repo.toLowerCase()
+      (isPrivate
+        ? !spec.archiveUrl
+        : !parsed?.ok ||
+          parsed.owner.toLowerCase() !== spec.owner.toLowerCase() ||
+          parsed.repo.toLowerCase() !== spec.repo.toLowerCase())
     ) {
       throw new Error("Verification spec does not match the dispatched job.");
     }
-    console.log(`Verifying ${spec.owner}/${spec.repo}@${spec.commitSha} against ${spec.baselineFindings.length} baseline findings`);
+    console.log(
+      isPrivate
+        ? `Verifying a private repository against ${spec.baselineFindings.length} baseline findings`
+        : `Verifying ${spec.owner}/${spec.repo}@${spec.commitSha} against ${spec.baselineFindings.length} baseline findings`,
+    );
 
     const result = await verifyRemediationOnSnapshot({
       owner: spec.owner,
@@ -121,6 +132,7 @@ async function runVerification(ctx: RunContext, remediationId: string) {
       targetedFingerprints: spec.targetedFingerprints,
       baselineFindings: spec.baselineFindings,
       config: getConfig(),
+      archiveUrl: isPrivate ? spec.archiveUrl : undefined,
     });
 
     const queuedAt = Date.parse(spec.queuedAt);

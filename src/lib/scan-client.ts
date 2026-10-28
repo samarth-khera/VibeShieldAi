@@ -290,8 +290,6 @@ export type PublicRemediation = {
 };
 
 export type PullRequestFailureCode =
-  | "not_configured"
-  | "repository_not_allowed"
   | "credential_invalid"
   | "access_denied"
   | "repository_not_found"
@@ -304,19 +302,70 @@ export type PullRequestFailureCode =
   | "github_error"
   | "network_error";
 
+/** Outcome of the last pull-request attempt, as GitHub reported it. */
 export type RemediationPullRequest = {
-  availability?: "enabled" | "not_configured" | "repository_not_allowed";
-  status?: "created" | "exists" | "failed";
+  status: "created" | "exists" | "failed";
   code?: PullRequestFailureCode;
-  message?: string;
-  branch?: string;
+  message: string;
+  branch: string;
   baseBranch?: string;
   headSha?: string;
   number?: number;
   url?: string;
   state?: "open" | "closed" | "merged";
-  at?: string;
+  baseAdvanced?: boolean;
+  openedBy?: { githubUserId: number; login: string };
+  at: string;
 };
+
+export type GithubAuthFailureCode =
+  | "not_configured"
+  | "not_connected"
+  | "authorization_expired"
+  | "authorization_revoked"
+  | "repository_not_found"
+  | "repository_changed"
+  | "not_installed"
+  | "no_push_permission"
+  | "app_lacks_permission"
+  | "rate_limited"
+  | "github_unavailable";
+
+/** The current browser session's GitHub App authorization, checked live by the server. */
+export type GithubStatus = {
+  configured: boolean;
+  unavailableReason?: "not_configured" | "setup_incomplete";
+  connected: boolean;
+  user?: { login: string; avatarUrl: string | null };
+  repository?: {
+    fullName: string;
+    defaultBranch?: string;
+    isPrivate?: boolean;
+    canRead: boolean;
+    canPush: boolean;
+    installed: boolean;
+    appCanWrite: boolean;
+    readyToWrite: boolean;
+    reason?: GithubAuthFailureCode;
+    message?: string;
+  };
+  authorizationProblem?: GithubAuthFailureCode;
+  links: { connect: string; install: string; manageInstallations: string };
+};
+
+export const fetchGithubStatus = (jobId: string, returnTo: string) =>
+  request<GithubStatus>(
+    `/api/auth/github/status?jobId=${encodeURIComponent(jobId)}&returnTo=${encodeURIComponent(returnTo)}`,
+  );
+
+export const disconnectGithub = () =>
+  request<{ connected: false; revokedAtGitHub?: boolean }>("/api/auth/github/disconnect", { method: "POST" });
+
+/** SHA-256 (hex) of the exact diff text shown to the user, sent as their confirmation. */
+export async function diffSha256(diff: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(diff));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 export const createRemediationPreview = (jobId: string, findingId: string) =>
   request<PublicRemediation>(`/api/scans/${encodeURIComponent(jobId)}/remediation/preview`, {
@@ -340,11 +389,18 @@ export const applyRemediation = (jobId: string, remediationId: string) =>
     { method: "POST" },
   );
 
-/** The server uses its own credential; the browser never sends or sees a GitHub token. */
-export const createRemediationPr = (jobId: string, remediationId: string) =>
+/**
+ * Opens the PR with the user's own GitHub App authorization (held server-side in an HttpOnly
+ * session; the browser never sees a token). `approvedDiffSha256` confirms the exact diff shown.
+ */
+export const createRemediationPr = (jobId: string, remediationId: string, approvedDiffSha256: string) =>
   request<{ remediation: PublicRemediation; pullRequest: RemediationPullRequest }>(
     `/api/scans/${encodeURIComponent(jobId)}/remediation/${encodeURIComponent(remediationId)}/pr`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ approvedDiffSha256 }),
+    },
   );
 
 

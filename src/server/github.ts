@@ -11,6 +11,8 @@ export const ALLOWED_HOSTS: ReadonlySet<string> = new Set([API_HOST, ARCHIVE_HOS
 const MAX_REDIRECTS = 3;
 
 export type RepoMetadata = {
+  /** GitHub's immutable repository ID. */
+  id: number;
   fullName: string;
   defaultBranch: string;
   description: string | null;
@@ -122,6 +124,7 @@ export async function fetchRepoMetadata(
     throw new RetrievalError("rejected_by_limits", "repo_too_large", "Repository is larger than the supported size limit.");
   }
   return {
+    id: typeof body.id === "number" ? body.id : 0,
     fullName: body.full_name,
     defaultBranch,
     description: typeof body.description === "string" ? body.description.slice(0, 500) : null,
@@ -225,4 +228,56 @@ export async function fetchFileAtCommit(
   }
 
   return await res.text();
+}
+
+/**
+ * Resolves the short-lived, archive-scoped download URL GitHub issues for a private repository
+ * tarball (the `Location` of the API redirect). The URL embeds a temporary token that only grants
+ * this one archive, so a worker can download the snapshot without ever holding the user's token.
+ * Treat the result as a secret: never log it.
+ */
+export async function resolveArchiveUrl(
+  fetchImpl: FetchLike,
+  owner: string,
+  repo: string,
+  sha: string,
+  config: ServerConfig,
+  signal: AbortSignal,
+): Promise<string> {
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw new RetrievalError("failed", "internal_error", "Retrieval failed unexpectedly.");
+  const url = `https://${API_HOST}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tarball/${sha}`;
+  let res: Response;
+  try {
+    res = await fetchImpl(url, { headers: headers(config, "application/vnd.github+json"), redirect: "manual", signal });
+  } catch {
+    throw new RetrievalError("download_failed", "network_error", "Could not reach GitHub.");
+  }
+  await res.body?.cancel().catch(() => undefined);
+  const loc = res.headers.get("location");
+  if (res.status < 300 || res.status >= 400 || !loc) throw mapHttpFailure(res);
+  const target = assertApprovedUrl(new URL(loc, url).toString());
+  if (target.hostname !== ARCHIVE_HOST) throw new RetrievalError("download_failed", "redirect_rejected", "GitHub returned an unexpected redirect.");
+  return target.toString();
+}
+
+/** Downloads an archive from a URL produced by `resolveArchiveUrl`, with the usual size limit. */
+export async function openArchiveUrl(
+  fetchImpl: FetchLike,
+  archiveUrl: string,
+  config: Pick<ServerConfig, "maxArchiveBytes">,
+  signal: AbortSignal,
+): Promise<Response> {
+  const target = assertApprovedUrl(archiveUrl);
+  if (target.hostname !== ARCHIVE_HOST) throw new RetrievalError("download_failed", "redirect_rejected", "Unexpected archive host.");
+  const res = await safeFetch(fetchImpl, target.toString(), { headers: { "User-Agent": "VibeShieldAI-Retriever/0.1" } }, signal);
+  if (!res.ok || !res.body) {
+    await res.body?.cancel().catch(() => undefined);
+    throw mapHttpFailure(res);
+  }
+  const declared = Number.parseInt(res.headers.get("content-length") ?? "", 10);
+  if (Number.isFinite(declared) && declared > config.maxArchiveBytes) {
+    await res.body.cancel().catch(() => undefined);
+    throw new RetrievalError("rejected_by_limits", "archive_too_large", "Repository archive exceeds the size limit.");
+  }
+  return res;
 }

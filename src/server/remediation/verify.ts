@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import type { ServerConfig } from "../config";
-import { openArchive, type FetchLike } from "../github";
+import { openArchive, openArchiveUrl, type FetchLike } from "../github";
 import { extractArchiveSafely } from "../archive";
 import type { ScanEngineResult } from "../scanners/types";
 import type { ArchiveSource } from "../worker/scan-executor";
@@ -25,6 +25,8 @@ export type SnapshotVerificationParams = {
   scanEngine?: (dir: string) => Promise<ScanEngineResult>;
   /** Archive source (the warm worker reuses the archive its scan already downloaded). */
   archives?: ArchiveSource;
+  /** Private repositories: short-lived archive URL from the signed spec. Takes precedence. */
+  archiveUrl?: string;
 };
 
 /**
@@ -53,7 +55,10 @@ export async function verifyRemediationOnSnapshot(params: SnapshotVerificationPa
     const tDownload = Date.now();
     let stream: Readable;
     let archiveCache: "hit" | "miss" | "none" = "none";
-    if (params.archives) {
+    if (params.archiveUrl) {
+      const res = await openArchiveUrl(fetchImpl, params.archiveUrl, params.config, controller.signal);
+      stream = Readable.fromWeb(res.body as never);
+    } else if (params.archives) {
       const a = await params.archives(params.owner, params.repo, params.commitSha, params.config as ServerConfig, controller.signal);
       stream = a.stream;
       archiveCache = a.cache;

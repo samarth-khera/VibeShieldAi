@@ -14,7 +14,6 @@ describe("scans-service API logic", () => {
     store = new InMemoryJobStore();
     enqueued = [];
     config = {
-      pullRequestRepositories: [],
       maxArchiveBytes: 50 * 1024 * 1024,
       maxUnpackedBytes: 200 * 1024 * 1024,
       maxFileCount: 10000,

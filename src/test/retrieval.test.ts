@@ -128,7 +128,6 @@ describe("runRetrieval pipeline", () => {
     store = new MockJobStore();
     testTmpDir = await mkdtemp(path.join(tmpdir(), "retrieval-test-"));
     config = {
-      pullRequestRepositories: [],
       maxArchiveBytes: 10 * 1024 * 1024,
       maxUnpackedBytes: 20 * 1024 * 1024,
       maxFileCount: 50,

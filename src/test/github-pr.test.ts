@@ -1,146 +1,7 @@
-import { createHash } from "node:crypto";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { createRemediationPullRequest, remediationBranchName } from "@/server/remediation/github-pr";
 import { applyDiffStrict, DiffApplyError } from "@/server/remediation/strict-apply";
-import { handleCreatePullRequest } from "@/server/remediation/api";
-import { approveRemediation, diffDigest, type RemediationDeps } from "@/server/remediation/service";
-import type { ServerConfig } from "@/server/config";
-import { InMemoryJobStore } from "@/test/mock-store";
-
-/**
- * A small content-addressed model of GitHub's Git Data + Pulls API: enough to prove that the PR
- * branch holds exactly the patched files on top of the scanned commit, and that retries converge.
- */
-type Entry = { path: string; mode: string; type: "blob" | "tree"; sha: string };
-class FakeGitHub {
-  blobs = new Map<string, string>();
-  trees = new Map<string, Entry[]>();
-  commits = new Map<string, { tree: string; parents: string[]; message: string }>();
-  refs = new Map<string, string>();
-  pulls: { number: number; head: string; base: string; title: string; body: string; state: string; merged_at: null }[] = [];
-  calls: { method: string; path: string }[] = [];
-  repo = { full_name: "acme/webapp", default_branch: "main", archived: false, permissions: { push: true } };
-  mode: "ok" | "unauthorized" | "deny_writes" | "rate_limited" | "offline" | "missing_repo" = "ok";
-
-  private sha(kind: string, data: unknown) {
-    return createHash("sha1").update(kind + JSON.stringify(data)).digest("hex");
-  }
-  blob(content: string) {
-    const sha = this.sha("blob", content);
-    this.blobs.set(sha, content);
-    return sha;
-  }
-  tree(entries: Entry[]) {
-    const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
-    const sha = this.sha("tree", sorted);
-    this.trees.set(sha, sorted);
-    return sha;
-  }
-  /** Builds nested trees from a flat path → entry map. */
-  build(flat: Map<string, { mode: string; sha: string }>): string {
-    const here: Entry[] = [];
-    const dirs = new Map<string, Map<string, { mode: string; sha: string }>>();
-    for (const [p, e] of flat) {
-      const [head, ...rest] = p.split("/");
-      if (rest.length === 0) here.push({ path: head, mode: e.mode, type: "blob", sha: e.sha });
-      else {
-        if (!dirs.has(head)) dirs.set(head, new Map());
-        dirs.get(head)!.set(rest.join("/"), e);
-      }
-    }
-    for (const [name, sub] of dirs) here.push({ path: name, mode: "040000", type: "tree", sha: this.build(sub) });
-    return this.tree(here);
-  }
-  flatten(treeSha: string, prefix = ""): Map<string, { mode: string; sha: string }> {
-    const out = new Map<string, { mode: string; sha: string }>();
-    for (const e of this.trees.get(treeSha) ?? []) {
-      if (e.type === "tree") for (const [p, v] of this.flatten(e.sha, `${prefix}${e.path}/`)) out.set(p, v);
-      else out.set(`${prefix}${e.path}`, { mode: e.mode, sha: e.sha });
-    }
-    return out;
-  }
-  seed(files: Record<string, string | { content: string; mode: string }>): string {
-    const flat = new Map<string, { mode: string; sha: string }>();
-    for (const [p, v] of Object.entries(files)) {
-      const { content, mode } = typeof v === "string" ? { content: v, mode: "100644" } : v;
-      flat.set(p, { mode, sha: this.blob(content) });
-    }
-    const tree = this.build(flat);
-    const sha = this.sha("commit", { tree, parents: [] });
-    this.commits.set(sha, { tree, parents: [], message: "init" });
-    this.refs.set("heads/main", sha);
-    return sha;
-  }
-  filesAt(commitSha: string): Record<string, string> {
-    const c = this.commits.get(commitSha)!;
-    return Object.fromEntries([...this.flatten(c.tree)].map(([p, e]) => [p, this.blobs.get(e.sha)!]));
-  }
-
-  fetch = async (url: string, init?: RequestInit): Promise<Response> => {
-    const method = init?.method ?? "GET";
-    const path = url.replace("https://api.github.com/repos/acme/webapp", "");
-    this.calls.push({ method, path });
-    const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
-      new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
-    if (this.mode === "offline") throw new TypeError("fetch failed");
-    if (this.mode === "unauthorized") return json(401, { message: "Bad credentials" });
-    if (this.mode === "rate_limited") return json(403, { message: "API rate limit exceeded" }, { "x-ratelimit-remaining": "0" });
-    if (this.mode === "missing_repo") return json(404, { message: "Not Found" });
-    if (this.mode === "deny_writes" && method !== "GET") return json(403, { message: "Resource not accessible by personal access token" });
-    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-
-    if (method === "GET" && path === "") return json(200, this.repo);
-    let m: RegExpMatchArray | null;
-    if (method === "GET" && (m = path.match(/^\/git\/commits\/([0-9a-f]+)$/))) {
-      const c = this.commits.get(m[1]);
-      return c ? json(200, { sha: m[1], tree: { sha: c.tree }, parents: c.parents.map((sha) => ({ sha })) }) : json(404, {});
-    }
-    if (method === "GET" && (m = path.match(/^\/git\/trees\/([0-9a-f]+)$/))) {
-      const t = this.trees.get(m[1]);
-      return t ? json(200, { sha: m[1], tree: t }) : json(404, {});
-    }
-    if (method === "GET" && (m = path.match(/^\/git\/blobs\/([0-9a-f]+)$/))) {
-      const b = this.blobs.get(m[1]);
-      return b === undefined ? json(404, {}) : json(200, { encoding: "base64", content: Buffer.from(b).toString("base64") });
-    }
-    if (method === "POST" && path === "/git/trees") {
-      const flat = this.flatten(body.base_tree);
-      for (const e of body.tree) flat.set(e.path, { mode: e.mode, sha: this.blob(e.content) });
-      return json(201, { sha: this.build(flat) });
-    }
-    if (method === "POST" && path === "/git/commits") {
-      const sha = this.sha("commit", { ...body, n: this.commits.size });
-      this.commits.set(sha, { tree: body.tree, parents: body.parents, message: body.message });
-      return json(201, { sha });
-    }
-    if (method === "GET" && (m = path.match(/^\/git\/ref\/heads\/(.+)$/))) {
-      const sha = this.refs.get(`heads/${m[1]}`);
-      return sha ? json(200, { object: { sha } }) : json(404, { message: "Not Found" });
-    }
-    if (method === "POST" && path === "/git/refs") {
-      const name = body.ref.replace(/^refs\//, "");
-      if (this.refs.has(name)) return json(422, { message: "Reference already exists" });
-      this.refs.set(name, body.sha);
-      return json(201, { ref: body.ref });
-    }
-    if (method === "GET" && path.startsWith("/pulls?")) {
-      const head = decodeURIComponent(new URL(`https://x${path}`).searchParams.get("head")!).split(":")[1];
-      return json(
-        200,
-        this.pulls.filter((p) => p.head === head).map((p) => ({ ...p, html_url: `https://github.com/acme/webapp/pull/${p.number}`, base: { ref: p.base } })),
-      );
-    }
-    if (method === "POST" && path === "/pulls") {
-      if (this.pulls.some((p) => p.head === body.head && p.state === "open")) {
-        return json(422, { message: "A pull request already exists" });
-      }
-      const number = this.pulls.length + 1;
-      this.pulls.push({ number, head: body.head, base: body.base, title: body.title, body: body.body, state: "open", merged_at: null });
-      return json(201, { number, html_url: `https://github.com/acme/webapp/pull/${number}` });
-    }
-    return json(404, { message: `unhandled ${method} ${path}` });
-  };
-}
+import { FakeGitHub } from "@/test/fake-github";
 
 const REQS = "flask==2.0.0\nrequests==2.19.0\nnumpy==1.26.0\n";
 const DIFF = "--- a/api/requirements.txt\n+++ b/api/requirements.txt\n@@ -2,1 +2,1 @@\n-requests==2.19.0\n+requests==2.31.0\n";
@@ -156,8 +17,8 @@ const params = () => ({
   unifiedDiff: DIFF,
   title: "[VibeShield AI] Bump requests",
   body: "Fixes GHSA-x",
-  token: "test-write-token",
-  allowedRepositories: ["acme/webapp"],
+  token: "test-user-token",
+  expectedRepoId: 4242,
   fetchImpl: gh.fetch,
 });
 
@@ -184,6 +45,18 @@ describe("strict diff application", () => {
 });
 
 describe("createRemediationPullRequest against a modelled GitHub", () => {
+  it("sends only the user's own token and reports a base branch that moved since the scan", async () => {
+    const result = await createRemediationPullRequest(params());
+    expect(new Set(gh.calls.map((c) => c.auth))).toEqual(new Set(["Bearer test-user-token"]));
+    expect(result.baseAdvanced).toBe(false);
+    const again = await createRemediationPullRequest({ ...params(), remediationId: "0f2b1c3d-aaaa-bbbb-cccc-000000000009" });
+    expect(again.status).toBe("created");
+    gh.refs.set("heads/main", "f".repeat(40));
+    const third = await createRemediationPullRequest({ ...params(), remediationId: "0f2b1c3d-aaaa-bbbb-cccc-000000000010" });
+    expect(third.baseAdvanced).toBe(true);
+    expect(gh.commits.get(third.headSha!)!.parents).toEqual([base]); // still based on the verified commit
+  });
+
   it("commits exactly the patched file on a new branch whose only parent is the scanned commit", async () => {
     const result = await createRemediationPullRequest(params());
     expect(result.status).toBe("created");
@@ -247,10 +120,10 @@ describe("createRemediationPullRequest against a modelled GitHub", () => {
     expect(gh.calls.some((c) => c.method === "POST")).toBe(false);
   });
 
-  it("refuses repositories outside the allowlist without calling GitHub", async () => {
-    const result = await createRemediationPullRequest({ ...params(), allowedRepositories: ["acme/other"] });
-    expect(result).toMatchObject({ status: "failed", code: "repository_not_allowed" });
-    expect(gh.calls).toHaveLength(0);
+  it("refuses a repository recreated under the same name (different immutable ID)", async () => {
+    const result = await createRemediationPullRequest({ ...params(), expectedRepoId: 9999 });
+    expect(result).toMatchObject({ status: "failed", code: "repository_mismatch" });
+    expect(gh.calls.some((c) => c.method === "POST")).toBe(false);
   });
 
   it("refuses a repository that was renamed or transferred since the scan", async () => {
@@ -270,7 +143,7 @@ describe("createRemediationPullRequest against a modelled GitHub", () => {
     expect(result.status).toBe("failed");
     expect(result.code).toBe(code);
     expect(result.url).toBeUndefined();
-    expect(result.message).not.toContain("test-write-token");
+    expect(result.message).not.toContain("test-user-token");
     expect(gh.pulls).toHaveLength(0);
   });
 
@@ -282,97 +155,3 @@ describe("createRemediationPullRequest against a modelled GitHub", () => {
   });
 });
 
-describe("PR endpoint gates", () => {
-  const config = (over: Partial<ServerConfig> = {}) =>
-    ({ githubWriteToken: "test-write-token", pullRequestRepositories: ["acme/webapp"], githubApiTimeoutMs: 5000, ...over }) as ServerConfig;
-
-  async function setup(status: "verified" | "needs_review" | "approved" = "verified") {
-    const COMMIT = base;
-    const store = new InMemoryJobStore();
-    const job = await store.create({ owner: "acme", repo: "webapp", repositoryUrl: "https://github.com/acme/webapp", expiresAt: new Date(Date.now() + 3_600_000) });
-    await store.update(job.id, { status: "completed", commitSha: COMMIT, defaultBranch: "main" });
-    const rem = await store.createRemediation({
-      id: "0f2b1c3d-aaaa-bbbb-cccc-000000000002",
-      scanJobId: job.id,
-      findingFingerprints: ["fp"],
-      affectedFiles: ["api/requirements.txt"],
-      commitSha: COMMIT,
-      eligibility: "safe",
-      eligibilityReason: "Patch-level dependency bump",
-      requiresRotation: false,
-      patchSummary: "Bump requests",
-      unifiedDiff: DIFF,
-      status: "preview",
-      approvedAt: null,
-      rescanStatus: null,
-      branchName: null,
-      pullRequestUrl: null,
-    });
-    const deps: RemediationDeps = { store, fetchImpl: gh.fetch, config: config() };
-    await approveRemediation(job.id, rem.id, deps);
-    if (status !== "approved") await store.updateRemediation(job.id, rem.id, { status, rescanStatus: status === "verified" ? "verified" : "needs_review" });
-    return { store, job, rem, deps };
-  }
-
-  it("records the approved diff digest", async () => {
-    const { store, job, rem } = await setup("approved");
-    const r = await store.getRemediation(job.id, rem.id);
-    expect((r!.approvedOperations as { diffSha256: string }).diffSha256).toBe(diffDigest(DIFF));
-  });
-
-  it("rejects unverified and needs-review fixes before touching GitHub", async () => {
-    for (const status of ["approved", "needs_review"] as const) {
-      const { job, rem, deps } = await setup(status);
-      const res = await handleCreatePullRequest(job.id, rem.id, deps);
-      expect(res.status).toBe(409);
-      expect((await res.json()).error.code).toBe("not_verified");
-    }
-    expect(gh.calls).toHaveLength(0);
-  });
-
-  it("rejects a patch that differs from the approved one", async () => {
-    const { store, job, rem, deps } = await setup();
-    await store.updateRemediation(job.id, rem.id, { unifiedDiff: DIFF.replace("2.31.0", "9.9.9") });
-    const res = await handleCreatePullRequest(job.id, rem.id, deps);
-    expect(res.status).toBe(409);
-    expect((await res.json()).error.code).toBe("patch_mismatch");
-    expect(gh.calls).toHaveLength(0);
-  });
-
-  it("opens the PR through the endpoint, persists it, and reports the same PR on retry", async () => {
-    const { job, rem, deps } = await setup();
-    vi.useFakeTimers({ toFake: ["Date"] });
-    const first = await handleCreatePullRequest(job.id, rem.id, deps);
-    expect(first.status).toBe(201);
-    const a = (await first.json()).data;
-    expect(a.pullRequest).toMatchObject({ status: "created", number: 1 });
-    expect(a.remediation.pullRequestUrl).toBe("https://github.com/acme/webapp/pull/1");
-    expect(a.remediation.pullRequest).toMatchObject({ availability: "enabled", status: "created" });
-    expect(gh.pulls[0].body).toContain("Patch applied to the scanned commit");
-    expect(gh.pulls[0].body).toContain(base);
-
-    // Inside the recheck window the stored outcome is returned without calling GitHub again.
-    const callsBefore = gh.calls.length;
-    const cachedRes = await handleCreatePullRequest(job.id, rem.id, deps);
-    expect((await cachedRes.json()).data.pullRequest).toMatchObject({ status: "created", number: 1 });
-    expect(gh.calls.length).toBe(callsBefore);
-
-    vi.setSystemTime(Date.now() + 16_000);
-    const second = await handleCreatePullRequest(job.id, rem.id, deps);
-    vi.useRealTimers();
-    expect(second.status).toBe(200);
-    expect((await second.json()).data.pullRequest).toMatchObject({ status: "exists", number: 1 });
-    expect(gh.pulls).toHaveLength(1);
-  });
-
-  it("returns 503 not_configured with the truthful state when no write credential exists", async () => {
-    const { job, rem, deps } = await setup();
-    const res = await handleCreatePullRequest(job.id, rem.id, { ...deps, config: config({ githubWriteToken: undefined }) });
-    expect(res.status).toBe(503);
-    const body = await res.json();
-    expect(body.error.code).toBe("not_configured");
-    expect(body.data.remediation.pullRequest).toMatchObject({ availability: "not_configured", status: "failed" });
-    expect(body.data.remediation.pullRequestUrl).toBeNull();
-    expect(JSON.stringify(body)).not.toContain("test-write-token");
-  });
-});

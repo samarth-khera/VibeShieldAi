@@ -18,7 +18,10 @@ import {
 import { toPublicRemediation, type RemediationRecord, type RescanComparison } from "./types";
 import { isWarmLease } from "../quota";
 import { verificationClaimOf } from "./claims";
-import { pullRequestAvailability } from "./github-pr";
+import { AUTH_FAILURE, authorizeRepository, checkJobAccess } from "../auth/repository-access";
+import { isSameOrigin, type AuthDeps } from "../auth/service";
+import { loadScanAccess } from "../auth/repository-access";
+import { resolvePrivateSource } from "../auth/private-source";
 import type { JobRecord, JobStore } from "../job-store";
 
 const REMEDIATION_ID_RE = /^[0-9a-f-]{36}$/;
@@ -63,9 +66,7 @@ export async function handleListRemediations(
   await deps.store.reapStale(new Date(), deps.config ?? getConfig()).catch(() => undefined);
   await pumpVerifications(scanJobId, deps).catch(() => undefined);
   const list = await deps.store.listRemediations(scanJobId);
-  const job = list.length ? await deps.store.get(scanJobId) : null;
-  const availability = job ? pullRequestAvailability(job.owner, job.repo, deps.config ?? getConfig()) : undefined;
-  return ok(list.map((r) => toPublicRemediation(r, availability)));
+  return ok(list.map((r) => toPublicRemediation(r)));
 }
 
 export async function handleApproveRemediation(
@@ -107,8 +108,7 @@ export async function handleApplyRemediation(
 }
 
 const PR_FAILURE_STATUS: Record<string, number> = {
-  not_configured: 503,
-  repository_not_allowed: 403,
+  credential_invalid: 401,
   access_denied: 403,
   repository_not_found: 404,
   rate_limited: 429,
@@ -119,23 +119,73 @@ const PR_FAILURE_STATUS: Record<string, number> = {
   unsafe_target: 422,
 };
 
+const PrRequestSchema = z.object({ approvedDiffSha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict();
+
 /**
- * Opens a GitHub PR for a verified remediation using only the server-side credential. A client
- * cannot choose the repository, branch, commit or credential: all come from the stored scan.
+ * Opens a GitHub PR for a verified remediation with the requesting user's own GitHub App
+ * authorization, re-checked live against the exact scanned repository on every call. The client
+ * supplies only the digest of the diff it showed the user; repository, commit, branch and diff all
+ * come from the stored scan.
  */
 export async function handleCreatePullRequest(
+  req: Request,
   scanJobId: string,
   remediationId: string,
   deps: RemediationDeps,
 ): Promise<Response> {
   if (!JOB_ID_RE.test(scanJobId)) return fail(404, "not_found", "Scan job not found.");
-  const config = deps.config ?? getConfig();
+  const auth = deps.auth;
+  if (!auth?.app) return fail(503, "not_configured", AUTH_FAILURE.not_configured.message);
+  if (!isSameOrigin(req, auth.app)) return fail(403, "forbidden_origin", "Cross-site request refused.");
+
+  let confirmed: string;
+  try {
+    confirmed = PrRequestSchema.parse(await req.json()).approvedDiffSha256;
+  } catch {
+    return fail(400, "invalid_request", "Confirm the exact diff before opening a pull request.");
+  }
 
   try {
     const job = await deps.store.get(scanJobId);
-    const availability = job ? pullRequestAvailability(job.owner, job.repo, config) : undefined;
-    const { remediation, pullRequest } = await requestPullRequest(scanJobId, remediationId, deps);
-    const body = { remediation: toPublicRemediation(remediation, availability), pullRequest };
+    if (!job) return fail(404, "not_found", "Scan job not found.");
+    const gate = await checkJobAccess(req, auth, job);
+    if (gate.denied) return gate.denied;
+
+    const authz = await authorizeRepository(req, auth, job, gate.scanAccess, "write");
+    const repository = `${job.owner}/${job.repo}`;
+    if (!authz.ok) {
+      await auth.store.audit({
+        action: "pull_request",
+        outcome: "denied",
+        githubUserId: authz.account?.githubUserId,
+        githubLogin: authz.account?.login,
+        scanJobId,
+        remediationId,
+        repository,
+        detail: authz.code,
+      });
+      const f = AUTH_FAILURE[authz.code];
+      return fail(f.status, authz.code, f.message);
+    }
+
+    const { remediation, pullRequest } = await requestPullRequest(scanJobId, remediationId, deps, {
+      githubUserId: authz.account.githubUserId,
+      login: authz.account.login,
+      token: authz.token,
+      repoId: authz.access.repoId!,
+      confirmedDiffSha256: confirmed,
+    });
+    await auth.store.audit({
+      action: "pull_request",
+      outcome: pullRequest.status === "failed" ? `failed:${pullRequest.code}` : pullRequest.status,
+      githubUserId: authz.account.githubUserId,
+      githubLogin: authz.account.login,
+      scanJobId,
+      remediationId,
+      repository,
+      detail: pullRequest.number ? `#${pullRequest.number}` : null,
+    });
+    const body = { remediation: toPublicRemediation(remediation), pullRequest };
     if (pullRequest.status === "failed") {
       const status = PR_FAILURE_STATUS[pullRequest.code ?? ""] ?? 502;
       return Response.json(
@@ -209,12 +259,29 @@ export async function handleVerificationSpec(
     return fail(409, "not_awaiting_verification", "This remediation is not awaiting verification.");
   }
 
-  return ok(await buildVerificationSpec(job, remediation, deps.store));
+  try {
+    return ok(await buildVerificationSpec(job, remediation, deps.store, deps.auth));
+  } catch (err) {
+    if (err instanceof RemediationError) return fail(err.status, err.code, err.message);
+    throw err;
+  }
 }
 
 /** The approved remediation and immutable commit a verification worker needs; never includes secrets. */
-export async function buildVerificationSpec(job: JobRecord, remediation: RemediationRecord, store: JobStore) {
+export async function buildVerificationSpec(job: JobRecord, remediation: RemediationRecord, store: JobStore, auth?: AuthDeps) {
+  // Private repositories: a fresh short-lived archive URL obtained with the authorizing user's
+  // token. Workers never receive the token itself, and the spec endpoint is signed.
+  let archiveUrl: string | undefined;
+  if (auth?.app) {
+    const access = await loadScanAccess(auth, job.id);
+    if (access?.isPrivate) {
+      const src = await resolvePrivateSource(job, access, "verify", auth, getConfig());
+      if ("code" in src) throw new RemediationError("source_unavailable", "The private repository source is no longer available.", 409);
+      archiveUrl = src.archiveUrl;
+    }
+  }
   return {
+    ...(archiveUrl ? { archiveUrl, private: true } : {}),
     scanJobId: job.id,
     remediationId: remediation.id,
     owner: job.owner,

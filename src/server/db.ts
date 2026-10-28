@@ -75,7 +75,7 @@ export async function withDbRetry<T>(
 
 export const prismaJobStore: JobStore = {
   create: (data: NewJob) =>
-    withDbRetry(() => prisma.scanJob.create({ data: { id: newJobId(), ...data } }) as Promise<JobRecord>),
+    withDbRetry(() => prisma.scanJob.create({ data: { ...data, id: data.id ?? newJobId() } }) as Promise<JobRecord>),
 
   async createWithQuota(data: NewJob, config, now = new Date()): Promise<CreateJobWithQuotaResult> {
     return withHeavySlotLock(config, now, async (tx) => {
@@ -102,7 +102,7 @@ export const prismaJobStore: JobStore = {
       if (!limit.allowed) return { ok: false, rateLimit: limit };
 
       // Created waiting (no slot yet) inside the locked transaction; an executor claims it next.
-      const job = (await tx.scanJob.create({ data: { id: newJobId(), status: "queued", ...data } })) as unknown as JobRecord;
+      const job = (await tx.scanJob.create({ data: { ...data, id: data.id ?? newJobId(), status: "queued" } })) as unknown as JobRecord;
       return { ok: true, job };
     });
   },
