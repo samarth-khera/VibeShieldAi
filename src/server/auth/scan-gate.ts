@@ -2,6 +2,9 @@ import type { RepositoryGate } from "../scans-service";
 import { checkRepositoryAccess } from "./github-app";
 import { isMissingTable } from "./repository-access";
 import { markRevoked, resolveAuthorizedUser, type AuthDeps } from "./service";
+import { PRIVATE_SCANNING_AVAILABLE } from "./private-source";
+
+const PRIVATE_NOT_SCANNABLE = "Repository not found or not public. Private repository scanning is currently unavailable.";
 
 type PublicCheck = (owner: string, repo: string) => Promise<{ ok: boolean; repoId?: number | null; code?: string; error?: string }>;
 
@@ -24,6 +27,9 @@ export async function resolveRepositoryForScan(
   if (pub.ok) return { ok: true, repoId: pub.repoId ?? null, isPrivate: false, githubUserId: null };
   const fail = (status: number, code: string, error: string): RepositoryGate => ({ ok: false, status, code, error });
   if (pub.code !== "not_found_or_private") return fail(400, pub.code ?? "invalid_repository", pub.error ?? "Repository is not accessible.");
+  // Fail closed before any job, access record or dispatch exists: with no private worker, anything
+  // not confirmed public is refused (without revealing whether a private repository exists).
+  if (!PRIVATE_SCANNING_AVAILABLE) return fail(400, "not_found_or_private", PRIVATE_NOT_SCANNABLE);
 
   let user;
   try {

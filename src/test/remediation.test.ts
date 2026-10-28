@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { diffDigest } from "@/server/remediation/service";
+/** The job owner's session subject; in production it comes from the signed owner grant. */
+const TEST_OWNER = { ownerSubject: "test-owner-subject" };
 import {
   validateUnifiedDiff,
   generateRemediationPatch,
@@ -267,17 +270,25 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       expect(preview.status).toBe("preview");
 
       // Attempting to apply without user approval must throw
-      await expect(applyAndVerify(testJob.id, preview.id, deps)).rejects.toThrow(
+      await expect(applyAndVerify(testJob.id, preview.id, deps, TEST_OWNER)).rejects.toThrow(
         /Explicit user approval is required/
       );
     });
 
     it("Explicit user approval transitions remediation to approved state", async () => {
       const preview = await createPreview(testJob.id, testFinding.id, deps);
-      const approved = await approveRemediation(testJob.id, preview.id, deps, "user-session-123");
+      const approved = await approveRemediation(testJob.id, preview.id, deps, TEST_OWNER);
 
       expect(approved.status).toBe("approved");
-      expect((approved.approvedOperations as { approvedBy?: string })?.approvedBy).toBe("user-session-123");
+      expect(approved.approvedOperations).toMatchObject({
+        approvedBy: "job_owner",
+        ownerSubject: TEST_OWNER.ownerSubject,
+        scanJobId: testJob.id,
+        remediationId: preview.id,
+        commitSha: preview.commitSha,
+        findingFingerprints: preview.findingFingerprints,
+        diffSha256: diffDigest(preview.unifiedDiff),
+      });
       expect(approved.approvedAt).toBeInstanceOf(Date);
     });
 
@@ -304,7 +315,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       expect(preview.warnings?.length).toBeGreaterThan(0);
 
       // Attempting to approve an unsuitable finding must throw
-      await expect(approveRemediation(testJob.id, preview.id, deps)).rejects.toThrow(
+      await expect(approveRemediation(testJob.id, preview.id, deps, TEST_OWNER)).rejects.toThrow(
         /This finding requires manual intervention and cannot be auto-approved/
       );
     });
@@ -529,12 +540,12 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       const preview = await createPreview(job.id, evalFinding.id, deps);
 
       // Attempting apply without approval must fail with 403
-      await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toThrow(
+      await expect(applyAndVerify(job.id, preview.id, deps, TEST_OWNER)).rejects.toThrow(
         /Explicit user approval is required/
       );
 
       // Explicit user approval
-      const approved = await approveRemediation(job.id, preview.id, deps, "session-user-999");
+      const approved = await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
       expect(approved.status).toBe("approved");
       expect(approved.approvedAt).toBeInstanceOf(Date);
     });
@@ -607,9 +618,9 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       };
 
       const preview = await createPreview(job.id, findings[0].id, deps);
-      await approveRemediation(job.id, preview.id, deps, "user-verifier");
+      await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
 
-      const verified = await applyAndVerify(job.id, preview.id, deps);
+      const verified = await applyAndVerify(job.id, preview.id, deps, TEST_OWNER);
 
       expect(verified.status).toBe("verified");
       expect(verified.rescanStatus).toBe("verified");
@@ -722,9 +733,9 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       };
 
       const preview = await createPreview(job.id, findings[0].id, deps);
-      await approveRemediation(job.id, preview.id, deps, "user-verifier");
+      await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
 
-      const result = await applyAndVerify(job.id, preview.id, deps);
+      const result = await applyAndVerify(job.id, preview.id, deps, TEST_OWNER);
 
       // Must be needs_review, NEVER verified
       expect(result.status).toBe("needs_review");
@@ -938,6 +949,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
     it("uncovered path 2: eval wrapper with unrelated JSON-related words elsewhere in the source must still be rejected", async () => {
       const unrelatedSource = `// Unrelated JSON utility elsewhere in file
 import { parseJson } from "./utils";
+
 const logger = { log: (x: any) => console.log(JSON.stringify(x)) };
 
 export function executeUserPayload(rawData: string) {
@@ -1037,8 +1049,8 @@ export function executeUserPayload(rawData: string) {
         requiresRotation: false,
         patchSummary: "Stale patch",
         unifiedDiff: `--- a/src/config.ts\n+++ b/src/config.ts\n@@ -10,1 +10,1 @@\n-nonExistentCodeOldLine();\n+replacementCode();\n`,
-        status: "approved",
-        approvedAt: new Date(),
+        status: "preview",
+        approvedAt: null,
         rescanStatus: null,
         branchName: null,
         pullRequestUrl: null,
@@ -1068,7 +1080,8 @@ export function executeUserPayload(rawData: string) {
         scanEngine: mockEngine,
       };
 
-      const result = await applyAndVerify(job.id, staleRem.id, deps);
+      await approveRemediation(job.id, staleRem.id, deps, TEST_OWNER);
+      const result = await applyAndVerify(job.id, staleRem.id, deps, TEST_OWNER);
       // A patch that does not apply to the scanned revision is an explicit failure, never a resolution.
       expect(result.status).toBe("failed");
       expect(result.rescanStatus).toBe("failed");
@@ -1113,7 +1126,7 @@ export function executeUserPayload(rawData: string) {
       expect(preview.approvedAt).toBeNull();
 
       // Attempting to apply without explicit user approval must throw 403
-      await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toThrow(
+      await expect(applyAndVerify(job.id, preview.id, deps, TEST_OWNER)).rejects.toThrow(
         /Explicit user approval is required/
       );
     });
@@ -1150,7 +1163,7 @@ export function executeUserPayload(rawData: string) {
       };
 
       const preview = await createPreview(job.id, savedFindings7[0].id, deps);
-      await approveRemediation(job.id, preview.id, deps, "admin");
+      await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
 
       // Subcase 7A: Rescan introduces a new regression finding
       const regressionFinding = makeFinding({
@@ -1179,7 +1192,7 @@ export function executeUserPayload(rawData: string) {
       const regressionResult = await applyAndVerify(job.id, preview.id, {
         ...deps,
         scanEngine: engineWithRegression,
-      });
+      }, TEST_OWNER);
 
       expect(regressionResult.status).toBe("needs_review");
       expect(regressionResult.rescanStatus).toBe("needs_review");
@@ -1206,12 +1219,12 @@ export function executeUserPayload(rawData: string) {
 
       // Create fresh preview for Subcase 7B to test engine failure on approved patch
       const preview2 = await createPreview(job.id, savedFindings7[0].id, deps);
-      await approveRemediation(job.id, preview2.id, deps, "admin");
+      await approveRemediation(job.id, preview2.id, deps, TEST_OWNER);
 
       const failedRescanResult = await applyAndVerify(job.id, preview2.id, {
         ...deps,
         scanEngine: failingEngine,
-      });
+      }, TEST_OWNER);
 
       expect(failedRescanResult.status).toBe("failed");
       expect(failedRescanResult.rescanStatus).toBe("failed");
@@ -2458,12 +2471,12 @@ export function getSafeComputedNonJsonConfig() {
         );
 
         // 3. Attempting to approve an unsuitable finding must fail
-        await expect(approveRemediation(job.id, bypassPreview.id, deps, "user-auditor")).rejects.toThrow(
+        await expect(approveRemediation(job.id, bypassPreview.id, deps, TEST_OWNER)).rejects.toThrow(
           /requires manual intervention and cannot be auto-approved/
         );
 
         // 4. Attempting to apply unapproved preview must fail
-        await expect(applyAndVerify(job.id, bypassPreview.id, deps)).rejects.toThrow(
+        await expect(applyAndVerify(job.id, bypassPreview.id, deps, TEST_OWNER)).rejects.toThrow(
           /Explicit user approval is required/
         );
 
@@ -2473,11 +2486,11 @@ export function getSafeComputedNonJsonConfig() {
         expect(safePreview.status).toBe("preview");
 
         // 3. User approval is mandatory
-        const approved = await approveRemediation(job.id, safePreview.id, deps, "user-auditor");
+        const approved = await approveRemediation(job.id, safePreview.id, deps, TEST_OWNER);
         expect(approved.status).toBe("approved");
 
         // 4. Sandboxed verification applies patch and confirms 0 regressions
-        const verified = await applyAndVerify(job.id, safePreview.id, deps);
+        const verified = await applyAndVerify(job.id, safePreview.id, deps, TEST_OWNER);
         expect(verified.status).toBe("verified");
         expect(verified.rescanStatus).toBe("verified");
       });
@@ -2645,16 +2658,16 @@ export function getSafeComputedNonJsonConfig() {
       expect(sourceFiles["backend/requirements.txt"]).toBe(initialRequirements);
 
       // 3. Unapproved apply is rejected
-      await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toThrow(
+      await expect(applyAndVerify(job.id, preview.id, deps, TEST_OWNER)).rejects.toThrow(
         /Explicit user approval is required/
       );
 
       // 4. User approves patch
-      const approved = await approveRemediation(job.id, preview.id, deps, "user-auditor");
+      const approved = await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
       expect(approved.status).toBe("approved");
 
       // 5. Sandboxed execution applies patch and rescan verifies resolution
-      const verified = await applyAndVerify(job.id, preview.id, deps);
+      const verified = await applyAndVerify(job.id, preview.id, deps, TEST_OWNER);
       expect(verified.status).toBe("verified");
       expect(verified.rescanStatus).toBe("verified");
       expect(verified.rescanSummary?.targetResolved).toBe(true);
@@ -2773,16 +2786,16 @@ export function getSafeComputedNonJsonConfig() {
       expect(sourceFiles["backend/requirements.txt"]).toBe(initialRequirements);
 
       // 5. Unapproved apply is rejected
-      await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toThrow(
+      await expect(applyAndVerify(job.id, preview.id, deps, TEST_OWNER)).rejects.toThrow(
         /Explicit user approval is required/
       );
 
       // 6. User approval
-      const approved = await approveRemediation(job.id, preview.id, deps, "sec-admin");
+      const approved = await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
       expect(approved.status).toBe("approved");
 
       // 7. Apply patch in sandbox and execute REAL OSV-Scanner rescan
-      const verified = await applyAndVerify(job.id, preview.id, deps);
+      const verified = await applyAndVerify(job.id, preview.id, deps, TEST_OWNER);
       expect(verified.status).toBe("verified");
       expect(verified.rescanStatus).toBe("verified");
       expect(verified.rescanSummary?.targetResolved).toBe(true);

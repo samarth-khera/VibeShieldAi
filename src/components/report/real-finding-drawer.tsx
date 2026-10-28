@@ -30,11 +30,14 @@ export function RealFindingDrawer({
   finding,
   onClose,
   mode = "review",
+  readOnly = false,
 }: {
   jobId: string;
   finding: PublicFinding | null;
   onClose: () => void;
   mode?: "review" | "autofix";
+  /** Not the browser that started the scan: show results, offer no actions. */
+  readOnly?: boolean;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLElement>(null);
@@ -249,7 +252,10 @@ export function RealFindingDrawer({
                 </div>
               </div>
 
-              {!aiExplanation && !isExplaining && (
+              {!aiExplanation && !isExplaining && readOnly && (
+                <p className="text-[11px] text-muted">Only the browser that started this scan can request an explanation.</p>
+              )}
+              {!aiExplanation && !isExplaining && !readOnly && (
                 <button
                   onClick={handleExplain}
                   className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-background shadow transition-all hover:bg-accent/90 hover:shadow-accent/20"
@@ -468,7 +474,7 @@ export function RealFindingDrawer({
 
           {/* AI Remediation & Auto-Fix Panel */}
           <section>
-            <RemediationPanel jobId={jobId} finding={finding} mode={mode} />
+            <RemediationPanel jobId={jobId} finding={finding} mode={mode} readOnly={readOnly} />
           </section>
 
           {/* External References */}

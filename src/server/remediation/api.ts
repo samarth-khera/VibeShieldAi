@@ -19,7 +19,7 @@ import { toPublicRemediation, type RemediationRecord, type RescanComparison } fr
 import { isWarmLease } from "../quota";
 import { verificationClaimOf } from "./claims";
 import { AUTH_FAILURE, authorizeRepository, checkJobAccess } from "../auth/repository-access";
-import { isSameOrigin, type AuthDeps } from "../auth/service";
+import { isSameOrigin, loadSession, type AuthDeps } from "../auth/service";
 import { loadScanAccess } from "../auth/repository-access";
 import { resolvePrivateSource } from "../auth/private-source";
 import type { JobRecord, JobStore } from "../job-store";
@@ -69,15 +69,25 @@ export async function handleListRemediations(
   return ok(list.map((r) => toPublicRemediation(r)));
 }
 
+/**
+ * POST …/approve. `ownerSubject` comes from the verified owner grant (route gate), never from the
+ * request body. A connected GitHub user is recorded too, so publishing can be tied to them.
+ */
 export async function handleApproveRemediation(
+  req: Request,
   scanJobId: string,
   remediationId: string,
   deps: RemediationDeps,
+  ownerSubject: string,
 ): Promise<Response> {
   if (!JOB_ID_RE.test(scanJobId)) return fail(404, "not_found", "Scan job not found.");
 
   try {
-    const approved = await approveRemediation(scanJobId, remediationId, deps);
+    const session = deps.auth?.app ? await loadSession(req, deps.auth).catch(() => null) : null;
+    const approved = await approveRemediation(scanJobId, remediationId, deps, {
+      ownerSubject,
+      githubUserId: session?.account?.githubUserId ?? null,
+    });
     return ok(toPublicRemediation(approved));
   } catch (err) {
     if (err instanceof RemediationError) {
@@ -91,11 +101,12 @@ export async function handleApplyRemediation(
   scanJobId: string,
   remediationId: string,
   deps: RemediationDeps,
+  ownerSubject: string,
 ): Promise<Response> {
   if (!JOB_ID_RE.test(scanJobId)) return fail(404, "not_found", "Scan job not found.");
 
   try {
-    const result = await applyAndVerify(scanJobId, remediationId, deps);
+    const result = await applyAndVerify(scanJobId, remediationId, deps, { ownerSubject });
     // 202: verification is running on the worker; poll the remediation list for the result.
     return ok(toPublicRemediation(result), result.status === "applied" ? 202 : 200);
   } catch (err) {
@@ -132,6 +143,7 @@ export async function handleCreatePullRequest(
   scanJobId: string,
   remediationId: string,
   deps: RemediationDeps,
+  ownerSubject: string,
 ): Promise<Response> {
   if (!JOB_ID_RE.test(scanJobId)) return fail(404, "not_found", "Scan job not found.");
   const auth = deps.auth;
@@ -174,6 +186,7 @@ export async function handleCreatePullRequest(
       token: authz.token,
       repoId: authz.access.repoId!,
       confirmedDiffSha256: confirmed,
+      ownerSubject,
     });
     await auth.store.audit({
       action: "pull_request",

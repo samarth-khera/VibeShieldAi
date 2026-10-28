@@ -16,12 +16,15 @@ import { InMemoryAuthStore } from "@/server/auth/store";
 import { authorizeRepository, checkJobAccess } from "@/server/auth/repository-access";
 import { githubStatus } from "@/server/auth/status";
 import { resolveRepositoryForScan } from "@/server/auth/scan-gate";
-import { repositoryUrlForWorker, resolvePrivateSource } from "@/server/auth/private-source";
+import { PrivateExecutionRefused, repositoryUrlForWorker, resolvePrivateSource } from "@/server/auth/private-source";
 import { handleCreatePullRequest, handleDownloadPatch } from "@/server/remediation/api";
 import { approveRemediation, diffDigest, type RemediationDeps } from "@/server/remediation/service";
-import { submitScan, type ScanDeps } from "@/server/scans-service";
+import { pumpQueue, submitScan, type ScanDeps } from "@/server/scans-service";
 import { InMemoryJobStore } from "@/test/mock-store";
 import { FakeGitHubApp } from "@/test/fake-github";
+
+/** The job owner's session subject; in production it comes from the signed owner grant. */
+const TEST_OWNER = { ownerSubject: "test-owner-subject" };
 
 const ORIGIN = "https://vs.example";
 const COOKIE = "__Host-vibeshield_session";
@@ -340,7 +343,7 @@ describe("pull request endpoint", () => {
       pullRequestUrl: null,
     });
     const rdeps: RemediationDeps = { store: jobs, fetchImpl: gh.fetch, config, auth: deps };
-    await approveRemediation(job.id, rem.id, rdeps);
+    await approveRemediation(job.id, rem.id, rdeps, TEST_OWNER);
     if (status !== "approved") await jobs.updateRemediation(job.id, rem.id, { status, rescanStatus: status });
     return { jobs, job, rem, rdeps };
   }
@@ -354,7 +357,7 @@ describe("pull request endpoint", () => {
   it("opens the PR with the requesting user's own token only, idempotently, and audits it", async () => {
     const { job, rem, rdeps } = await setup();
     const cookie = await connect(1001);
-    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps);
+    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect(res.status).toBe(201);
     const body = (await res.json()).data;
     expect(body.pullRequest).toMatchObject({ status: "created", number: 1, openedBy: { githubUserId: 1001, login: "alice" } });
@@ -370,7 +373,7 @@ describe("pull request endpoint", () => {
 
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.now() + 16_000);
-    const again = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps);
+    const again = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     vi.useRealTimers();
     expect((await again.json()).data.pullRequest).toMatchObject({ status: "exists", number: 1 });
     expect(gh.git.pulls).toHaveLength(1);
@@ -379,11 +382,11 @@ describe("pull request endpoint", () => {
   it("never lets one user's authorization serve another session", async () => {
     const { job, rem, rdeps } = await setup();
     await connect(1001); // alice is connected in her own browser
-    const anonymous = await handleCreatePullRequest(prRequest(job.id, rem.id, null), job.id, rem.id, rdeps);
+    const anonymous = await handleCreatePullRequest(prRequest(job.id, rem.id, null), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect(anonymous.status).toBe(401);
     expect((await anonymous.json()).error.code).toBe("not_connected");
     const mallory = await connect(1003);
-    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, mallory), job.id, rem.id, rdeps);
+    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, mallory), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect(res.status).toBe(403);
     expect((await res.json()).error.code).toBe("repository_not_found");
     expect(gh.git.pulls).toHaveLength(0);
@@ -392,7 +395,7 @@ describe("pull request endpoint", () => {
   it("denies a user without write access and records the denial", async () => {
     const { job, rem, rdeps } = await setup();
     const bob = await connect(1002);
-    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, bob), job.id, rem.id, rdeps);
+    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, bob), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect(res.status).toBe(403);
     expect((await res.json()).error.code).toBe("no_push_permission");
     expect(store.events).toContainEqual(expect.objectContaining({ action: "pull_request", outcome: "denied", detail: "no_push_permission" }));
@@ -402,19 +405,19 @@ describe("pull request endpoint", () => {
     const cookie = await connect(1001);
     for (const status of ["approved", "needs_review"] as const) {
       const { job, rem, rdeps } = await setup(status);
-      const res = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps);
+      const res = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
       expect(res.status).toBe(409);
       expect((await res.json()).error.code).toBe("not_verified");
     }
     const { job, rem, rdeps, jobs } = await setup();
-    const wrong = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie, "0".repeat(64)), job.id, rem.id, rdeps);
+    const wrong = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie, "0".repeat(64)), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect((await wrong.json()).error.code).toBe("diff_confirmation_mismatch");
     await jobs.updateRemediation(job.id, rem.id, { unifiedDiff: DIFF.replace("2.31.0", "9.9.9") });
-    const swapped = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie, diffDigest(DIFF.replace("2.31.0", "9.9.9"))), job.id, rem.id, rdeps);
+    const swapped = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie, diffDigest(DIFF.replace("2.31.0", "9.9.9"))), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect((await swapped.json()).error.code).toBe("patch_mismatch");
     const unapproved = await setup("approved");
     await unapproved.jobs.updateRemediation(unapproved.job.id, unapproved.rem.id, { approvedAt: null, status: "verified", rescanStatus: "verified" });
-    const r = await handleCreatePullRequest(prRequest(unapproved.job.id, unapproved.rem.id, cookie), unapproved.job.id, unapproved.rem.id, unapproved.rdeps);
+    const r = await handleCreatePullRequest(prRequest(unapproved.job.id, unapproved.rem.id, cookie), unapproved.job.id, unapproved.rem.id, unapproved.rdeps, TEST_OWNER.ownerSubject);
     expect((await r.json()).error.code).toBe("approval_required");
     expect(gh.git.pulls).toHaveLength(0);
   });
@@ -424,12 +427,12 @@ describe("pull request endpoint", () => {
     const { job, rem, rdeps, jobs } = await setup();
     gh.git.repoId = 5555; // repository deleted and recreated under the same name
     gh.installation.repos.add(5555);
-    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps);
+    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect(res.status).toBe(409);
     expect((await res.json()).error.code).toBe("repository_changed");
     gh.git.repoId = 4242;
     await jobs.update(job.id, { commitSha: "e".repeat(40) });
-    const moved = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps);
+    const moved = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect((await moved.json()).error.code).toBe("commit_mismatch");
     expect(gh.git.pulls).toHaveLength(0);
   });
@@ -437,9 +440,9 @@ describe("pull request endpoint", () => {
   it("refuses cross-site requests and answers not_configured, keeping the patch download, when the app is absent", async () => {
     const { job, rem, rdeps } = await setup();
     const cookie = await connect(1001);
-    const xsite = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie, diffDigest(DIFF), "https://evil.example"), job.id, rem.id, rdeps);
+    const xsite = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie, diffDigest(DIFF), "https://evil.example"), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect(xsite.status).toBe(403);
-    const off = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, { ...rdeps, auth: { ...deps, app: undefined } });
+    const off = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, { ...rdeps, auth: { ...deps, app: undefined } }, TEST_OWNER.ownerSubject);
     expect(off.status).toBe(503);
     expect((await off.json()).error.code).toBe("not_configured");
     const patch = await handleDownloadPatch(job.id, rem.id, rdeps);
@@ -447,11 +450,20 @@ describe("pull request endpoint", () => {
     expect(await patch.text()).toBe(DIFF);
   });
 
+  it("refuses publishing from a different owner session than the one that approved", async () => {
+    const { job, rem, rdeps } = await setup();
+    const cookie = await connect(1001);
+    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps, "another-session");
+    expect(res.status).toBe(409);
+    expect((await res.json()).error.code).toBe("approval_session_mismatch");
+    expect(gh.git.pulls).toHaveLength(0);
+  });
+
   it("rejects after disconnect", async () => {
     const { job, rem, rdeps } = await setup();
     const cookie = await connect(1001);
     await disconnect(new Request(`${ORIGIN}/api/auth/github/disconnect`, { method: "POST", headers: { cookie, origin: ORIGIN } }), deps);
-    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps);
+    const res = await handleCreatePullRequest(prRequest(job.id, rem.id, cookie), job.id, rem.id, rdeps, TEST_OWNER.ownerSubject);
     expect(res.status).toBe(401);
     expect(gh.git.pulls).toHaveLength(0);
   });
@@ -522,60 +534,66 @@ describe("private repositories", () => {
     expect(enqueued).toEqual(["https://github.com/acme/webapp"]);
   });
 
-  it("requires authorization for a private repository and never reveals whether it exists", async () => {
-    gh.isPrivate = true;
-    const { d } = scanDeps();
-    const anon = await submit(d);
-    expect(anon.status).toBe(403);
-    expect((await anon.json()).error.code).toBe("authorization_required");
-    const mallory = await connect(1003);
-    const denied = await submit(d, mallory);
-    expect(denied.status).toBe(400);
-    expect((await denied.json()).error.code).toBe("not_found_or_private");
-  });
-
-  it("scans a private repository for an authorized user, writing the access record before the job, and hides it from others", async () => {
+  it("refuses every private repository before creating a job, access record or dispatch (no private worker)", async () => {
     gh.isPrivate = true;
     const order: string[] = [];
-    const { d, jobs, enqueued } = scanDeps(order);
-    const alice = await connect(1001);
-    const res = await submit(d, alice);
-    expect(res.status).toBe(202);
-    const id = (await res.json()).data.id;
-    expect(order).toEqual(["private-access", "job"]);
-    expect(await store.getScanAccess(id)).toMatchObject({ isPrivate: true, githubUserId: 1001, githubRepoId: 4242 });
-    // The workflow/claim value is a placeholder: the private name never reaches public workflow inputs.
-    expect(enqueued).toEqual(["private"]);
-
-    const job = (await jobs.get(id))!;
-    expect((await checkJobAccess(get("/x", alice), deps, job)).denied).toBeNull();
-    const bob = await connect(1002); // bob can read the repo on GitHub, but did not authorize this scan
-    expect((await checkJobAccess(get("/x", bob), deps, job)).denied?.status).toBe(404);
-    expect((await checkJobAccess(get("/x"), deps, job)).denied?.status).toBe(404);
-    // Live operations re-check access with GitHub: removed from the installation means denied.
-    gh.installation.repos.clear();
-    const live = await checkJobAccess(get("/x", alice), deps, job, { live: true });
-    expect(live.denied).not.toBeNull();
+    const { d, enqueued } = scanDeps(order);
+    const alice = await connect(1001); // even a user who can read and push to it
+    for (const cookie of [undefined, alice]) {
+      const res = await submit(d, cookie);
+      expect(res.status).toBe(400);
+      const err = (await res.json()).error;
+      expect(err.code).toBe("not_found_or_private");
+      expect(err.message).toMatch(/Private repository scanning is currently unavailable/);
+    }
+    expect(order).toEqual([]);
+    expect(store.access.size).toBe(0);
+    expect(enqueued).toEqual([]);
+    expect(gh.oauthCalls.length).toBe(1); // only alice's connect: no GitHub lookup for the refusal
   });
 
-  it("gives workers a short-lived archive URL, never the user's token, and fails closed when access is lost", async () => {
+  it("refuses a private gate result in submitScan itself (defence in depth)", async () => {
+    const { d, enqueued } = scanDeps();
+    d.resolveRepository = async () => ({ ok: true, repoId: 4242, isPrivate: true, githubUserId: 1001 });
+    const res = await submit(d);
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.code).toBe("private_scanning_unavailable");
+    expect(store.access.size).toBe(0);
+    expect(enqueued).toEqual([]);
+  });
+
+  it("a private job that reaches the queue is failed, never dispatched", async () => {
+    const { d, jobs, enqueued } = scanDeps();
+    const job = await jobs.create({ owner: "acme", repo: "webapp", repositoryUrl: "https://github.com/acme/webapp", expiresAt: new Date(Date.now() + 3_600_000) });
+    await store.setScanAccess({ scanJobId: job.id, githubRepoId: 4242, isPrivate: true, githubUserId: 1001 });
+    await pumpQueue(d);
+    expect(enqueued).toEqual([]);
+    expect((await jobs.get(job.id))!.status).toBe("failed");
+  });
+
+  it("never hands a private job to any worker, and never issues it a source URL", async () => {
+    await store.setScanAccess({ scanJobId: "jobp", githubRepoId: 4242, isPrivate: true, githubUserId: 1001 });
+    await expect(repositoryUrlForWorker("jobp", "https://github.com/acme/webapp", deps)).rejects.toBeInstanceOf(PrivateExecutionRefused);
+    expect(await repositoryUrlForWorker("public-job", "https://github.com/acme/webapp", deps)).toBe("https://github.com/acme/webapp");
     gh.isPrivate = true;
     await connect(1001);
-    const job = { id: "jobp", owner: "acme", repo: "webapp", commitSha: base };
     const rec = { scanJobId: "jobp", githubRepoId: 4242, isPrivate: true, githubUserId: 1001 };
-    const src = await resolvePrivateSource(job, rec, "verify", deps, scanConfig);
-    expect(src).toMatchObject({ commitSha: base, defaultBranch: "main" });
-    expect((src as { archiveUrl: string }).archiveUrl).toMatch(/^https:\/\/codeload\.github\.com\//);
-    expect(JSON.stringify(src)).not.toMatch(/ghu_|ghr_/);
-    const scan = await resolvePrivateSource(job, rec, "scan", deps, scanConfig);
-    expect(scan).toMatchObject({ commitSha: base });
+    const src = await resolvePrivateSource({ id: "jobp", owner: "acme", repo: "webapp", commitSha: base }, rec, "verify", deps, scanConfig);
+    expect(src).toEqual({ code: "private_scanning_unavailable" });
+    expect(gh.git.calls).toHaveLength(0);
+  });
 
-    gh.read.delete(1001);
-    expect(await resolvePrivateSource(job, rec, "scan", deps, scanConfig)).toEqual({ code: "access_lost" });
-    gh.read.add(1001);
-    gh.git.repoId = 9;
-    gh.installation.repos.add(9);
-    expect(await resolvePrivateSource(job, rec, "scan", deps, scanConfig)).toEqual({ code: "repository_changed" });
-    expect(await resolvePrivateSource(job, { ...rec, isPrivate: false }, "scan", deps, scanConfig)).toEqual({ code: "not_private" });
+  it("keeps a private record visible only to its authorizing user (legacy or future records)", async () => {
+    gh.isPrivate = true;
+    const jobs = new InMemoryJobStore();
+    const job = await jobs.create({ owner: "acme", repo: "webapp", repositoryUrl: "https://github.com/acme/webapp", expiresAt: new Date(Date.now() + 3_600_000) });
+    await store.setScanAccess({ scanJobId: job.id, githubRepoId: 4242, isPrivate: true, githubUserId: 1001 });
+    const alice = await connect(1001);
+    const bob = await connect(1002);
+    expect((await checkJobAccess(get("/x", alice), deps, job)).denied).toBeNull();
+    expect((await checkJobAccess(get("/x", bob), deps, job)).denied?.status).toBe(404);
+    expect((await checkJobAccess(get("/x"), deps, job)).denied?.status).toBe(404);
+    gh.installation.repos.clear();
+    expect((await checkJobAccess(get("/x", alice), deps, job, { live: true })).denied).not.toBeNull();
   });
 });

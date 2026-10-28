@@ -325,6 +325,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
     return count;
   }, [findings, selectedFindingIds]);
 
+  const readOnly = job?.viewer ? !job.viewer.isOwner : false;
   const selected = useMemo(() => findings.find((f) => f.id === selectedId) ?? null, [findings, selectedId]);
 
   if (loading && !job) {
@@ -367,6 +368,13 @@ export function RealReportView({ jobId }: { jobId: string }) {
         <Link href="/" className="inline-flex items-center gap-2 font-mono text-xs uppercase tracking-wider text-muted hover:text-accent">
           <ArrowLeft className="size-4" aria-hidden /> Back to homepage
         </Link>
+
+        {readOnly && (
+          <div role="note" className="mt-4 rounded-lg border border-line bg-surface p-3 text-sm text-muted">
+            <span className="font-semibold text-foreground">Read-only report.</span> Only the browser session that started this
+            scan can generate, approve, verify or publish fixes. Start your own scan to work on fixes.
+          </div>
+        )}
 
         {githubNotice && (
           <div role="status" className="mt-4 rounded-lg border border-line bg-surface p-3 text-sm text-foreground">
@@ -838,7 +846,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
           </div>
         </section>
 
-        <RealFindingDrawer jobId={jobId} finding={selected} onClose={close} mode={mode} />
+        <RealFindingDrawer jobId={jobId} finding={selected} onClose={close} mode={mode} readOnly={readOnly} />
       </div>
     </div>
   );

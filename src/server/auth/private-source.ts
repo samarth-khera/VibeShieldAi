@@ -18,7 +18,7 @@ export type PrivateSource = {
 };
 
 export type PrivateSourceFailure = {
-  code: "not_private" | "authorization_lost" | "access_lost" | "repository_changed" | "github_unavailable";
+  code: "not_private" | "private_scanning_unavailable" | "authorization_lost" | "access_lost" | "repository_changed" | "github_unavailable";
 };
 
 /**
@@ -34,6 +34,7 @@ export async function resolvePrivateSource(
   config: ServerConfig,
 ): Promise<PrivateSource | PrivateSourceFailure> {
   if (!scanAccess?.isPrivate || scanAccess.githubUserId === null) return { code: "not_private" };
+  if (!PRIVATE_SCANNING_AVAILABLE) return { code: "private_scanning_unavailable" };
   const account = await deps.store.getAccountByGithubUserId(scanAccess.githubUserId);
   if (!account) return { code: "authorization_lost" };
   const t = await getUserToken(account, deps);
@@ -63,6 +64,23 @@ export async function resolvePrivateSource(
 }
 
 /**
+ * No private worker is deployed. The only executors are GitHub-hosted runners of this public
+ * repository, whose run names and logs (job IDs, timings) are public, so private repositories are
+ * never scanned or verified. Changing this requires a verified private worker and routing that
+ * keeps private jobs away from the public workflow; see docs/private-worker.md.
+ */
+export const PRIVATE_SCANNING_AVAILABLE: boolean = false;
+
+export const PRIVATE_SCANNING_UNAVAILABLE =
+  "Private repository scanning is temporarily unavailable: no private scan worker is configured, and the public worker's logs are public.";
+
+export class PrivateExecutionRefused extends Error {
+  constructor() {
+    super("private_scanning_unavailable");
+  }
+}
+
+/**
  * The repository value a worker may see in workflow inputs or claim responses. Private scans get a
  * placeholder so their name never reaches the public Actions UI. A lookup failure throws, so a
  * private name is never sent by mistake.
@@ -70,5 +88,8 @@ export async function resolvePrivateSource(
 export async function repositoryUrlForWorker(jobId: string, repositoryUrl: string, deps: AuthDeps): Promise<string> {
   if (!deps.app) return repositoryUrl;
   const access = await loadScanAccess(deps, jobId);
-  return access?.isPrivate ? PRIVATE_REPOSITORY : repositoryUrl;
+  if (!access?.isPrivate) return repositoryUrl;
+  // Fail closed: a private job never reaches a worker while no private worker exists.
+  if (!PRIVATE_SCANNING_AVAILABLE) throw new PrivateExecutionRefused();
+  return PRIVATE_REPOSITORY;
 }

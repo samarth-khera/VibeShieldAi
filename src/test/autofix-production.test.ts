@@ -25,6 +25,9 @@ import { clearSourceCache } from "@/server/remediation/source-cache";
 import { signCallbackPayload, verificationSpecSigningPayload } from "@/server/callback-auth";
 import type { NormalizedFinding, ScanEngineResult } from "@/server/scanners/types";
 
+/** The job owner's session subject; in production it comes from the signed owner grant. */
+const TEST_OWNER = { ownerSubject: "test-owner-subject" };
+
 const SHA = "3f9c2b1a4d5e6f708192a3b4c5d6e7f8091a2b3c";
 const SECRET = "test-callback-secret";
 const REQUIREMENTS = ["flask==2.2.5", "pytest==7.1.0", "requests==2.31.0", ""].join("\n");
@@ -192,10 +195,10 @@ describe("Production Auto-Fix composition (getRemediationDeps)", () => {
       `https://api.github.com/repos/octocat/demo/contents/backend/requirements.txt?ref=${SHA}`,
     ]);
 
-    await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toThrow(/Explicit user approval is required/);
-    await approveRemediation(job.id, preview.id, deps);
+    await expect(applyAndVerify(job.id, preview.id, deps, TEST_OWNER)).rejects.toThrow(/Explicit user approval is required/);
+    await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
 
-    const applied = await applyAndVerify(job.id, preview.id, deps);
+    const applied = await applyAndVerify(job.id, preview.id, deps, TEST_OWNER);
     expect(applied.status).toBe("applied");
     expect(applied.rescanStatus).toBeNull();
 
@@ -212,7 +215,7 @@ describe("Production Auto-Fix composition (getRemediationDeps)", () => {
     expect(JSON.stringify(body)).not.toContain("pytest");
 
     // A repeated click while the worker runs does not dispatch a second verification.
-    expect((await applyAndVerify(job.id, preview.id, deps)).status).toBe("applied");
+    expect((await applyAndVerify(job.id, preview.id, deps, TEST_OWNER)).status).toBe("applied");
     expect(github.calls.filter((c) => c.url.endsWith("/dispatches"))).toHaveLength(1);
   });
 
@@ -223,9 +226,9 @@ describe("Production Auto-Fix composition (getRemediationDeps)", () => {
     const deps: RemediationDeps = { ...getRemediationDeps(productionConfig()), store, fetchImpl: github.impl };
     const { job, finding } = await seedScan(store);
     const preview = await createPreview(job.id, finding.id, deps);
-    await approveRemediation(job.id, preview.id, deps);
+    await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
 
-    await expect(applyAndVerify(job.id, preview.id, deps)).rejects.toMatchObject({ code: "verification_unavailable", status: 503 });
+    await expect(applyAndVerify(job.id, preview.id, deps, TEST_OWNER)).rejects.toMatchObject({ code: "verification_unavailable", status: 503 });
     const after = await store.getRemediation(job.id, preview.id);
     expect(after?.status).toBe("approved");
     expect(after?.rescanStatus).toBeNull();
@@ -243,8 +246,8 @@ describe("Production Auto-Fix composition (getRemediationDeps)", () => {
 
     const { job, finding } = await seedScan(store);
     const preview = await createPreview(job.id, finding.id, deps);
-    await approveRemediation(job.id, preview.id, deps);
-    const result = await applyAndVerify(job.id, preview.id, deps);
+    await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
+    const result = await applyAndVerify(job.id, preview.id, deps, TEST_OWNER);
 
     expect(result.status).toBe("verified");
     expect(result.rescanSummary?.snapshot).toEqual({ commitSha: SHA, fileCount: 3 });
@@ -331,8 +334,8 @@ describe("Signed verification worker protocol", () => {
     };
     const { job, finding } = await seedScan(store);
     const preview = await createPreview(job.id, finding.id, deps);
-    await approveRemediation(job.id, preview.id, deps);
-    await applyAndVerify(job.id, preview.id, deps);
+    await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
+    await applyAndVerify(job.id, preview.id, deps, TEST_OWNER);
     return { store, deps, jobId: job.id, rid: preview.id, diff: preview.unifiedDiff };
   }
 
@@ -433,12 +436,12 @@ describe("Signed verification worker protocol", () => {
     };
     const { job, finding } = await seedScan(store);
     const preview = await createPreview(job.id, finding.id, deps);
-    await approveRemediation(job.id, preview.id, deps);
+    await approveRemediation(job.id, preview.id, deps, TEST_OWNER);
     // Another user's scan is claimed by an executor and occupies the only slot (waiting scans do not).
     await store.create({ owner: "a", repo: "b", repositoryUrl: "https://github.com/a/b", expiresAt: new Date(Date.now() + 1e6) });
     expect(await store.claimNextScan({ kind: "github-actions" }, deps.config!)).not.toBeNull();
 
-    const err = await applyAndVerify(job.id, preview.id, deps).catch((e) => e);
+    const err = await applyAndVerify(job.id, preview.id, deps, TEST_OWNER).catch((e) => e);
     expect(err).toBeInstanceOf(RemediationError);
     expect(err.status).toBe(429);
     expect((await store.getRemediation(job.id, preview.id))?.status).toBe("approved");

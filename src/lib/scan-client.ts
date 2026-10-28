@@ -105,6 +105,8 @@ export type PublicScanJob = {
   /** Present while the scan waits for a free worker slot. */
   queue?: { waitingForSlot: boolean; position: number | null } | null;
   executor?: "warm-worker" | "github-actions" | null;
+  /** Whether this browser started the scan (display only; the server re-checks every change). */
+  viewer?: { isOwner: boolean };
   createdAt: string;
   updatedAt: string;
   startedAt?: string | null;

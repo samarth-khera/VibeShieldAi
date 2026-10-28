@@ -1,10 +1,13 @@
 import { gateScanAccessWithToken } from "@/server/auth/gate";
+import { requireJobOwner } from "@/server/auth/owner-gate";
 import { getConfig } from "@/server/config";
 import { getRemediationDeps } from "@/server/deps";
 import { handleCreatePreview } from "@/server/remediation/api";
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
+  const owner = requireJobOwner(req, id);
+  if (!owner.ok) return owner.response;
   const gate = await gateScanAccessWithToken(req, id);
   if (gate.denied) return gate.denied;
   const config = getConfig();

@@ -1,4 +1,4 @@
-import { repositoryUrlForWorker } from "./auth/private-source";
+import { PrivateExecutionRefused, repositoryUrlForWorker } from "./auth/private-source";
 import { getAuthDeps } from "./deps";
 import { z } from "zod";
 import { fail, ok } from "./api";
@@ -88,13 +88,27 @@ export async function handleWorkerClaim(req: Request, deps: WorkerApiDeps): Prom
   if (body.accept.includes("scan") && deps.store.claimNextScan) {
     const c = await deps.store.claimNextScan({ kind: "warm", workerId: body.workerId }, deps.config, now);
     if (c) {
+      let repositoryUrl: string;
+      try {
+        repositoryUrl = await repositoryUrlForWorker(c.job.id, c.job.repositoryUrl, getAuthDeps(deps.config));
+      } catch (err) {
+        if (!(err instanceof PrivateExecutionRefused)) throw err;
+        // Fail closed: a private job is never handed to a worker while no private worker exists.
+        await deps.store.update(c.job.id, {
+          status: "failed",
+          failureCategory: "private_scanning_unavailable",
+          errorMessage: "Private repository scanning is unavailable.",
+          completedAt: now,
+        });
+        return ok({ work: null, pollAfterMs: 0 });
+      }
       const queuedMs = now.getTime() - c.job.createdAt.getTime();
       log("info", "warm_worker_claimed", { kind: "scan", jobId: c.job.id, workerId: body.workerId, queuedMs });
       return ok({
         work: {
           kind: "scan",
           jobId: c.job.id,
-          repositoryUrl: await repositoryUrlForWorker(c.job.id, c.job.repositoryUrl, getAuthDeps(deps.config)),
+          repositoryUrl,
           lease: c.lease,
           acceptedAt: c.job.createdAt.toISOString(),
         },

@@ -136,14 +136,89 @@ export async function createPreview(
   return record;
 }
 
+/** Who approves: the job owner's session subject, and their GitHub user when connected. */
+export type ApprovalActor = { ownerSubject: string; githubUserId?: number | null };
+
+/** An approval is valid for this long; after that the owner must review and approve again. */
+export const APPROVAL_TTL_MS = 24 * 3600_000;
+
+/** Stored in Remediation.approvedOperations: what exactly was approved, and by whom. */
+export type ApprovalBinding = {
+  approvedBy: "job_owner";
+  ownerSubject: string;
+  githubUserId: number | null;
+  scanJobId: string;
+  remediationId: string;
+  commitSha: string;
+  findingFingerprints: string[];
+  approvedFiles: string[];
+  diffSha256: string;
+  approvedAt: string;
+};
+
+export type ApprovalProblem =
+  | "approval_missing"
+  | "approval_session_mismatch"
+  | "approval_target_mismatch"
+  | "approval_diff_changed"
+  | "approval_expired";
+
+const APPROVAL_MESSAGES: Record<ApprovalProblem, string> = {
+  approval_missing: "This patch has no valid approval. Review the diff and approve it again.",
+  approval_session_mismatch: "This approval was made in a different session. Review the diff and approve it again.",
+  approval_target_mismatch: "The repository, commit or finding changed since approval. Review the diff and approve it again.",
+  approval_diff_changed: "The patch changed after it was approved. Review the new diff and approve it again.",
+  approval_expired: "The approval expired. Review the diff and approve it again.",
+};
+
+/** Re-derives every bound identifier from server state; null when the approval still holds. */
+export function approvalProblem(
+  job: JobRecord,
+  remediation: RemediationRecord,
+  actor: { ownerSubject: string },
+  now: Date,
+  opts: { checkExpiry?: boolean } = {},
+): ApprovalProblem | null {
+  const b = remediation.approvedOperations as Partial<ApprovalBinding> | null;
+  if (!remediation.approvedAt || !b || b.approvedBy !== "job_owner" || !b.ownerSubject) return "approval_missing";
+  if (b.ownerSubject !== actor.ownerSubject) return "approval_session_mismatch";
+  const sameFindings =
+    Array.isArray(b.findingFingerprints) &&
+    b.findingFingerprints.length === remediation.findingFingerprints.length &&
+    b.findingFingerprints.every((f, i) => f === remediation.findingFingerprints[i]);
+  if (
+    b.scanJobId !== job.id ||
+    b.remediationId !== remediation.id ||
+    b.commitSha !== remediation.commitSha ||
+    b.commitSha !== job.commitSha ||
+    !sameFindings
+  ) {
+    return "approval_target_mismatch";
+  }
+  if (b.diffSha256 !== diffDigest(remediation.unifiedDiff)) return "approval_diff_changed";
+  if (opts.checkExpiry !== false && now.getTime() - Date.parse(b.approvedAt ?? "") > APPROVAL_TTL_MS) return "approval_expired";
+  return null;
+}
+
+/** Returns an approved-but-stale remediation to preview so the owner must approve it again. */
+async function invalidateApproval(scanJobId: string, remediationId: string, deps: RemediationDeps): Promise<void> {
+  await deps.store.transitionRemediation(scanJobId, remediationId, ["approved"], {
+    status: "preview",
+    approvedAt: null,
+    approvedOperations: null,
+  });
+}
+
 /**
- * Requires explicit user approval before any changes may be applied.
+ * Requires explicit approval by the job owner before any change may be applied. The approval is
+ * bound to the owner's session, the job, the remediation, the scanned commit, the targeted
+ * findings and the SHA-256 of the exact diff.
  */
 export async function approveRemediation(
   scanJobId: string,
   remediationId: string,
   deps: RemediationDeps,
-  approvedBy?: string,
+  actor: ApprovalActor,
 ): Promise<RemediationRecord> {
   const job = await deps.store.get(scanJobId);
   if (!job) throw new RemediationError("scan_not_found", "Scan job not found.", 404);
@@ -163,17 +238,31 @@ export async function approveRemediation(
     );
   }
 
-  if (remediation.status === "approved") return remediation;
+  if (!job.commitSha || !COMMIT_SHA_RE.test(job.commitSha) || remediation.commitSha !== job.commitSha) {
+    throw new RemediationError("commit_unknown", "The patch does not belong to this scan's commit.", 409);
+  }
+  const now = new Date();
+  // Idempotent: a still-valid approval by the same owner is returned unchanged.
+  if (remediation.status === "approved" && !approvalProblem(job, remediation, actor, now)) return remediation;
 
-  // A failed verification (e.g. worker outage) may be re-approved; in-flight or finished ones may not.
-  const updated = await deps.store.transitionRemediation(scanJobId, remediationId, ["preview", "failed"], {
+  const binding: ApprovalBinding = {
+    approvedBy: "job_owner",
+    ownerSubject: actor.ownerSubject,
+    githubUserId: actor.githubUserId ?? null,
+    scanJobId,
+    remediationId,
+    commitSha: remediation.commitSha,
+    findingFingerprints: [...remediation.findingFingerprints],
+    approvedFiles: [...remediation.affectedFiles],
+    diffSha256: diffDigest(remediation.unifiedDiff),
+    approvedAt: now.toISOString(),
+  };
+  // A failed verification (e.g. worker outage) or a lapsed approval may be re-approved; in-flight
+  // or finished ones may not.
+  const updated = await deps.store.transitionRemediation(scanJobId, remediationId, ["preview", "failed", "approved"], {
     status: "approved",
-    approvedAt: new Date(),
-    approvedOperations: {
-      approvedBy: approvedBy || "user",
-      approvedFiles: remediation.affectedFiles,
-      diffSha256: diffDigest(remediation.unifiedDiff),
-    },
+    approvedAt: now,
+    approvedOperations: binding,
     rescanStatus: null,
   });
   if (!updated) {
@@ -193,6 +282,7 @@ export async function applyAndVerify(
   scanJobId: string,
   remediationId: string,
   deps: RemediationDeps,
+  actor: { ownerSubject: string },
 ): Promise<RemediationRecord> {
   const job = await deps.store.get(scanJobId);
   if (!job) throw new RemediationError("scan_not_found", "Scan job not found.", 404);
@@ -216,6 +306,12 @@ export async function applyAndVerify(
       "This patch is not tied to the scanned commit, so it cannot be verified.",
       409,
     );
+  }
+  // The approval must still describe exactly this job, commit, findings and diff, by this owner.
+  const problem = approvalProblem(job, remediation, actor, new Date());
+  if (problem) {
+    await invalidateApproval(scanJobId, remediationId, deps);
+    throw new RemediationError(problem, APPROVAL_MESSAGES[problem], 409);
   }
 
   const config = deps.config ?? getConfig();
@@ -435,6 +531,8 @@ export type PullRequestActor = {
   repoId: number;
   /** SHA-256 of the diff the user confirmed in the dialog; must equal the approved diff. */
   confirmedDiffSha256: string;
+  /** The job owner's session subject; must be the one that approved the patch. */
+  ownerSubject: string;
 };
 
 export async function requestPullRequest(
@@ -469,6 +567,10 @@ export async function requestPullRequest(
   if (approvedDigest && approvedDigest !== currentDigest) {
     throw new RemediationError("patch_mismatch", "The patch differs from the one that was approved.", 409);
   }
+  // Same owner session and same job/commit/findings/diff as approved (verification already
+  // happened, so the approval's age no longer matters here).
+  const problem = approvalProblem(job, remediation, actor, new Date(), { checkExpiry: false });
+  if (problem) throw new RemediationError(problem, APPROVAL_MESSAGES[problem], 409);
   // The publishing user explicitly confirmed this exact diff, not just "a" fix for the finding.
   if (actor.confirmedDiffSha256 !== currentDigest) {
     throw new RemediationError(

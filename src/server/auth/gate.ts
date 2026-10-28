@@ -2,7 +2,9 @@ import { getConfig } from "../config";
 import { prismaJobStore } from "../db";
 import { JOB_ID_RE } from "../job-store";
 import { getAuthDeps } from "../deps";
-import { checkJobAccess } from "./repository-access";
+import { checkJobAccess, loadScanAccess } from "./repository-access";
+import { PRIVATE_SCANNING_AVAILABLE, PRIVATE_SCANNING_UNAVAILABLE } from "./private-source";
+import { fail } from "../api";
 
 /**
  * Route-level access gate for one scan. Public scans pass through (the unguessable job ID remains
@@ -31,4 +33,15 @@ export async function gateScanAccessWithToken(
   const job = await prismaJobStore.get(jobId);
   if (!job) return { denied: null };
   return checkJobAccess(req, getAuthDeps(config), job, { live: true });
+}
+
+/**
+ * Refuses scan, rescan, retry and verification of a private repository while no private worker
+ * exists, before anything is queued or dispatched. Null when the job may run.
+ */
+export async function refusePrivateExecution(jobId: string): Promise<Response | null> {
+  const config = getConfig();
+  if (!config.githubApp || !JOB_ID_RE.test(jobId) || PRIVATE_SCANNING_AVAILABLE) return null;
+  const access = await loadScanAccess(getAuthDeps(config), jobId);
+  return access?.isPrivate ? fail(403, "private_scanning_unavailable", PRIVATE_SCANNING_UNAVAILABLE) : null;
 }

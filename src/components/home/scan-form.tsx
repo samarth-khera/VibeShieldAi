@@ -85,15 +85,7 @@ export function ScanForm() {
             <AlertCircle className="size-4 shrink-0" aria-hidden /> {flow.message}
           </p>
         )}
-        {flow.phase === "error" &&
-          (flow.code === "authorization_required" || flow.code === "authorization_expired" || flow.code === "authorization_revoked") && (
-            <a
-              href="/api/auth/github/start?returnTo=%2F"
-              className="mt-2 inline-flex h-8 items-center gap-1.5 rounded-lg bg-accent px-3 text-xs font-medium text-background"
-            >
-              Connect GitHub to scan private repositories
-            </a>
-          )}
+
         {flow.phase === "job" && (
           <ScanStatusPanel
             job={flow.job}

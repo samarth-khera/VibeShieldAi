@@ -1,4 +1,5 @@
 import { newJobId } from "./job-store";
+import { PRIVATE_SCANNING_AVAILABLE, PRIVATE_SCANNING_UNAVAILABLE } from "./auth/private-source";
 import { parseGithubRepoUrl } from "@/lib/github-url";
 import type { ServerConfig } from "./config";
 import { fail, ok, toPublicFinding, toPublicJob } from "./api";
@@ -120,6 +121,10 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
   let job;
   // A private scan's access record is written before its job exists, so no worker can ever be
   // handed the job (and its repository name) without the private marker.
+  if (gate?.ok && gate.isPrivate && !PRIVATE_SCANNING_AVAILABLE) {
+    // Defence in depth: never create (or dispatch) a private job without a private worker.
+    return fail(403, "private_scanning_unavailable", PRIVATE_SCANNING_UNAVAILABLE);
+  }
   const presetId = gate?.ok && gate.isPrivate ? newJobId() : undefined;
   if (presetId && gate?.ok) {
     if (!deps.recordScanAccess || gate.repoId === null) {

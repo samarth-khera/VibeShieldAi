@@ -105,12 +105,15 @@ export function RemediationPanel({
   existingRemediation,
   onRemediationUpdated,
   mode = "review",
+  readOnly = false,
 }: {
   jobId: string;
   finding: PublicFinding;
   existingRemediation?: PublicRemediation | null;
   onRemediationUpdated?: (rem: PublicRemediation) => void;
   mode?: "review" | "autofix";
+  /** Not the job owner: show the current fix and its verification, but no actions. */
+  readOnly?: boolean;
 }) {
   const [remediation, setRemediation] = useState<PublicRemediation | null>(existingRemediation ?? null);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -267,6 +270,9 @@ export function RemediationPanel({
             Generate an exact, reviewable unified diff to resolve <strong>{finding.ruleId}</strong>. No repository files
             will be modified without your explicit approval.
           </p>
+          {readOnly ? (
+            <p className="text-xs text-muted">Only the browser that started this scan can generate a fix.</p>
+          ) : (
           <Button onClick={onGeneratePreview} disabled={isGenerating} size="sm">
             {isGenerating ? (
               <>
@@ -278,6 +284,7 @@ export function RemediationPanel({
               </>
             )}
           </Button>
+          )}
         </div>
       )}
 
@@ -304,7 +311,13 @@ export function RemediationPanel({
             </div>
           )}
 
-          {mode === "autofix" && (
+          {readOnly && (
+            <p className="rounded-lg border border-line bg-surface-subtle p-3 text-xs text-muted" role="note">
+              Read-only: only the browser session that started this scan can approve, verify or publish this fix.
+            </p>
+          )}
+
+          {mode === "autofix" && !readOnly && (
             <GithubPullRequestPanel
               jobId={jobId}
               finding={finding}
@@ -318,7 +331,7 @@ export function RemediationPanel({
           )}
 
           {/* Status: Preview -> Requires Approval */}
-          {remediation.status === "preview" && (
+          {remediation.status === "preview" && !readOnly && (
             <div className="rounded-lg border border-line bg-surface p-3 space-y-3">
               {mode === "review" ? (
                 <div className="space-y-2">
@@ -373,7 +386,7 @@ export function RemediationPanel({
           )}
 
           {/* Status: Approved -> Apply & Rescan */}
-          {remediation.status === "approved" && (
+          {remediation.status === "approved" && !readOnly && (
             <div className="rounded-lg border border-line bg-surface p-3 space-y-3">
               <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
                 <CheckCircle2 className="size-4 text-accent" /> Patch Approved by User
@@ -420,10 +433,12 @@ export function RemediationPanel({
                   "Verification could not complete."}
               </p>
               {remediation.rescanSummary && <VerificationDetails summary={remediation.rescanSummary} />}
-              <Button onClick={onApprove} disabled={isApproving} size="sm" variant="secondary">
-                {isApproving ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldCheck className="size-3.5" />}
-                Approve Again to Retry
-              </Button>
+              {!readOnly && (
+                <Button onClick={onApprove} disabled={isApproving} size="sm" variant="secondary">
+                  {isApproving ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldCheck className="size-3.5" />}
+                  Approve Again to Retry
+                </Button>
+              )}
             </div>
           )}
 

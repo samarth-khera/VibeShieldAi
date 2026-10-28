@@ -76,7 +76,7 @@ function headers(config: ServerConfig, accept: string): Record<string, string> {
 function mapHttpFailure(res: Response): RetrievalError {
   const remaining = res.headers.get("x-ratelimit-remaining");
   if (res.status === 404 || res.status === 451) {
-    return new RetrievalError("invalid_repository", "not_found_or_private", "Repository not found, or it is not public.");
+    return new RetrievalError("invalid_repository", "not_found_or_private", "Repository not found or not public. Private repository scanning is currently unavailable.");
   }
   if (res.status === 409) {
     return new RetrievalError("invalid_repository", "empty_repository", "The repository is empty.");
@@ -109,8 +109,9 @@ export async function fetchRepoMetadata(
   } catch {
     throw new RetrievalError("download_failed", "github_error", "GitHub returned an unreadable response.");
   }
-  if (body.private === true || (typeof body.visibility === "string" && body.visibility !== "public")) {
-    throw new RetrievalError("invalid_repository", "not_found_or_private", "Repository not found, or it is not public.");
+  // Fail closed: only an explicit `private: false` (and, when present, visibility "public") counts as public.
+  if (body.private !== false || (typeof body.visibility === "string" && body.visibility !== "public")) {
+    throw new RetrievalError("invalid_repository", "not_found_or_private", "Repository not found or not public. Private repository scanning is currently unavailable.");
   }
   if (body.disabled === true) {
     throw new RetrievalError("invalid_repository", "disabled", "This repository is disabled.");
