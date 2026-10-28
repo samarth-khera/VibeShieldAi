@@ -128,6 +128,7 @@ describe("runRetrieval pipeline", () => {
     store = new MockJobStore();
     testTmpDir = await mkdtemp(path.join(tmpdir(), "retrieval-test-"));
     config = {
+      pullRequestRepositories: [],
       maxArchiveBytes: 10 * 1024 * 1024,
       maxUnpackedBytes: 20 * 1024 * 1024,
       maxFileCount: 50,
@@ -143,6 +144,12 @@ describe("runRetrieval pipeline", () => {
       globalDailyScanCap: 20,
       maxConcurrentHeavyScans: 1,
       jobTimeoutMs: 900_000,
+      maxQueuedScans: 10,
+      queueTimeoutMs: 1_800_000,
+      warmWorkerEnabled: false,
+      warmLeaseMs: 60_000,
+      warmWorkerHealthyMs: 30_000,
+      warmWorkerGraceMs: 10_000,
       scanDispatchBackend: "bullmq",
       githubRepository: "samarth-khera/VibeShieldAi",
       githubWorkflowRef: "main",

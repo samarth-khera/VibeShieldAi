@@ -28,7 +28,10 @@ describe.skipIf(!PG_URL)("PostgreSQL heavy-work slot reservation (live database)
     maxScansPerIpHourly: 100,
     maxScansPerIpDaily: 100,
     globalDailyScanCap: 1000,
+    maxQueuedScans: 50,
     jobTimeoutMs: 15 * 60_000,
+    queueTimeoutMs: 30 * 60_000,
+    warmLeaseMs: 60_000,
   });
 
   const newJob = (i: number) => ({
@@ -57,16 +60,18 @@ describe.skipIf(!PG_URL)("PostgreSQL heavy-work slot reservation (live database)
     await prisma?.$disconnect();
   });
 
-  it("accepts exactly `maxConcurrentHeavyScans` of 12 simultaneous submissions", async () => {
-    const results = await Promise.all(Array.from({ length: 12 }, (_, i) => store.createWithQuota!(newJob(i), quota(2))));
-    expect(results.filter((r) => r.ok)).toHaveLength(2);
+  it("bounds the waiting queue exactly under 12 simultaneous submissions", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 12 }, (_, i) => store.createWithQuota!(newJob(i), { ...quota(2), maxQueuedScans: 5 })),
+    );
+    expect(results.filter((r) => r.ok)).toHaveLength(5);
     const rejected = results.filter((r) => !r.ok);
-    expect(rejected).toHaveLength(10);
-    for (const r of rejected) if (!r.ok) expect(r.rateLimit.reason).toBe("concurrency_limit");
-    expect(await prisma.scanJob.count({ where: { status: "queued" } })).toBe(2);
+    expect(rejected).toHaveLength(7);
+    for (const r of rejected) if (!r.ok) expect(r.rateLimit.reason).toBe("queue_full");
+    expect(await prisma.scanJob.count({ where: { status: "queued", startedAt: null } })).toBe(5);
   });
 
-  it("counts remediation verifications and scans against one shared cap", async () => {
+  it("counts remediation verifications and executing scans against one shared cap", async () => {
     const done = await store.createWithQuota!(newJob(100), quota(5));
     if (!done.ok) throw new Error("setup failed");
     await prisma.scanJob.update({ where: { id: done.job.id }, data: { status: "completed", commitSha: "a".repeat(40) } });
@@ -90,21 +95,23 @@ describe.skipIf(!PG_URL)("PostgreSQL heavy-work slot reservation (live database)
         },
       });
     }
-    // One slot is already taken by an active scan; 5 verifications and 5 scans race for the last one.
-    const busy = await store.createWithQuota!(newJob(101), quota(2));
-    expect(busy.ok).toBe(true);
+    for (let i = 0; i < 6; i++) await store.createWithQuota!(newJob(200 + i), quota(2));
+    // One slot is taken by an executing scan; 5 verifications and 5 scan claims race for the last one.
+    expect(await store.claimNextScan!({ kind: "github-actions" }, quota(2))).not.toBeNull();
 
     const outcomes = await Promise.all([
-      ...remediationIds.map((id) => store.beginRemediationVerification!(done.job.id, id, quota(2))),
-      ...Array.from({ length: 5 }, (_, i) => store.createWithQuota!(newJob(200 + i), quota(2))),
+      ...remediationIds.map((id) => store.beginRemediationVerification!(done.job.id, id, quota(2)).then((r) => r.ok)),
+      ...Array.from({ length: 5 }, (_, i) =>
+        store.claimNextScan!(i % 2 ? { kind: "github-actions" } : { kind: "warm", workerId: `w${i}` }, quota(2)).then(Boolean),
+      ),
     ]);
-    expect(outcomes.filter((o) => o.ok)).toHaveLength(1);
+    expect(outcomes.filter(Boolean)).toHaveLength(1);
     const verifying = await prisma.remediation.count({ where: { status: "applied" } });
-    const activeScans = await prisma.scanJob.count({ where: { status: "queued" } });
-    expect(verifying + activeScans).toBe(2);
+    const executing = await prisma.scanJob.count({ where: { startedAt: { not: null }, status: "queued" } });
+    expect(verifying + executing).toBe(2);
   });
 
-  it("lets only one of several contended retries take the last slot", async () => {
+  it("re-queues contended retries only while the waiting queue has room", async () => {
     const ids: string[] = [];
     for (let i = 0; i < 4; i++) {
       const r = await store.createWithQuota!(newJob(300 + i), quota(10));
@@ -112,25 +119,26 @@ describe.skipIf(!PG_URL)("PostgreSQL heavy-work slot reservation (live database)
       await prisma.scanJob.update({ where: { id: r.job.id }, data: { status: "failed" } });
       ids.push(r.job.id);
     }
-    const results = await Promise.all(ids.map((id) => store.requeueWithQuota!(id, ["failed"], 5, quota(1))));
+    const results = await Promise.all(ids.map((id) => store.requeueWithQuota!(id, ["failed"], 5, { ...quota(1), maxQueuedScans: 1 })));
     expect(results.filter((r) => r.ok)).toHaveLength(1);
-    expect(await prisma.scanJob.count({ where: { status: "queued" } })).toBe(1);
+    expect(await prisma.scanJob.count({ where: { status: "queued", startedAt: null } })).toBe(1);
     expect(await prisma.scanJob.count({ where: { status: "failed" } })).toBe(3);
   });
 
-  it("reaps a job that stopped reporting progress and frees its slot", async () => {
-    const stuck = await store.createWithQuota!(newJob(400), quota(1));
-    if (!stuck.ok) throw new Error("setup failed");
-    await prisma.$executeRawUnsafe(
-      `UPDATE "ScanJob" SET "updatedAt" = now() - interval '20 minutes' WHERE id = $1`,
-      stuck.job.id,
-    );
+  it("fails executor-claimed work that stopped reporting and expired queue entries, freeing the slot", async () => {
+    const a = await store.createWithQuota!(newJob(400), quota(1));
+    const b = await store.createWithQuota!(newJob(401), quota(1));
+    if (!a.ok || !b.ok) throw new Error("setup failed");
+    const claimed = await store.claimNextScan!({ kind: "github-actions" }, quota(1));
+    expect(claimed?.job.id).toBe(a.job.id);
+    await prisma.$executeRawUnsafe(`UPDATE "ScanJob" SET "updatedAt" = now() - interval '20 minutes' WHERE id = $1`, a.job.id);
+    await prisma.$executeRawUnsafe(`UPDATE "ScanJob" SET "updatedAt" = now() - interval '40 minutes' WHERE id = $1`, b.job.id);
 
-    const next = await store.createWithQuota!(newJob(401), quota(1));
+    const next = await store.createWithQuota!(newJob(402), quota(1));
     expect(next.ok).toBe(true);
-    const reaped = await prisma.scanJob.findUnique({ where: { id: stuck.job.id } });
-    expect(reaped?.status).toBe("failed");
-    expect(reaped?.failureCategory).toBe("worker_timeout");
+    expect(await prisma.scanJob.findUnique({ where: { id: a.job.id } })).toMatchObject({ status: "failed", failureCategory: "worker_timeout" });
+    expect(await prisma.scanJob.findUnique({ where: { id: b.job.id } })).toMatchObject({ status: "failed", failureCategory: "queue_timeout" });
+    expect(await store.claimNextScan!({ kind: "github-actions" }, quota(1))).not.toBeNull();
   });
 
   it("applies worker progress heartbeats forward-only and never reopens a finished job", async () => {

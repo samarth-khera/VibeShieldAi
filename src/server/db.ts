@@ -1,8 +1,20 @@
+import { randomBytes } from "node:crypto";
+import { verificationClaimOf, withVerificationClaim as withClaim } from "./remediation/claims";
 import { Prisma, PrismaClient } from "@prisma/client";
-import type { ServerConfig } from "./config";
-import { countActiveHeavyWork, evaluateQuota, type QuotaCounts } from "./quota";
+import {
+  countActiveHeavyWork,
+  countWaitingScans,
+  evaluateQuota,
+  isWarmLease,
+  WAITING_WHERE,
+  WARM_LEASE_PREFIX,
+  type QuotaCounts,
+} from "./quota";
 import {
   ACTIVE_STATUSES,
+  MAX_WARM_ATTEMPTS,
+  type QuotaConfig,
+  type ScanExecutor,
   newJobId,
   RETRYABLE_STATUSES,
   STALE_JOB_PATCH,
@@ -66,8 +78,8 @@ export const prismaJobStore: JobStore = {
     withDbRetry(() => prisma.scanJob.create({ data: { id: newJobId(), ...data } }) as Promise<JobRecord>),
 
   async createWithQuota(data: NewJob, config, now = new Date()): Promise<CreateJobWithQuotaResult> {
-    return withHeavySlotLock(config, now, async (tx, active) => {
-      const counts: QuotaCounts = { active };
+    return withHeavySlotLock(config, now, async (tx) => {
+      const counts: QuotaCounts = { waiting: await countWaitingScans(tx) };
       let limit = evaluateQuota(counts, config);
       if (!limit.allowed) return { ok: false, rateLimit: limit };
 
@@ -89,27 +101,95 @@ export const prismaJobStore: JobStore = {
       limit = evaluateQuota(counts, config);
       if (!limit.allowed) return { ok: false, rateLimit: limit };
 
-      // Created inside the locked transaction, so the next reservation counts this job.
+      // Created waiting (no slot yet) inside the locked transaction; an executor claims it next.
       const job = (await tx.scanJob.create({ data: { id: newJobId(), status: "queued", ...data } })) as unknown as JobRecord;
       return { ok: true, job };
     });
   },
 
   async requeueWithQuota(id, from, maxAttempts, config, now = new Date()) {
-    return withHeavySlotLock(config, now, async (tx, active): Promise<SlotReservation> => {
+    return withHeavySlotLock(config, now, async (tx): Promise<SlotReservation> => {
       const job = await tx.scanJob.findUnique({ where: { id }, select: { status: true, attempts: true } });
       if (!job || !from.includes(job.status) || job.attempts >= maxAttempts) return { ok: false };
 
-      // A job that already holds a slot (e.g. ready_for_scan) keeps it rather than needing a second one.
-      const holdsSlot = ACTIVE_STATUSES.includes(job.status);
-      const limit = evaluateQuota({ active: holdsSlot ? active - 1 : active }, config);
+      const limit = evaluateQuota({ waiting: await countWaitingScans(tx) }, config);
       if (!limit.allowed) return { ok: false, rateLimit: limit };
 
-      await tx.scanJob.update({
-        where: { id },
-        data: { status: "queued", failureCategory: null, errorMessage: null, completedAt: null, startedAt: null },
-      });
+      // Back to waiting: it must be claimed through the same slot reservation as a new scan.
+      await tx.scanJob.update({ where: { id }, data: WAITING_RESET });
       return { ok: true };
+    });
+  },
+
+  async claimNextScan(executor, config, now = new Date(), opts) {
+    return withHeavySlotLock(config, now, async (tx, active) => {
+      if (evaluateQuota({ active }, config).allowed === false) return null;
+      const waitedSince = new Date(now.getTime() - (opts?.minWaitMs ?? 0));
+      const next = await tx.scanJob.findFirst({
+        where: { ...WAITING_WHERE, updatedAt: { lte: waitedSince } },
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      if (!next) return null;
+      const lease = newLease(executor);
+      const job = (await tx.scanJob.update({
+        where: { id: next.id },
+        data: { startedAt: now, workflowRunId: lease, attempts: { increment: 1 } },
+      })) as unknown as JobRecord;
+      return { job, lease };
+    });
+  },
+
+  async queuePosition(jobId) {
+    return withDbRetry(async () => {
+      const job = await prisma.scanJob.findUnique({ where: { id: jobId }, select: { status: true, startedAt: true, createdAt: true } });
+      if (!job || job.status !== "queued" || job.startedAt) return null;
+      return 1 + (await prisma.scanJob.count({ where: { ...WAITING_WHERE, createdAt: { lt: job.createdAt } } }));
+    });
+  },
+
+  async renewLease(lease, now = new Date()) {
+    return withDbRetry(async () => {
+      const scans = await prisma.scanJob.updateMany({
+        where: { workflowRunId: lease, status: { in: [...ACTIVE_STATUSES] } },
+        data: { updatedAt: now },
+      });
+      const verifications = await prisma.remediation.updateMany({
+        where: { status: "applied", approvedOperations: { path: ["verificationClaim", "lease"], equals: lease } },
+        data: { updatedAt: now },
+      });
+      return scans.count + verifications.count;
+    });
+  },
+
+  async recordWorkerHeartbeat(input, now = new Date()) {
+    return withDbRetry(async () => {
+      const data = {
+        lastRequestMs: BigInt(input.requestMs),
+        lastSeenAt: now,
+        capacity: input.capacity,
+        activeJobs: input.activeJobs,
+        version: input.version?.slice(0, 40) ?? null,
+        arch: input.arch?.slice(0, 40) ?? null,
+        scannerVersions: (input.scannerVersions ?? Prisma.DbNull) as Prisma.InputJsonValue,
+      };
+      // Monotonic per worker: a replayed or reordered signed request never updates the row.
+      const updated = await prisma.workerHeartbeat.updateMany({
+        where: { id: input.workerId, lastRequestMs: { lt: BigInt(input.requestMs) } },
+        data,
+      });
+      if (updated.count === 1) return true;
+      const existing = await prisma.workerHeartbeat.findUnique({ where: { id: input.workerId }, select: { id: true } });
+      if (existing) return false;
+      await prisma.workerHeartbeat.create({ data: { id: input.workerId, startedAt: now, ...data } }).catch(() => undefined);
+      return true;
+    });
+  },
+
+  async warmWorkerHealthy(now, healthyMs) {
+    return withDbRetry(async () => {
+      const n = await prisma.workerHeartbeat.count({ where: { lastSeenAt: { gte: new Date(now.getTime() - healthyMs) } } });
+      return n > 0;
     });
   },
 
@@ -123,8 +203,8 @@ export const prismaJobStore: JobStore = {
     });
   },
 
-  async reapStale(now, timeoutMs) {
-    return withDbRetry(() => reapStaleWork(prisma, now, timeoutMs));
+  async reapStale(now, config) {
+    return withDbRetry(() => reapStaleWork(prisma, now, config));
   },
 
   get: (id) =>
@@ -337,6 +417,37 @@ export const prismaJobStore: JobStore = {
     });
   },
 
+  async assignVerification(scanJobId, remediationId, lease) {
+    return withDbRetry(() =>
+      prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(84239105)`;
+        const r = await tx.remediation.findFirst({ where: { id: remediationId, scanJobId, status: "applied" } });
+        if (!r || verificationClaimOf(r.approvedOperations)) return false;
+        await tx.remediation.update({
+          where: { id: remediationId },
+          data: { approvedOperations: withVerificationClaim(r.approvedOperations, lease) },
+        });
+        return true;
+      }),
+    );
+  },
+
+  async claimNextVerification(workerId, config, now = new Date()) {
+    return withHeavySlotLock(config, now, async (tx) => {
+      // The slot was already reserved when the verification was approved and applied.
+      const pending = await tx.remediation.findMany({ where: { status: "applied" }, orderBy: { updatedAt: "asc" }, take: 20 });
+      const next = pending.find((r) => !verificationClaimOf(r.approvedOperations));
+      if (!next) return null;
+      const lease = newLease({ kind: "warm", workerId });
+      const remediation = await tx.remediation.update({
+        where: { id: next.id },
+        data: { approvedOperations: withVerificationClaim(next.approvedOperations, lease), updatedAt: now },
+      });
+      const job = (await tx.scanJob.findUnique({ where: { id: next.scanJobId } })) as unknown as JobRecord;
+      return { job, lease, remediation: remediation as unknown as import("./remediation/types").RemediationRecord };
+    });
+  },
+
   async updateRemediation(scanJobId, remediationId, patch) {
     return withDbRetry(async () => {
       const updated = await prisma.remediation.update({
@@ -361,32 +472,101 @@ function remediationPatchData(patch: Partial<import("./remediation/types").Remed
 
 type Tx = Prisma.TransactionClient;
 
-/** Fails scans and verifications that stopped reporting progress, so they release their worker slot. */
-async function reapStaleWork(client: Tx | PrismaClient, now: Date, timeoutMs: number): Promise<number> {
-  const staleBefore = new Date(now.getTime() - timeoutMs);
-  const scans = await client.scanJob.updateMany({
-    where: { status: { in: [...ACTIVE_STATUSES] }, updatedAt: { lt: staleBefore } },
+/** Fields reset when a scan goes back to waiting for a slot. */
+const WAITING_RESET = {
+  status: "queued",
+  startedAt: null,
+  workflowRunId: null,
+  workflowRunUrl: null,
+  failureCategory: null,
+  errorMessage: null,
+  completedAt: null,
+  gitleaksStatus: null,
+  semgrepStatus: null,
+  osvStatus: null,
+} as const;
+
+function newLease(executor: ScanExecutor): string {
+  const token = randomBytes(9).toString("base64url");
+  return executor.kind === "warm" ? `${WARM_LEASE_PREFIX}${executor.workerId.slice(0, 64)}:${token}` : `gha:${token}`;
+}
+
+const withVerificationClaim = (ops: unknown, lease: string | null) => withClaim(ops, lease) as Prisma.InputJsonValue;
+
+const VERIFICATION_TIMEOUT_SUMMARY = {
+  targetResolved: false,
+  originalFindingsCount: 0,
+  postRescanFindingsCount: 0,
+  newFindingsCount: 0,
+  resolvedFingerprints: [],
+  remainingFingerprints: [],
+  regressions: [],
+  reason: "verification_timeout",
+  detail: "The verification worker did not report a result in time. Nothing was verified.",
+};
+
+/** Releases work that stopped reporting progress, so it never holds a slot or a status forever. */
+async function reapStaleWork(client: Tx | PrismaClient, now: Date, config: QuotaConfig): Promise<number> {
+  const leaseExpired = new Date(now.getTime() - config.warmLeaseMs);
+  const jobExpired = new Date(now.getTime() - config.jobTimeoutMs);
+  const queueExpired = new Date(now.getTime() - config.queueTimeoutMs);
+  let changed = 0;
+
+  // Warm-worker scans whose lease lapsed (worker crashed or restarted): re-queue a bounded number of times.
+  const lost = await client.scanJob.findMany({
+    where: {
+      status: { in: [...ACTIVE_STATUSES] },
+      startedAt: { not: null },
+      workflowRunId: { startsWith: WARM_LEASE_PREFIX },
+      updatedAt: { lt: leaseExpired },
+    },
+    select: { id: true, attempts: true },
+  });
+  for (const job of lost) {
+    if (job.attempts < MAX_WARM_ATTEMPTS) {
+      await client.finding.deleteMany({ where: { scanJobId: job.id } }); // partial results of the lost run
+      await client.scanJob.update({ where: { id: job.id }, data: WAITING_RESET });
+    } else {
+      await client.scanJob.update({ where: { id: job.id }, data: { ...STALE_JOB_PATCH, completedAt: now } });
+    }
+    changed++;
+  }
+
+  const stuck = await client.scanJob.updateMany({
+    where: {
+      status: { in: [...ACTIVE_STATUSES] },
+      startedAt: { not: null },
+      NOT: { workflowRunId: { startsWith: WARM_LEASE_PREFIX } },
+      updatedAt: { lt: jobExpired },
+    },
     data: { ...STALE_JOB_PATCH, completedAt: now },
   });
-  const verifications = await client.remediation.updateMany({
-    where: { status: "applied", updatedAt: { lt: staleBefore } },
+  const expiredInQueue = await client.scanJob.updateMany({
+    where: { ...WAITING_WHERE, updatedAt: { lt: queueExpired } },
     data: {
       status: "failed",
-      rescanStatus: "failed",
-      rescanSummary: {
-        targetResolved: false,
-        originalFindingsCount: 0,
-        postRescanFindingsCount: 0,
-        newFindingsCount: 0,
-        resolvedFingerprints: [],
-        remainingFingerprints: [],
-        regressions: [],
-        reason: "verification_timeout",
-        detail: "The verification worker did not report a result in time. Nothing was verified.",
-      },
+      failureCategory: "queue_timeout",
+      errorMessage: "No scan worker became available in time. Please retry the scan.",
+      completedAt: now,
     },
   });
-  return scans.count + verifications.count;
+  changed += stuck.count + expiredInQueue.count;
+
+  for (const r of await client.remediation.findMany({ where: { status: "applied", updatedAt: { lt: leaseExpired } } })) {
+    const claim = verificationClaimOf(r.approvedOperations);
+    if (isWarmLease(claim?.lease)) {
+      // Unassign so a live worker (or the Actions fallback) picks it up again.
+      await client.remediation.update({ where: { id: r.id }, data: { approvedOperations: withVerificationClaim(r.approvedOperations, null) } });
+      changed++;
+    } else if (r.updatedAt < jobExpired) {
+      await client.remediation.update({
+        where: { id: r.id },
+        data: { status: "failed", rescanStatus: "failed", rescanSummary: VERIFICATION_TIMEOUT_SUMMARY },
+      });
+      changed++;
+    }
+  }
+  return changed;
 }
 
 /**
@@ -396,7 +576,7 @@ async function reapStaleWork(client: Tx | PrismaClient, now: Date, timeoutMs: nu
  * both observe a free slot.
  */
 async function withHeavySlotLock<T>(
-  config: Pick<ServerConfig, "jobTimeoutMs">,
+  config: QuotaConfig,
   now: Date,
   fn: (tx: Tx, activeSlots: number) => Promise<T>,
 ): Promise<T> {
@@ -404,8 +584,8 @@ async function withHeavySlotLock<T>(
     prisma.$transaction(
       async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(84239105)`;
-        await reapStaleWork(tx, now, config.jobTimeoutMs);
-        const active = await countActiveHeavyWork(tx, new Date(now.getTime() - config.jobTimeoutMs));
+        await reapStaleWork(tx, now, config);
+        const active = await countActiveHeavyWork(tx);
         return fn(tx, active);
       },
       { timeout: 15000, isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },

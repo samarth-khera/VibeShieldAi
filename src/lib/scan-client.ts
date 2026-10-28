@@ -102,6 +102,9 @@ export type PublicScanJob = {
   retryable: boolean;
   scanPerformed: boolean;
   workerOnline: boolean | null;
+  /** Present while the scan waits for a free worker slot. */
+  queue?: { waitingForSlot: boolean; position: number | null } | null;
+  executor?: "warm-worker" | "github-actions" | null;
   createdAt: string;
   updatedAt: string;
   startedAt?: string | null;
@@ -111,6 +114,10 @@ export type PublicScanJob = {
 
 export type ScanProgress = {
   phase?: "worker_started" | "retrieving" | "extracting" | "scanning";
+  /** Increments whenever a scanner publishes results; refetch findings only when it changes. */
+  revision?: number;
+  firstFindingAt?: string;
+  finalAt?: string;
   worker_startedAt?: string;
   retrievingAt?: string;
   extractingAt?: string;
@@ -271,14 +278,44 @@ export type PublicRemediation = {
     detail?: string;
     scannerStatuses?: { gitleaks: string; semgrep: string; osvScanner: string };
     timings?: Record<string, number | undefined>;
-    runtime?: "github-actions" | "local";
+    runtime?: "github-actions" | "warm-worker" | "local";
     snapshot?: { commitSha: string; fileCount: number };
     workflowRunUrl?: string;
   } | null;
   branchName: string | null;
   pullRequestUrl: string | null;
+  pullRequest: RemediationPullRequest | null;
   createdAt: string;
   updatedAt: string;
+};
+
+export type PullRequestFailureCode =
+  | "not_configured"
+  | "repository_not_allowed"
+  | "credential_invalid"
+  | "access_denied"
+  | "repository_not_found"
+  | "repository_mismatch"
+  | "rate_limited"
+  | "commit_not_found"
+  | "unsafe_target"
+  | "patch_conflict"
+  | "branch_conflict"
+  | "github_error"
+  | "network_error";
+
+export type RemediationPullRequest = {
+  availability?: "enabled" | "not_configured" | "repository_not_allowed";
+  status?: "created" | "exists" | "failed";
+  code?: PullRequestFailureCode;
+  message?: string;
+  branch?: string;
+  baseBranch?: string;
+  headSha?: string;
+  number?: number;
+  url?: string;
+  state?: "open" | "closed" | "merged";
+  at?: string;
 };
 
 export const createRemediationPreview = (jobId: string, findingId: string) =>
@@ -303,13 +340,11 @@ export const applyRemediation = (jobId: string, remediationId: string) =>
     { method: "POST" },
   );
 
-export const createRemediationPr = (jobId: string, remediationId: string, token?: string) =>
-  request<{ remediation: PublicRemediation; message: string; hasWriteAccess: boolean }>(
+/** The server uses its own credential; the browser never sends or sees a GitHub token. */
+export const createRemediationPr = (jobId: string, remediationId: string) =>
+  request<{ remediation: PublicRemediation; pullRequest: RemediationPullRequest }>(
     `/api/scans/${encodeURIComponent(jobId)}/remediation/${encodeURIComponent(remediationId)}/pr`,
-    {
-      method: "POST",
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-    },
+    { method: "POST" },
   );
 
 

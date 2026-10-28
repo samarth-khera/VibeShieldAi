@@ -97,8 +97,34 @@ export type CreateJobWithQuotaResult =
 
 export type QuotaConfig = Pick<
   ServerConfig,
-  "maxScansPerIpHourly" | "maxScansPerIpDaily" | "globalDailyScanCap" | "maxConcurrentHeavyScans" | "jobTimeoutMs"
+  | "maxScansPerIpHourly"
+  | "maxScansPerIpDaily"
+  | "globalDailyScanCap"
+  | "maxConcurrentHeavyScans"
+  | "maxQueuedScans"
+  | "jobTimeoutMs"
+  | "queueTimeoutMs"
+  | "warmLeaseMs"
 >;
+
+/** Who executes a claimed job. */
+export type ScanExecutor = { kind: "github-actions" } | { kind: "warm"; workerId: string };
+
+export type ClaimedScan = { job: JobRecord; lease: string };
+export type ClaimedVerification = { job: JobRecord; remediation: RemediationRecord; lease: string };
+
+export type WorkerHeartbeatInput = {
+  workerId: string;
+  requestMs: number;
+  capacity: number;
+  activeJobs: number;
+  version?: string;
+  arch?: string;
+  scannerVersions?: Record<string, unknown>;
+};
+
+/** Warm-worker jobs are re-queued this many times after a lost lease before failing. */
+export const MAX_WARM_ATTEMPTS = 3;
 
 /** Outcome of reserving one of the `maxConcurrentHeavyScans` slots. `rateLimit` is absent when the status did not allow it. */
 export type SlotReservation =
@@ -136,8 +162,25 @@ export interface JobStore {
   ): Promise<SlotReservation>;
   /** Moves a job from one of `from` to `patch.status` (or just applies `patch`). Returns false if it was not in `from`. */
   transition(id: string, from: readonly ScanStatus[], patch: JobPatch): Promise<boolean>;
-  /** Fails active jobs and verifications whose last progress is older than `timeoutMs`. Returns the number reaped. */
-  reapStale(now: Date, timeoutMs: number): Promise<number>;
+  /**
+   * Releases work that stopped making progress: expired warm-worker leases are re-queued (up to
+   * MAX_WARM_ATTEMPTS), other claimed jobs fail after `jobTimeoutMs`, and scans waiting longer than
+   * `queueTimeoutMs` fail. Returns the number of rows changed.
+   */
+  reapStale(now: Date, config: QuotaConfig): Promise<number>;
+  /**
+   * Atomically claims the oldest waiting scan for `executor` if a slot is free (same advisory lock
+   * as every other reservation). `minWaitMs` leaves younger jobs for a healthy warm worker.
+   */
+  claimNextScan?(executor: ScanExecutor, config: QuotaConfig, now?: Date, opts?: { minWaitMs?: number }): Promise<ClaimedScan | null>;
+  /** 1-based position among waiting scans, or null if the job is not waiting. */
+  queuePosition?(jobId: string): Promise<number | null>;
+  /** Extends the lease on whatever this lease owns (scan or verification). */
+  renewLease?(lease: string, now?: Date): Promise<number>;
+  /** Records a signed worker poll. Returns false for a replayed or out-of-order request timestamp. */
+  recordWorkerHeartbeat?(input: WorkerHeartbeatInput, now?: Date): Promise<boolean>;
+  /** True if any warm worker polled within `healthyMs`. */
+  warmWorkerHealthy?(now: Date, healthyMs: number): Promise<boolean>;
   get(id: string): Promise<JobRecord | null>;
   /** Atomically moves queued (or a stale `retrieving`) job to `retrieving`. Returns false if not claimable. */
   claim(id: string, staleBefore: Date): Promise<boolean>;
@@ -174,6 +217,10 @@ export interface JobStore {
     config: QuotaConfig,
     now?: Date,
   ): Promise<VerificationReservation>;
+  /** Assigns an in-flight (`applied`) verification to an executor lease if it has none yet. */
+  assignVerification?(scanJobId: string, remediationId: string, lease: string): Promise<boolean>;
+  /** Claims the oldest unassigned in-flight verification for a warm worker. */
+  claimNextVerification?(workerId: string, config: QuotaConfig, now?: Date): Promise<ClaimedVerification | null>;
 }
 
 /** 192 bits of CSPRNG output → 32 URL-safe chars. Unguessable; acts as the access capability. */

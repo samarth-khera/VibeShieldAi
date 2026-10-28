@@ -1,0 +1,11 @@
+# Never send credentials, local state or build output into an image build context.
+.env
+.env.*
+!.env.example
+node_modules
+.next
+.git
+.vercel
+*.log
+tsconfig.tsbuildinfo
+production_acceptance_report.md

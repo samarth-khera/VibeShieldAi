@@ -1,15 +1,14 @@
 import { createHash } from "node:crypto";
 import type IORedis from "ioredis";
-import type { ServerConfig } from "./config";
 import { withDbRetry } from "./db";
-import { countActiveHeavyWork, evaluateQuota, type QuotaClient, type QuotaCounts, type QuotaLimits } from "./quota";
+import { countWaitingScans, evaluateQuota, type QuotaClient, type QuotaCounts, type QuotaLimits } from "./quota";
 
 export { countActiveHeavyWork, evaluateQuota, type QuotaCounts } from "./quota";
 
 export type RateLimitResult = {
   allowed: boolean;
   retryAfterSeconds: number;
-  reason?: "concurrency_limit" | "hourly_ip_limit" | "daily_ip_limit" | "global_daily_limit" | "rate_limited";
+  reason?: "concurrency_limit" | "queue_full" | "hourly_ip_limit" | "daily_ip_limit" | "global_daily_limit" | "rate_limited";
   message?: string;
 };
 
@@ -74,13 +73,11 @@ export async function checkRateLimit(
 export async function checkDatabaseQuotas(
   prismaClient: QuotaClient,
   ipHash: string,
-  config: QuotaLimits & Pick<ServerConfig, "jobTimeoutMs">,
+  config: QuotaLimits,
   now: Date = new Date(),
 ): Promise<RateLimitResult> {
   return withDbRetry(async () => {
-    const counts: QuotaCounts = {
-      active: await countActiveHeavyWork(prismaClient, new Date(now.getTime() - config.jobTimeoutMs)),
-    };
+    const counts: QuotaCounts = { waiting: await countWaitingScans(prismaClient) };
     let result = evaluateQuota(counts, config);
     if (!result.allowed) return result;
 

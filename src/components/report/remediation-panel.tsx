@@ -1,12 +1,10 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   AlertCircle,
   AlertTriangle,
   CheckCircle2,
-  GitBranch,
-  GitPullRequest,
   Loader2,
   ShieldAlert,
   ShieldCheck,
@@ -15,6 +13,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
+  ApiRequestError,
   applyRemediation,
   approveRemediation,
   createRemediationPreview,
@@ -23,6 +22,7 @@ import {
   type PublicFinding,
   type PublicRemediation,
 } from "@/lib/scan-client";
+import { PullRequestSection } from "./pull-request-section";
 import { DiffViewer } from "./diff-viewer";
 import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
 import { useAdaptivePoll } from "@/lib/use-adaptive-poll";
@@ -48,7 +48,13 @@ function VerificationDetails({ summary }: { summary: NonNullable<PublicRemediati
       {summary.runtime && (
         <>
           <dt>Runtime</dt>
-          <dd>{summary.runtime === "github-actions" ? "GitHub Actions scanner worker" : "Local scanner runtime"}</dd>
+          <dd>
+            {summary.runtime === "github-actions"
+              ? "GitHub Actions scanner worker"
+              : summary.runtime === "warm-worker"
+                ? "Persistent warm scanner worker"
+                : "Local scanner runtime"}
+          </dd>
         </>
       )}
       {summary.snapshot && (
@@ -113,9 +119,27 @@ export function RemediationPanel({
   const [isApproving, setIsApproving] = useState(false);
   const [isApplying, setIsApplying] = useState(false);
   const [isOpeningPr, setIsOpeningPr] = useState(false);
-  const [prResult, setPrResult] = useState<{ url?: string; message: string; hasWriteAccess: boolean } | null>(null);
+  const [prError, setPrError] = useState<{ code: string; message: string } | null>(null);
   const [approvedChecked, setApprovedChecked] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Restore the latest remediation for this finding after a reload, so a verified fix and its
+  // pull request state are shown instead of offering a fresh preview.
+  useEffect(() => {
+    if (existingRemediation) return;
+    let cancelled = false;
+    listRemediations(jobId)
+      .then((list) => {
+        const latest = list
+          .filter((r) => r.findingFingerprints.includes(finding.fingerprint) && r.status !== "rejected")
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+        if (!cancelled && latest) setRemediation((current) => current ?? latest);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, finding.fingerprint, existingRemediation]);
 
   const initialEligibility = classifyRemediationEligibility(finding);
   const effectiveEligibility = remediation?.eligibility ?? initialEligibility.eligibility;
@@ -180,20 +204,23 @@ export function RemediationPanel({
   };
 
   const onOpenPr = async () => {
-    if (!remediation) return;
+    if (!remediation || isOpeningPr) return;
     setIsOpeningPr(true);
-    setError(null);
+    setPrError(null);
     try {
       const res = await createRemediationPr(jobId, remediation.id);
       setRemediation(res.remediation);
-      setPrResult({
-        url: res.remediation.pullRequestUrl ?? undefined,
-        message: res.message,
-        hasWriteAccess: res.hasWriteAccess,
-      });
       onRemediationUpdated?.(res.remediation);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create pull request.");
+      setPrError({
+        code: err instanceof ApiRequestError ? err.code : "network_error",
+        message: err instanceof Error ? err.message : "Failed to create pull request.",
+      });
+      // The server records failed attempts; refresh so the panel shows the stored state.
+      const fresh = await listRemediations(jobId)
+        .then((list) => list.find((r) => r.id === remediation.id))
+        .catch(() => undefined);
+      if (fresh) setRemediation(fresh);
     } finally {
       setIsOpeningPr(false);
     }
@@ -441,56 +468,13 @@ export function RemediationPanel({
                 </div>
               )}
 
-              {/* GitHub PR or Download Patch Flow */}
-              <div className="rounded-lg border border-line bg-surface p-3 space-y-3">
-                <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
-                  <GitBranch className="size-4 text-accent" /> Branch &amp; Pull Request Flow
-                </div>
-                <p className="text-xs text-muted">
-                  Create a dedicated branch (<code>vibeshield/fixes/{jobId.slice(0, 8)}</code>) and open a Pull Request.
-                  Default branch is never touched.
-                </p>
-
-                {prResult && (
-                  <div
-                    className={`rounded p-2.5 text-xs ${
-                      prResult.url ? "bg-accent/10 text-accent border border-accent/30" : "bg-surface-subtle text-muted"
-                    }`}
-                  >
-                    <p className="font-semibold">{prResult.message}</p>
-                    {prResult.url && (
-                      <a
-                        href={prResult.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="mt-1 inline-flex items-center gap-1 underline font-mono text-[11px]"
-                      >
-                        View Pull Request on GitHub &rarr;
-                      </a>
-                    )}
-                  </div>
-                )}
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button onClick={onOpenPr} disabled={isOpeningPr} size="sm">
-                    {isOpeningPr ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <GitPullRequest className="size-3.5" />
-                    )}
-                    Open GitHub Pull Request
-                  </Button>
-                  {patchDownloadUrl && (
-                    <a
-                      href={patchDownloadUrl}
-                      download
-                      className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-line hover:border-line-bright text-xs font-medium text-foreground transition-colors"
-                    >
-                      Download .patch File
-                    </a>
-                  )}
-                </div>
-              </div>
+              <PullRequestSection
+                remediation={remediation}
+                isOpening={isOpeningPr}
+                requestError={prError}
+                onOpen={onOpenPr}
+                patchDownloadUrl={patchDownloadUrl}
+              />
             </div>
           )}
         </div>

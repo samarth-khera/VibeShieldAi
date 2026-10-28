@@ -1,0 +1,32 @@
+# systemd unit for the persistent warm worker on a Linux VM with Docker (e.g. OCI Always Free Ampere A1).
+# Install: copy to /etc/systemd/system/, put WORKER_ID, VIBESHIELD_API_URL, WARM_WORKER_SECRET (and an
+# optional read-only GITHUB_TOKEN) in /etc/vibeshield/worker.env (mode 0600, root-owned), then
+#   systemctl daemon-reload && systemctl enable --now vibeshield-warm-worker
+# Rollback: systemctl disable --now vibeshield-warm-worker; leases expire and GitHub Actions takes over.
+[Unit]
+Description=VibeShield AI warm scanner worker
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+# SIGTERM lets running scans finish (WORKER_SHUTDOWN_GRACE_MS); anything left re-queues via lease expiry.
+TimeoutStopSec=90
+ExecStartPre=-/usr/bin/docker rm -f vibeshield-warm-worker
+ExecStart=/usr/bin/docker run --rm --name vibeshield-warm-worker \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=2g \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --pids-limit 256 \
+  --memory 3g --memory-swap 3g --cpus 2 \
+  --env-file /etc/vibeshield/worker.env \
+  -e WORKER_HEALTH_PORT=8787 \
+  -v vibeshield-archive-cache:/home/scanner/archive-cache \
+  vibeshield-warm-worker:current
+ExecStop=/usr/bin/docker stop --time 75 vibeshield-warm-worker
+
+[Install]
+WantedBy=multi-user.target

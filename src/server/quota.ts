@@ -4,10 +4,17 @@ import { ACTIVE_STATUSES } from "./job-store";
 import type { RateLimitResult } from "./rate-limit";
 
 // Pure quota logic with no database client import, so in-memory test stores can share it.
+//
+// Queue model: a scan is *waiting* while `status = queued` and `startedAt` is null, and *holds a
+// slot* once an executor (GitHub Actions dispatch or the warm worker) claims it and sets
+// `startedAt`. Submissions are limited by the waiting-queue length; execution is limited by
+// `maxConcurrentHeavyScans`, shared with in-flight Auto-Fix verifications.
 
 export type QuotaCounts = {
-  /** Scans holding a slot plus remediation verifications in flight. */
-  active: number;
+  /** Claimed scans plus remediation verifications in flight. Checked only where a slot is taken. */
+  active?: number;
+  /** Scans waiting for a slot. */
+  waiting?: number;
   ipHourly?: number;
   ipDaily?: number;
   globalDaily?: number;
@@ -15,18 +22,26 @@ export type QuotaCounts = {
 
 export type QuotaLimits = Pick<
   ServerConfig,
-  "maxScansPerIpHourly" | "maxScansPerIpDaily" | "globalDailyScanCap" | "maxConcurrentHeavyScans"
+  "maxScansPerIpHourly" | "maxScansPerIpDaily" | "globalDailyScanCap" | "maxConcurrentHeavyScans" | "maxQueuedScans"
 >;
 
 /** Single source of truth for quota decisions, shared by the pre-check and the locked reservation. */
 export function evaluateQuota(counts: QuotaCounts, config: QuotaLimits): RateLimitResult {
-  if (counts.active >= config.maxConcurrentHeavyScans) {
+  if (counts.active !== undefined && counts.active >= config.maxConcurrentHeavyScans) {
     const slots = config.maxConcurrentHeavyScans;
     return {
       allowed: false,
       retryAfterSeconds: 60,
       reason: "concurrency_limit",
       message: `All ${slots} free-tier scan worker slot${slots === 1 ? " is" : "s are"} busy, so this request was not queued. Please retry in about a minute.`,
+    };
+  }
+  if (counts.waiting !== undefined && counts.waiting >= config.maxQueuedScans) {
+    return {
+      allowed: false,
+      retryAfterSeconds: 120,
+      reason: "queue_full",
+      message: `The free-tier scan queue is full (${config.maxQueuedScans} scans waiting), so this request was not queued. Please retry in a few minutes.`,
     };
   }
   if (counts.ipHourly !== undefined && counts.ipHourly >= config.maxScansPerIpHourly) {
@@ -61,17 +76,23 @@ export type QuotaClient = {
   remediation?: Pick<PrismaClient["remediation"], "count">;
 };
 
-/**
- * Counts heavy work that currently holds a worker slot. Progress is tracked by `updatedAt`, so a
- * retried job created long ago still counts, and a job that stopped reporting stops counting.
- */
-export async function countActiveHeavyWork(client: QuotaClient, activeSince: Date): Promise<number> {
+/** Where-clause for scans waiting for a slot. */
+export const WAITING_WHERE = { status: "queued" as const, startedAt: null };
+
+/** Heavy work holding a slot: claimed scans plus in-flight verifications. Stale work is reaped first by callers. */
+export async function countActiveHeavyWork(client: QuotaClient): Promise<number> {
   const scans = await client.scanJob.count({
-    where: { status: { in: [...ACTIVE_STATUSES] }, updatedAt: { gte: activeSince } },
+    where: { status: { in: [...ACTIVE_STATUSES] }, startedAt: { not: null } },
   });
-  const verifications = client.remediation
-    ? await client.remediation.count({ where: { status: "applied", updatedAt: { gte: activeSince } } })
-    : 0;
+  const verifications = client.remediation ? await client.remediation.count({ where: { status: "applied" } }) : 0;
   return scans + verifications;
 }
 
+export async function countWaitingScans(client: QuotaClient): Promise<number> {
+  return client.scanJob.count({ where: WAITING_WHERE });
+}
+
+/** Lease owners written to ScanJob.workflowRunId when a slot is claimed. */
+export const GHA_DISPATCH_LEASE = "gha:dispatching";
+export const WARM_LEASE_PREFIX = "warm:";
+export const isWarmLease = (lease: string | null | undefined) => Boolean(lease?.startsWith(WARM_LEASE_PREFIX));

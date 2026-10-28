@@ -59,7 +59,7 @@ jobs:
         run: echo "RUNNER_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" >> "$GITHUB_ENV"
 
       - name: Checkout VibeShield AI
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
@@ -70,13 +70,13 @@ jobs:
         run: node scripts/ci/post-worker-status.mjs started
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
       - name: Set up Python for Semgrep
         id: py
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
           cache: pip
@@ -85,7 +85,7 @@ jobs:
       # Runner-owned path: the cache action cannot restore into root-owned system directories.
       # The key pins tool versions and the exact Python build the Semgrep venv links against.
       - name: Restore scanner tool cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.vibeshield/bin
@@ -102,7 +102,7 @@ jobs:
       # node_modules is produced only by `npm ci` from this exact lockfile; the key changes with it.
       - name: Restore worker dependencies
         id: node-modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: node_modules
           key: worker-node-modules-v1-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json') }}

@@ -43,7 +43,13 @@ export function toPublicFinding(f: FindingRecord) {
 }
 
 /** Whitelisted public projection. Never includes internal fields, error text beyond the sanitized message, or raw secrets. */
-export function toPublicJob(job: JobRecord, workerOnline?: boolean) {
+/** Public executor label; lease tokens stored in workflowRunId are never exposed. */
+function executorOf(job: JobRecord): "warm-worker" | "github-actions" | null {
+  if (!job.startedAt || !job.workflowRunId) return null;
+  return job.workflowRunId.startsWith("warm:") ? "warm-worker" : "github-actions";
+}
+
+export function toPublicJob(job: JobRecord, workerOnline?: boolean, extra?: { queuePosition?: number | null }) {
   const scanPerformed = ["completed", "completed_with_warnings"].includes(job.status);
   const totalFindings =
     (job.criticalCount ?? 0) +
@@ -103,6 +109,12 @@ export function toPublicJob(job: JobRecord, workerOnline?: boolean) {
     retryable: RETRYABLE_STATUSES.has(job.status),
     scanPerformed,
     workerOnline: job.status === "queued" ? (workerOnline ?? null) : null,
+    // Waiting for a free worker slot (accepted, not yet claimed by an executor).
+    queue:
+      job.status === "queued" && !job.startedAt
+        ? { waitingForSlot: true, position: extra?.queuePosition ?? null }
+        : null,
+    executor: executorOf(job),
     createdAt: job.createdAt.toISOString(),
     updatedAt: job.updatedAt.toISOString(),
     startedAt: job.startedAt?.toISOString() ?? null,

@@ -1,14 +1,9 @@
-import { chmod, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { Readable } from "node:stream";
 import { parseGithubRepoUrl } from "../src/lib/github-url";
 import { getConfig } from "../src/server/config";
-import { fetchCommitSha, fetchRepoMetadata, openArchive } from "../src/server/github";
-import { extractArchiveSafely } from "../src/server/archive";
-import { runSecurityScanEngine } from "../src/server/scanners/engine";
 import { redactText } from "../src/server/scanners/redact";
-import { signCallbackPayload, verificationSpecSigningPayload } from "../src/server/callback-auth";
+import { verificationSpecSigningPayload } from "../src/server/callback-auth";
+import { executeScanJob } from "../src/server/worker/scan-executor";
+import { getSigned, postSigned } from "../src/server/worker/signed-http";
 import { verifyRemediationOnSnapshot } from "../src/server/remediation/verify";
 import type { RescanComparison } from "../src/server/remediation/types";
 import type { BaselineFinding } from "../src/server/remediation/sandbox";
@@ -61,117 +56,19 @@ async function main() {
 }
 
 async function runScan(ctx: RunContext) {
-  const { jobId, repoUrl, callbackUrl, callbackSecret, runId, runUrl } = ctx;
-  console.log(`Starting VibeShield AI scan worker for job ${jobId} (${repoUrl})`);
-
-  const parsed = parseGithubRepoUrl(repoUrl);
-  if (!parsed.ok) {
-    console.error(`Invalid repository URL: ${parsed.error}`);
-    await postFailure(ctx, "invalid_repository", parsed.error);
-    process.exit(1);
-  }
-
-  const config = getConfig();
-  let workspace: string | null = null;
-  const progress: Record<string, string> = ctx.runnerStartedAt ? { worker_startedAt: ctx.runnerStartedAt } : {};
-  const heartbeat = async (phase: string, extra: Record<string, unknown> = {}) => {
-    const at = new Date().toISOString();
-    progress[`${phase}At`] = at;
-    await postProgress(ctx, { phase, at, ...extra });
-  };
-
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), config.retrievalTimeoutMs);
-    const t0 = Date.now();
-
-    await heartbeat("retrieving");
-    const tMeta = Date.now();
-    const meta = await fetchRepoMetadata(fetch, parsed.owner, parsed.repo, config, controller.signal);
-    const commitSha = await fetchCommitSha(fetch, parsed.owner, parsed.repo, meta.defaultBranch, config, controller.signal);
-    const metadataDurationMs = Date.now() - tMeta;
-    console.log(`Commit: ${commitSha} on branch ${meta.defaultBranch} (metadata: ${metadataDurationMs}ms)`);
-
-    const tDownload = Date.now();
-    const res = await openArchive(fetch, parsed.owner, parsed.repo, commitSha, config, controller.signal);
-    const declaredArchiveBytes = Number.parseInt(res.headers.get("content-length") ?? "", 10);
-    const downloadDurationMs = Date.now() - tDownload;
-
-    workspace = await mkdtemp(path.join(tmpdir(), "vibeshield-run-"));
-    await chmod(workspace, 0o700);
-    const sourceDir = path.join(workspace, "src");
-    const sourceStream = Readable.fromWeb(res.body as never);
-    controller.signal.addEventListener("abort", () => sourceStream.destroy(new Error("Download timed out.")), {
-      once: true,
-    });
-
-    await heartbeat("extracting", { commitSha, defaultBranch: meta.defaultBranch });
-    const tExtract = Date.now();
-    const stats = await extractArchiveSafely(sourceStream, sourceDir, config);
-    clearTimeout(timer);
-    const extractDurationMs = Date.now() - tExtract;
-    console.log(`Extracted ${stats.fileCount} files (${(stats.unpackedBytes / 1024 / 1024).toFixed(2)} MB) in ${extractDurationMs}ms.`);
-
-    await heartbeat("scanning");
-    const tScan = Date.now();
-    const scanResult = await runSecurityScanEngine(sourceDir);
-    const scanEngineDurationMs = Date.now() - tScan;
-    console.log(
-      `Scan ${scanResult.status} in ${scanEngineDurationMs}ms (Gitleaks: ${scanResult.gitleaksDurationMs}ms, Semgrep: ${scanResult.semgrepDurationMs}ms, OSV: ${scanResult.osvDurationMs}ms); findings: ${scanResult.findings.length}`,
-    );
-
-    for (const f of scanResult.findings) {
-      if (f.redactedEvidence) f.redactedEvidence = redactText(f.redactedEvidence);
-    }
-
-    const stageDurations = {
-      metadataMs: metadataDurationMs,
-      downloadMs: downloadDurationMs,
-      extractionMs: extractDurationMs,
-      scanningMs: scanEngineDurationMs,
-      callbackMs: 0,
-    };
-    scanResult.scanCoverage.stageDurations = stageDurations;
-    (scanResult.scanCoverage as unknown as Record<string, unknown>).progress = progress;
-
-    const callbackPayload = {
-      jobId: ctx.jobId,
-      status: scanResult.status,
-      workflowRunId: runId,
-      workflowRunUrl: runUrl,
-      commitSha,
-      archiveBytes: Number.isFinite(declaredArchiveBytes) ? declaredArchiveBytes : null,
-      fileCount: stats.fileCount,
-      unpackedBytes: stats.unpackedBytes,
-      gitleaksStatus: scanResult.gitleaksStatus,
-      gitleaksDurationMs: scanResult.gitleaksDurationMs,
-      gitleaksError: scanResult.gitleaksError,
-      semgrepStatus: scanResult.semgrepStatus,
-      semgrepDurationMs: scanResult.semgrepDurationMs,
-      semgrepError: scanResult.semgrepError,
-      osvStatus: scanResult.osvStatus,
-      osvDurationMs: scanResult.osvDurationMs,
-      osvError: scanResult.osvError,
-      scannerVersions: scanResult.scannerVersions as unknown as Record<string, unknown>,
-      scanCoverage: scanResult.scanCoverage as unknown as Record<string, unknown>,
-      counts: scanResult.counts,
-      findings: scanResult.findings,
-      remediations: [],
-    };
-
-    const tCallback = Date.now();
-    await postSigned(callbackUrl, callbackSecret, callbackPayload);
-    const callbackDurationMs = Date.now() - tCallback;
-    console.log(
-      `[Metrics] job=${jobId} metadata=${metadataDurationMs}ms download=${downloadDurationMs}ms extraction=${extractDurationMs}ms scanning=${scanEngineDurationMs}ms callback=${callbackDurationMs}ms total=${Date.now() - t0}ms`,
-    );
-  } catch (err: unknown) {
-    console.error("Scan worker failed:", err instanceof Error ? redactText(err.message) : "unknown error");
-    await postFailure(ctx, "scan_failed", err instanceof Error ? err.message : String(err));
-    process.exit(1);
-  } finally {
-    if (workspace) await rm(workspace, { recursive: true, force: true }).catch(() => undefined);
-  }
+  console.log(`Starting VibeShield AI scan worker for job ${ctx.jobId} (${ctx.repoUrl})`);
+  const outcome = await executeScanJob({
+    jobId: ctx.jobId,
+    repositoryUrl: ctx.repoUrl,
+    callbackUrl: ctx.callbackUrl,
+    secret: ctx.callbackSecret,
+    runId: ctx.runId,
+    runUrl: ctx.runUrl,
+    runnerStartedAt: ctx.runnerStartedAt,
+    config: getConfig(),
+    log: (line) => console.log(line),
+  });
+  if (outcome === "failed") process.exit(1);
 }
 
 type VerificationSpec = {
@@ -191,19 +88,15 @@ async function runVerification(ctx: RunContext, remediationId: string) {
   console.log(`Starting VibeShield AI verification worker for job ${jobId}, remediation ${remediationId}`);
   const t0 = Date.now();
 
-  const postResult = (rescanStatus: "verified" | "needs_review" | "failed", summary: RescanComparison) =>
-    postSigned(callbackUrl, callbackSecret, { scanJobId: jobId, remediationId, rescanStatus, summary });
+  const postResult = async (rescanStatus: "verified" | "needs_review" | "failed", summary: RescanComparison) => {
+    const res = await postSigned(callbackUrl, callbackSecret, { scanJobId: jobId, remediationId, rescanStatus, summary });
+    if (!res.ok) throw new Error(`Verification result rejected with HTTP ${res.status}.`);
+  };
 
   try {
     // The approved diff and commit come from server-side storage, never from workflow inputs.
     const tSpec = Date.now();
-    const res = await fetch(callbackUrl, {
-      headers: {
-        "X-VibeShield-Signature": signCallbackPayload(verificationSpecSigningPayload(jobId, remediationId), callbackSecret),
-        "User-Agent": "VibeShieldAI-Worker/0.2",
-      },
-      signal: AbortSignal.timeout(30_000),
-    });
+    const res = await getSigned(callbackUrl, callbackSecret, verificationSpecSigningPayload(jobId, remediationId));
     if (!res.ok) throw new Error(`Verification spec request returned HTTP ${res.status}.`);
     const spec = ((await res.json()) as { data: VerificationSpec }).data;
     const specFetchMs = Date.now() - tSpec;
@@ -260,68 +153,6 @@ async function runVerification(ctx: RunContext, remediationId: string) {
     }).catch(() => console.error("Could not report verification failure."));
     process.exit(1);
   }
-}
-
-/** Best-effort, single-attempt heartbeat: progress reporting must never fail a scan. */
-async function postProgress(ctx: RunContext, fields: Record<string, unknown>) {
-  const json = JSON.stringify({
-    type: "progress",
-    jobId: ctx.jobId,
-    workflowRunId: ctx.runId,
-    workflowRunUrl: ctx.runUrl,
-    ...fields,
-  });
-  try {
-    await fetch(ctx.callbackUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-VibeShield-Signature": signCallbackPayload(json, ctx.callbackSecret),
-        "User-Agent": "VibeShieldAI-Worker/0.2",
-      },
-      body: json,
-      signal: AbortSignal.timeout(10_000),
-    });
-  } catch {
-    console.warn(`Progress heartbeat '${String(fields.phase)}' could not be delivered.`);
-  }
-}
-
-async function postSigned(url: string, secret: string, payload: unknown): Promise<void> {
-  const json = JSON.stringify(payload);
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      // Re-sign each attempt so retries stay inside the replay window.
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-VibeShield-Signature": signCallbackPayload(json, secret),
-          "User-Agent": "VibeShieldAI-Worker/0.2",
-        },
-        body: json,
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (res.ok) return;
-      console.warn(`Callback attempt ${attempt} returned HTTP ${res.status}.`);
-    } catch {
-      console.warn(`Callback attempt ${attempt} failed with a network error.`);
-    }
-    await new Promise((r) => setTimeout(r, 1000 * attempt));
-  }
-  throw new Error("Failed to post callback after 3 attempts.");
-}
-
-async function postFailure(ctx: RunContext, category: string, error: string): Promise<void> {
-  await postSigned(ctx.callbackUrl, ctx.callbackSecret, {
-    jobId: ctx.jobId,
-    status: "failed",
-    workflowRunId: ctx.runId,
-    workflowRunUrl: ctx.runUrl,
-    failureCategory: category,
-    errorMessage: redactText(error).slice(0, 300),
-    findings: [],
-  }).catch(() => console.error("Could not post failure state to callback."));
 }
 
 main().catch((err) => {

@@ -92,6 +92,30 @@ describe.skipIf(missing.length > 0)("Real scanners on a full repository snapshot
     pytestFinding = baseline.find((f) => f.scanner === "osv-scanner" && f.packageInfo?.name === "pytest" && f.packageInfo.fixedVersion)!;
   }, 120_000);
 
+  it("publishes each real scanner's result as it finishes, before the aggregate resolves", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "vs-real-progressive-"));
+    try {
+      await extractArchiveSafely(Readable.from(tarball), dir, getConfig());
+      const events: { scanner: string; status: string; at: number; findings: number }[] = [];
+      const t0 = Date.now();
+      const result = await runSecurityScanEngine(dir, {
+        onScannerComplete: (r) => {
+          events.push({ scanner: r.scanner, status: r.status, at: Date.now() - t0, findings: r.findings.length });
+        },
+      });
+      const resolvedAt = Date.now() - t0;
+      expect(events.map((e) => e.scanner).sort()).toEqual(["gitleaks", "osv-scanner", "semgrep"]);
+      expect(events.every((e) => e.status === "completed")).toBe(true);
+      // Ordered by completion, all delivered before the aggregate: the first is available early.
+      expect(events.map((e) => e.at)).toEqual([...events.map((e) => e.at)].sort((x, y) => x - y));
+      expect(events[events.length - 1].at).toBeLessThanOrEqual(resolvedAt);
+      expect(events.reduce((n, e) => n + e.findings, 0)).toBe(result.findings.length);
+      console.log(`[progressive] ${events.map((e) => `${e.scanner}@${e.at}ms(${e.findings})`).join(" ")} aggregate@${resolvedAt}ms`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
   it("detects the planted secret (Gitleaks is genuinely scanning, not a no-op)", () => {
     const secret = baseline.find((f) => f.scanner === "gitleaks" && f.filePath === "config/settings.txt");
     expect(secret).toBeDefined();

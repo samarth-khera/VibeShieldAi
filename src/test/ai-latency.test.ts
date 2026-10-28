@@ -157,3 +157,34 @@ describe("Prompt size and redundant work", () => {
     expect(getFinding).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("AI failures never poison the cache or block findings", () => {
+  async function seeded() {
+    const store = new InMemoryJobStore();
+    const job = await store.create({ owner: "o", repo: "r", repositoryUrl: "https://github.com/o/r", expiresAt: new Date(Date.now() + 1e6) });
+    await store.saveFindings(job.id, [
+      {
+        scanner: "semgrep", ruleId: "eval", category: "Code Analysis", severity: "high", title: "eval", description: "eval use",
+        filePath: "a.js", fingerprint: "fp-bad", startLine: 1, endLine: 1, redactedEvidence: "eval(x)", vulnerabilityId: null,
+        remediation: null, packageInfo: null, metadata: null,
+      },
+    ]);
+    return { store, job, finding: (await store.getFindings(job.id)).findings[0] };
+  }
+
+  it.each([
+    ["malformed JSON", "{ not json"],
+    ["truncated JSON", '{"summary": "cut off'],
+    ["schema-invalid JSON", JSON.stringify({ summary: "too short" })],
+  ])("does not cache %s as a successful explanation", async (_label, raw) => {
+    const { store, job, finding } = await seeded();
+    const save = vi.spyOn(store, "saveFindingAiExplanation");
+    const provider = { isConfigured: () => true, getModelName: () => "gemini-2.5-flash", generateText: vi.fn().mockResolvedValue(raw) };
+    const res = await explainFinding(job.id, finding.id, { store, provider, finding });
+    expect(res.available).toBe(false);
+    expect(save).not.toHaveBeenCalled();
+    // Findings are untouched and still readable.
+    expect((await store.getFindings(job.id)).findings).toHaveLength(1);
+  });
+});
+

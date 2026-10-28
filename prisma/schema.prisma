@@ -192,3 +192,18 @@ model AiRequestLog {
   @@index([clientIpHash, createdAt])
   @@index([createdAt])
 }
+
+/// Liveness of persistent warm scanner workers. Only used when WARM_WORKER_ENABLED=true.
+model WorkerHeartbeat {
+  /// Worker identity from its configuration (not secret).
+  id                String   @id @db.VarChar(64)
+  /// Signed timestamp (ms) of the last accepted request; older or equal timestamps are replays.
+  lastRequestMs     BigInt
+  lastSeenAt        DateTime
+  startedAt         DateTime
+  capacity          Int      @default(1)
+  activeJobs        Int      @default(0)
+  version           String?  @db.VarChar(40)
+  arch              String?  @db.VarChar(40)
+  scannerVersions   Json?
+}

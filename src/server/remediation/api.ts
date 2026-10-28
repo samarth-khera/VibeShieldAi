@@ -9,12 +9,17 @@ import {
   applyAndVerify,
   createPreview,
   listBaselineFindings,
+  pumpVerifications,
   recordVerificationResult,
   requestPullRequest,
   RemediationError,
   type RemediationDeps,
 } from "./service";
-import { toPublicRemediation, type RescanComparison } from "./types";
+import { toPublicRemediation, type RemediationRecord, type RescanComparison } from "./types";
+import { isWarmLease } from "../quota";
+import { verificationClaimOf } from "./claims";
+import { pullRequestAvailability } from "./github-pr";
+import type { JobRecord, JobStore } from "../job-store";
 
 const REMEDIATION_ID_RE = /^[0-9a-f-]{36}$/;
 const MAX_RESULT_BYTES = 256 * 1024;
@@ -55,9 +60,12 @@ export async function handleListRemediations(
   if (!JOB_ID_RE.test(scanJobId)) return fail(404, "not_found", "Scan job not found.");
 
   // Release slots held by verifications whose worker never reported back, so the UI sees a final state.
-  await deps.store.reapStale(new Date(), (deps.config ?? getConfig()).jobTimeoutMs).catch(() => undefined);
+  await deps.store.reapStale(new Date(), deps.config ?? getConfig()).catch(() => undefined);
+  await pumpVerifications(scanJobId, deps).catch(() => undefined);
   const list = await deps.store.listRemediations(scanJobId);
-  return ok(list.map(toPublicRemediation));
+  const job = list.length ? await deps.store.get(scanJobId) : null;
+  const availability = job ? pullRequestAvailability(job.owner, job.repo, deps.config ?? getConfig()) : undefined;
+  return ok(list.map((r) => toPublicRemediation(r, availability)));
 }
 
 export async function handleApproveRemediation(
@@ -98,27 +106,49 @@ export async function handleApplyRemediation(
   }
 }
 
+const PR_FAILURE_STATUS: Record<string, number> = {
+  not_configured: 503,
+  repository_not_allowed: 403,
+  access_denied: 403,
+  repository_not_found: 404,
+  rate_limited: 429,
+  patch_conflict: 409,
+  branch_conflict: 409,
+  repository_mismatch: 409,
+  commit_not_found: 409,
+  unsafe_target: 422,
+};
+
+/**
+ * Opens a GitHub PR for a verified remediation using only the server-side credential. A client
+ * cannot choose the repository, branch, commit or credential: all come from the stored scan.
+ */
 export async function handleCreatePullRequest(
-  req: Request,
   scanJobId: string,
   remediationId: string,
   deps: RemediationDeps,
 ): Promise<Response> {
   if (!JOB_ID_RE.test(scanJobId)) return fail(404, "not_found", "Scan job not found.");
-
-  const authHeader = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  const config = deps.config ?? getConfig();
 
   try {
-    const result = await requestPullRequest(scanJobId, remediationId, deps, authHeader);
-    return ok({
-      remediation: toPublicRemediation(result.remediation),
-      message: result.message,
-      hasWriteAccess: result.hasWriteAccess,
-    });
+    const job = await deps.store.get(scanJobId);
+    const availability = job ? pullRequestAvailability(job.owner, job.repo, config) : undefined;
+    const { remediation, pullRequest } = await requestPullRequest(scanJobId, remediationId, deps);
+    const body = { remediation: toPublicRemediation(remediation, availability), pullRequest };
+    if (pullRequest.status === "failed") {
+      const status = PR_FAILURE_STATUS[pullRequest.code ?? ""] ?? 502;
+      return Response.json(
+        { error: { code: pullRequest.code ?? "github_error", message: pullRequest.message }, data: body },
+        { status, headers: { "Cache-Control": "no-store" } },
+      );
+    }
+    return ok(body, pullRequest.status === "created" ? 201 : 200);
   } catch (err) {
     if (err instanceof RemediationError) {
       return fail(err.status, err.code, err.message);
     }
+    log("error", "remediation_pull_request_failed", { jobId: scanJobId, remediationId });
     return fail(500, "internal_error", "Failed to create pull request.");
   }
 }
@@ -179,24 +209,30 @@ export async function handleVerificationSpec(
     return fail(409, "not_awaiting_verification", "This remediation is not awaiting verification.");
   }
 
-  return ok({
-    scanJobId,
-    remediationId,
+  return ok(await buildVerificationSpec(job, remediation, deps.store));
+}
+
+/** The approved remediation and immutable commit a verification worker needs; never includes secrets. */
+export async function buildVerificationSpec(job: JobRecord, remediation: RemediationRecord, store: JobStore) {
+  return {
+    scanJobId: job.id,
+    remediationId: remediation.id,
     owner: job.owner,
     repo: job.repo,
     commitSha: remediation.commitSha,
     unifiedDiff: remediation.unifiedDiff,
     targetedFingerprints: remediation.findingFingerprints,
-    baselineFindings: await listBaselineFindings(deps.store, scanJobId),
-    approvedAt: remediation.approvedAt.toISOString(),
+    baselineFindings: await listBaselineFindings(store, job.id),
+    approvedAt: remediation.approvedAt?.toISOString() ?? null,
     queuedAt: remediation.updatedAt.toISOString(),
-  });
+  };
 }
 
 const ScannerStatusSchema = z.string().max(30);
 const VerificationResultSchema = z.object({
   scanJobId: z.string().max(32),
   remediationId: z.string().max(36),
+  lease: z.string().max(100).optional(),
   rescanStatus: z.enum(["verified", "needs_review", "failed"]),
   summary: z.object({
     targetResolved: z.boolean(),
@@ -214,6 +250,7 @@ const VerificationResultSchema = z.object({
     timings: z.record(z.string(), z.number().int().nonnegative()).optional(),
     snapshot: z.object({ commitSha: z.string().max(40), fileCount: z.number().int().nonnegative() }).optional(),
     workflowRunUrl: z.string().max(300).optional(),
+    archiveCache: z.enum(["hit", "miss", "none"]).optional(),
   }),
 });
 
@@ -235,8 +272,15 @@ export async function handleVerificationResult(
 
   const raw = await req.text();
   if (raw.length > MAX_RESULT_BYTES) return fail(413, "payload_too_large", "Verification result is too large.");
-  const auth = verifyCallbackSignature(raw, req.headers.get("x-vibeshield-signature"), secret);
-  if (!auth.valid) return fail(401, "unauthorized", "Invalid or missing worker signature.");
+  const signature = req.headers.get("x-vibeshield-signature");
+  const warmSecret = (deps.config ?? getConfig()).warmWorkerSecret;
+  let signedBy: "callback" | "warm" = "callback";
+  if (!verifyCallbackSignature(raw, signature, secret).valid) {
+    if (!warmSecret || !verifyCallbackSignature(raw, signature, warmSecret).valid) {
+      return fail(401, "unauthorized", "Invalid or missing worker signature.");
+    }
+    signedBy = "warm";
+  }
 
   let parsed;
   try {
@@ -253,8 +297,15 @@ export async function handleVerificationResult(
   const remediation = await deps.store.getRemediation(scanJobId, remediationId);
   if (!remediation) return fail(404, "not_found", "Remediation not found.");
 
+  // The executor holding the verification lease is the only one whose result counts.
+  const claim = verificationClaimOf(remediation.approvedOperations);
+  const warmOwned = isWarmLease(claim?.lease);
+  if (warmOwned ? body.lease !== claim?.lease : signedBy === "warm" || Boolean(body.lease)) {
+    return fail(409, "stale_lease", "This worker no longer owns the verification.");
+  }
+
   const summary = body.summary as RescanComparison;
-  summary.runtime = "github-actions";
+  summary.runtime = warmOwned ? "warm-worker" : "github-actions";
   let status = body.rescanStatus;
   if (status === "verified") {
     const scannersOk =

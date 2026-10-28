@@ -41,21 +41,34 @@ const submit = (deps: ScanDeps, i: number) =>
   );
 
 describe("Bounded scan concurrency and explicit queue states", () => {
-  it("admits exactly the configured number of concurrent scans and rejects the rest explicitly", async () => {
+  it("runs exactly the configured number of scans and queues the rest with explicit positions", async () => {
     const deps = depsFor(new InMemoryJobStore());
     const responses = await Promise.all(Array.from({ length: 10 }, (_, i) => submit(deps, i)));
-    expect(responses.filter((r) => r.status === 202)).toHaveLength(2);
-    const rejected = responses.filter((r) => r.status === 429);
-    expect(rejected).toHaveLength(8);
-    const body = await rejected[0].json();
-    expect(body.error.code).toBe("concurrency_limit");
-    expect(body.error.message).toMatch(/All 2 free-tier scan worker slots are busy, so this request was not queued/);
-    expect(rejected[0].headers.get("Retry-After")).toBe("60");
-    // Only admitted scans were dispatched; nothing was silently dropped after acceptance.
+    expect(responses.every((r) => r.status === 202)).toBe(true);
+    const jobs = (await Promise.all(responses.map((r) => r.json()))).map((b) => b.data);
+    // Only admitted scans were dispatched; the rest wait with a position and are never dropped.
     expect(deps.enqueue).toHaveBeenCalledTimes(2);
+    expect(jobs.filter((j) => j.queue === null)).toHaveLength(2);
+    expect(jobs.filter((j) => j.queue?.waitingForSlot).map((j) => j.queue.position).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(jobs.filter((j) => j.executor === "github-actions")).toHaveLength(2);
   });
 
-  it("a retry cannot bypass the cap, and a rejected retry leaves the job in its failed state", async () => {
+  it("starts the next waiting scan as soon as a slot frees, in submission order", async () => {
+    const store = new InMemoryJobStore();
+    const deps = depsFor(store, { maxConcurrentHeavyScans: 1 });
+    const first = (await (await submit(deps, 1)).json()).data;
+    const second = (await (await submit(deps, 2)).json()).data;
+    const third = (await (await submit(deps, 3)).json()).data;
+    expect([second.queue?.position, third.queue?.position]).toEqual([1, 2]);
+
+    await store.update(first.id, { status: "completed" }); // the running scan finishes
+    const polled = (await (await getScan(third.id, deps)).json()).data; // any poll pumps the queue
+    expect(polled.queue?.position).toBe(1);
+    expect((await store.get(second.id))?.startedAt).not.toBeNull();
+    expect(deps.enqueue.mock.calls.map((c) => c[0])).toEqual([first.id, second.id]);
+  });
+
+  it("a retry joins the same queue: it never bypasses the cap or gets dispatched early", async () => {
     const store = new InMemoryJobStore();
     const deps = depsFor(store, { maxConcurrentHeavyScans: 1 });
     const first = await (await submit(deps, 1)).json();
@@ -63,10 +76,19 @@ describe("Bounded scan concurrency and explicit queue states", () => {
     await submit(deps, 2); // occupies the only slot
 
     const res = await retryScan(first.data.id, deps);
+    expect(res.status).toBe(202);
+    const body = (await res.json()).data;
+    expect(body.status).toBe("queued");
+    expect(body.queue).toEqual({ waitingForSlot: true, position: 1 });
+    expect(deps.enqueue).toHaveBeenCalledTimes(2); // first submission + the occupying scan, not the retry
+  });
+
+  it("rejects explicitly when the waiting queue is full", async () => {
+    const deps = depsFor(new InMemoryJobStore(), { maxConcurrentHeavyScans: 1, maxQueuedScans: 2 });
+    for (let i = 0; i < 3; i++) expect((await submit(deps, i)).status).toBe(202);
+    const res = await submit(deps, 9);
     expect(res.status).toBe(429);
-    expect((await res.json()).error.code).toBe("concurrency_limit");
-    expect((await store.get(first.data.id))?.status).toBe("failed");
-    expect(deps.enqueue).toHaveBeenCalledTimes(2);
+    expect((await res.json()).error.message).toMatch(/queue is full \(2 scans waiting\), so this request was not queued/);
   });
 
   it("does not dispatch a duplicate workflow for a job that is already queued or running", async () => {

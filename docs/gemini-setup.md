@@ -38,8 +38,8 @@ Configure the following environment variables in the **Vercel Project Dashboard*
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Free-tier supported model |
 | `AI_PROVIDER` | `gemini` | Active AI provider (`gemini` or `ollama`) |
 | `AI_GEMINI_ENABLED` | `true` | Enables AI feature flags |
-| `AI_MAX_REQUESTS_PER_IP_HOURLY`| `5` | Anti-abuse limit per client IP per hour |
-| `AI_MAX_REQUESTS_PER_IP_DAILY` | `15` | Anti-abuse limit per client IP per day |
+| `AI_MAX_REQUESTS_PER_IP_HOURLY`| `8` | Anti-abuse limit per client IP per hour |
+| `AI_MAX_REQUESTS_PER_IP_DAILY` | `25` | Anti-abuse limit per client IP per day |
 | `AI_GLOBAL_DAILY_CAP` | `50` | Total AI calls per day before circuit breaker |
 | `AI_CIRCUIT_BREAKER_COOLDOWN_HOURS` | `24` | Cooldown period on quota exhaustion |
 | `ADMIN_SECRET` | *(Random 32-char secret)* | Secret for inspecting/resetting circuit breaker |

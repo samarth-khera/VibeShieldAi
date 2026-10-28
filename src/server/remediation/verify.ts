@@ -6,6 +6,7 @@ import type { ServerConfig } from "../config";
 import { openArchive, type FetchLike } from "../github";
 import { extractArchiveSafely } from "../archive";
 import type { ScanEngineResult } from "../scanners/types";
+import type { ArchiveSource } from "../worker/scan-executor";
 import { applyAndRescanInSandbox, failedResult, type BaselineFinding, type SandboxResult } from "./sandbox";
 
 export const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
@@ -22,6 +23,8 @@ export type SnapshotVerificationParams = {
   config: Pick<ServerConfig, "maxArchiveBytes" | "maxUnpackedBytes" | "maxFileCount" | "retrievalTimeoutMs" | "githubToken">;
   fetchImpl?: FetchLike;
   scanEngine?: (dir: string) => Promise<ScanEngineResult>;
+  /** Archive source (the warm worker reuses the archive its scan already downloaded). */
+  archives?: ArchiveSource;
 };
 
 /**
@@ -48,17 +51,18 @@ export async function verifyRemediationOnSnapshot(params: SnapshotVerificationPa
 
   try {
     const tDownload = Date.now();
-    const res = await openArchive(
-      fetchImpl,
-      params.owner,
-      params.repo,
-      params.commitSha,
-      params.config as ServerConfig,
-      controller.signal,
-    );
+    let stream: Readable;
+    let archiveCache: "hit" | "miss" | "none" = "none";
+    if (params.archives) {
+      const a = await params.archives(params.owner, params.repo, params.commitSha, params.config as ServerConfig, controller.signal);
+      stream = a.stream;
+      archiveCache = a.cache;
+    } else {
+      const res = await openArchive(fetchImpl, params.owner, params.repo, params.commitSha, params.config as ServerConfig, controller.signal);
+      stream = Readable.fromWeb(res.body as never);
+    }
     const downloadMs = Date.now() - tDownload;
 
-    const stream = Readable.fromWeb(res.body as never);
     controller.signal.addEventListener("abort", () => stream.destroy(new Error("Download timed out.")), { once: true });
     const tExtract = Date.now();
     const stats = await extractArchiveSafely(stream, sourceDir, params.config);
@@ -74,6 +78,7 @@ export async function verifyRemediationOnSnapshot(params: SnapshotVerificationPa
     });
     result.summary.snapshot = { commitSha: params.commitSha, fileCount: stats.fileCount };
     result.summary.timings = { ...result.summary.timings, downloadMs, extractionMs };
+    result.summary.archiveCache = archiveCache;
     return result;
   } finally {
     clearTimeout(timer);

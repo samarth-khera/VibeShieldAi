@@ -65,6 +65,7 @@ describe("Free-tier Database Quotas & Concurrency Limiting (Rule 8)", () => {
     maxScansPerIpDaily: 5,
     globalDailyScanCap: 20,
     maxConcurrentHeavyScans: 1,
+    maxQueuedScans: 10,
     jobTimeoutMs: 900_000,
   };
 
@@ -80,11 +81,11 @@ describe("Free-tier Database Quotas & Concurrency Limiting (Rule 8)", () => {
     expect(res.retryAfterSeconds).toBe(0);
   });
 
-  it("enforces max 1 concurrent heavy scan", async () => {
+  it("rejects submissions explicitly once the waiting queue is full", async () => {
     const mockPrisma = {
       scanJob: {
         count: vi.fn().mockImplementation(({ where }) => {
-          if (where.status) return Promise.resolve(1); // 1 active heavy scan
+          if (where.status === "queued" && where.startedAt === null) return Promise.resolve(10); // waiting
           return Promise.resolve(0);
         }),
       },
@@ -92,8 +93,8 @@ describe("Free-tier Database Quotas & Concurrency Limiting (Rule 8)", () => {
 
     const res = await checkDatabaseQuotas(mockPrisma as never, "client-hash-1", config);
     expect(res.allowed).toBe(false);
-    expect(res.reason).toBe("concurrency_limit");
-    expect(res.retryAfterSeconds).toBe(60);
+    expect(res.reason).toBe("queue_full");
+    expect(res.retryAfterSeconds).toBe(120);
   });
 
   it("enforces hourly limit of 3 scans per IP", async () => {

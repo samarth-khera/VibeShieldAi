@@ -52,7 +52,23 @@ export async function GET() {
     }
   }
 
-  // 3. Platform isolation specifications
+  // 3. Persistent warm worker (optional). GitHub Actions remains the fallback executor either way.
+  let warmWorker: { status: "healthy" | "unavailable" | "disabled"; lastSeenSecondsAgo: number | null; fallback: string };
+  if (config.warmWorkerEnabled) {
+    const latest = await prisma.workerHeartbeat
+      .findFirst({ orderBy: { lastSeenAt: "desc" }, select: { lastSeenAt: true } })
+      .catch(() => null);
+    const age = latest ? Math.round((Date.now() - latest.lastSeenAt.getTime()) / 1000) : null;
+    warmWorker = {
+      status: age !== null && age * 1000 <= config.warmWorkerHealthyMs ? "healthy" : "unavailable",
+      lastSeenSecondsAgo: age,
+      fallback: "github-actions",
+    };
+  } else {
+    warmWorker = { status: "disabled", lastSeenSecondsAgo: null, fallback: "github-actions" };
+  }
+
+  // 4. Platform isolation specifications
   const isolation = getPlatformIsolationInfo();
 
   const status = overallHealthy
@@ -73,6 +89,7 @@ export async function GET() {
         dispatcher: isGithubBackend ? dispatchStatus : undefined,
         redis: redisStatus,
         worker: workerStatus,
+        warmWorker,
       },
       isolation: {
         mode: isolation.isolationMode,

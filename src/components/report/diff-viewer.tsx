@@ -76,7 +76,7 @@ export function DiffViewer({
                   ? "-"
                   : " "}
               </span>
-              <span className={`whitespace-pre-wrap break-all ${lineStyle}`}>{line.slice(1) || " "}</span>
+              <span className={`whitespace-pre-wrap break-all ${lineStyle}`}>{(/^(---|\+\+\+|@@)/.test(line) ? line : line.slice(1)) || " "}</span>
             </div>
           );
         })}

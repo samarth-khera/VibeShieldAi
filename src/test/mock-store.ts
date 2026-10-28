@@ -1,9 +1,14 @@
+import { randomBytes } from "node:crypto";
 import type { ScanStatus } from "@prisma/client";
-import { evaluateQuota } from "@/server/quota";
+import { evaluateQuota, isWarmLease, WARM_LEASE_PREFIX } from "@/server/quota";
+import { verificationClaimOf, withVerificationClaim } from "@/server/remediation/claims";
 import type { RemediationRecord, RemediationStatus } from "@/server/remediation/types";
 import {
   ACTIVE_STATUSES,
+  MAX_WARM_ATTEMPTS,
   STALE_JOB_PATCH,
+  type ScanExecutor,
+  type WorkerHeartbeatInput,
   newJobId,
   type QuotaConfig,
   type SlotReservation,
@@ -39,24 +44,43 @@ export class InMemoryJobStore implements JobStore {
     }
   }
 
-  private activeSlots(now: Date, timeoutMs: number): number {
-    const since = new Date(now.getTime() - timeoutMs);
+  private heartbeats = new Map<string, { lastRequestMs: number; lastSeenAt: Date }>();
+
+  private activeSlots(): number {
     let active = 0;
-    for (const job of this.jobs.values()) {
-      if (ACTIVE_STATUSES.includes(job.status) && job.updatedAt >= since) active++;
-    }
-    for (const list of this.remediations.values()) {
-      for (const r of list) if (r.status === "applied" && r.updatedAt >= since) active++;
-    }
+    for (const job of this.jobs.values()) if (ACTIVE_STATUSES.includes(job.status) && job.startedAt) active++;
+    for (const list of this.remediations.values()) for (const r of list) if (r.status === "applied") active++;
     return active;
+  }
+
+  private waiting(): JobRecord[] {
+    return [...this.jobs.values()]
+      .filter((j) => j.status === "queued" && !j.startedAt)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  }
+
+  private resetToWaiting(job: JobRecord, now: Date) {
+    Object.assign(job, {
+      status: "queued",
+      startedAt: null,
+      workflowRunId: null,
+      workflowRunUrl: null,
+      failureCategory: null,
+      errorMessage: null,
+      completedAt: null,
+      gitleaksStatus: null,
+      semgrepStatus: null,
+      osvStatus: null,
+      updatedAt: now,
+    });
   }
 
   async createWithQuota(data: NewJob, config: QuotaConfig, now: Date = new Date()): Promise<CreateJobWithQuotaResult> {
     return this.withLock(async () => {
-      await this.reapStale(now, config.jobTimeoutMs);
+      await this.reapStale(now, config);
       const oneHourAgo = new Date(now.getTime() - 3600_000);
       const oneDayAgo = new Date(now.getTime() - 86400_000);
-      const counts = { active: this.activeSlots(now, config.jobTimeoutMs), ipHourly: 0, ipDaily: 0, globalDaily: 0 };
+      const counts = { waiting: this.waiting().length, ipHourly: 0, ipDaily: 0, globalDaily: 0 };
 
       for (const job of this.jobs.values()) {
         if (job.createdAt < oneDayAgo) continue;
@@ -67,7 +91,7 @@ export class InMemoryJobStore implements JobStore {
         }
       }
 
-      const limit = evaluateQuota(data.clientIpHash ? counts : { active: counts.active, globalDaily: counts.globalDaily }, config);
+      const limit = evaluateQuota(data.clientIpHash ? counts : { waiting: counts.waiting, globalDaily: counts.globalDaily }, config);
       if (!limit.allowed) return { ok: false, rateLimit: limit };
       const job = await this.create(data);
       return { ok: true, job };
@@ -82,16 +106,63 @@ export class InMemoryJobStore implements JobStore {
     now: Date = new Date(),
   ): Promise<SlotReservation> {
     return this.withLock(async () => {
-      await this.reapStale(now, config.jobTimeoutMs);
+      await this.reapStale(now, config);
       const job = this.jobs.get(id);
       if (!job || !from.includes(job.status) || job.attempts >= maxAttempts) return { ok: false };
-      const holdsSlot = ACTIVE_STATUSES.includes(job.status);
-      const active = this.activeSlots(now, config.jobTimeoutMs) - (holdsSlot ? 1 : 0);
-      const limit = evaluateQuota({ active }, config);
+      const limit = evaluateQuota({ waiting: this.waiting().length }, config);
       if (!limit.allowed) return { ok: false, rateLimit: limit };
-      Object.assign(job, { status: "queued", failureCategory: null, errorMessage: null, completedAt: null, startedAt: null, updatedAt: now });
+      this.resetToWaiting(job, now);
       return { ok: true };
     });
+  }
+
+  async claimNextScan(executor: ScanExecutor, config: QuotaConfig, now: Date = new Date(), opts?: { minWaitMs?: number }) {
+    return this.withLock(async () => {
+      await this.reapStale(now, config);
+      if (!evaluateQuota({ active: this.activeSlots() }, config).allowed) return null;
+      const cutoff = now.getTime() - (opts?.minWaitMs ?? 0);
+      const next = this.waiting().find((j) => j.updatedAt.getTime() <= cutoff);
+      if (!next) return null;
+      const lease = executor.kind === "warm" ? `${WARM_LEASE_PREFIX}${executor.workerId}:${randomBytes(6).toString("hex")}` : `gha:${randomBytes(6).toString("hex")}`;
+      Object.assign(next, { startedAt: now, workflowRunId: lease, attempts: next.attempts + 1, updatedAt: now });
+      return { job: next, lease };
+    });
+  }
+
+  async queuePosition(jobId: string) {
+    const list = this.waiting();
+    const i = list.findIndex((j) => j.id === jobId);
+    return i === -1 ? null : i + 1;
+  }
+
+  async renewLease(lease: string, now: Date = new Date()) {
+    let n = 0;
+    for (const job of this.jobs.values()) {
+      if (job.workflowRunId === lease && ACTIVE_STATUSES.includes(job.status)) {
+        job.updatedAt = now;
+        n++;
+      }
+    }
+    for (const list of this.remediations.values()) {
+      for (const r of list) {
+        if (r.status === "applied" && verificationClaimOf(r.approvedOperations)?.lease === lease) {
+          r.updatedAt = now;
+          n++;
+        }
+      }
+    }
+    return n;
+  }
+
+  async recordWorkerHeartbeat(input: WorkerHeartbeatInput, now: Date = new Date()) {
+    const prev = this.heartbeats.get(input.workerId);
+    if (prev && input.requestMs <= prev.lastRequestMs) return false;
+    this.heartbeats.set(input.workerId, { lastRequestMs: input.requestMs, lastSeenAt: now });
+    return true;
+  }
+
+  async warmWorkerHealthy(now: Date, healthyMs: number) {
+    return [...this.heartbeats.values()].some((h) => now.getTime() - h.lastSeenAt.getTime() <= healthyMs);
   }
 
   async transition(id: string, from: readonly ScanStatus[], patch: JobPatch): Promise<boolean> {
@@ -101,18 +172,40 @@ export class InMemoryJobStore implements JobStore {
     return true;
   }
 
-  async reapStale(now: Date, timeoutMs: number): Promise<number> {
-    const staleBefore = new Date(now.getTime() - timeoutMs);
+  async reapStale(now: Date, config: QuotaConfig): Promise<number> {
+    const leaseExpired = now.getTime() - config.warmLeaseMs;
+    const jobExpired = now.getTime() - config.jobTimeoutMs;
+    const queueExpired = now.getTime() - config.queueTimeoutMs;
     let reaped = 0;
     for (const job of this.jobs.values()) {
-      if (ACTIVE_STATUSES.includes(job.status) && job.updatedAt < staleBefore) {
+      const t = job.updatedAt.getTime();
+      if (!ACTIVE_STATUSES.includes(job.status)) continue;
+      if (!job.startedAt) {
+        if (job.status === "queued" && t < queueExpired) {
+          Object.assign(job, { status: "failed", failureCategory: "queue_timeout", errorMessage: "No scan worker became available in time. Please retry the scan.", completedAt: now, updatedAt: now });
+          reaped++;
+        }
+      } else if (isWarmLease(job.workflowRunId) && t < leaseExpired) {
+        if (job.attempts < MAX_WARM_ATTEMPTS) {
+          this.findings.set(job.id, []);
+          this.resetToWaiting(job, now);
+        } else {
+          Object.assign(job, STALE_JOB_PATCH, { completedAt: now, updatedAt: now });
+        }
+        reaped++;
+      } else if (!isWarmLease(job.workflowRunId) && t < jobExpired) {
         Object.assign(job, STALE_JOB_PATCH, { completedAt: now, updatedAt: now });
         reaped++;
       }
     }
     for (const list of this.remediations.values()) {
       for (const r of list) {
-        if (r.status === "applied" && r.updatedAt < staleBefore) {
+        if (r.status !== "applied") continue;
+        const claim = verificationClaimOf(r.approvedOperations);
+        if (isWarmLease(claim?.lease) && r.updatedAt.getTime() < leaseExpired) {
+          r.approvedOperations = withVerificationClaim(r.approvedOperations, null);
+          reaped++;
+        } else if (!isWarmLease(claim?.lease) && r.updatedAt.getTime() < jobExpired) {
           Object.assign(r, {
             status: "failed",
             rescanStatus: "failed",
@@ -341,8 +434,8 @@ export class InMemoryJobStore implements JobStore {
     now: Date = new Date(),
   ): Promise<VerificationReservation> {
     return this.withLock(async () => {
-      await this.reapStale(now, config.jobTimeoutMs);
-      const limit = evaluateQuota({ active: this.activeSlots(now, config.jobTimeoutMs) }, config);
+      await this.reapStale(now, config);
+      const limit = evaluateQuota({ active: this.activeSlots() }, config);
       if (!limit.allowed) return { ok: false, rateLimit: limit };
       const current = await this.getRemediation(scanJobId, remediationId);
       if (!current || current.status !== "approved" || !current.approvedAt) return { ok: false };
@@ -352,6 +445,29 @@ export class InMemoryJobStore implements JobStore {
         rescanSummary: null,
       });
       return { ok: true, remediation };
+    });
+  }
+
+  async assignVerification(scanJobId: string, remediationId: string, lease: string) {
+    return this.withLock(async () => {
+      const r = await this.getRemediation(scanJobId, remediationId);
+      if (!r || r.status !== "applied" || verificationClaimOf(r.approvedOperations)) return false;
+      r.approvedOperations = withVerificationClaim(r.approvedOperations, lease);
+      return true;
+    });
+  }
+
+  async claimNextVerification(workerId: string, config: QuotaConfig, now: Date = new Date()) {
+    return this.withLock(async () => {
+      await this.reapStale(now, config);
+      const all = [...this.remediations.values()].flat().filter((r) => r.status === "applied" && !verificationClaimOf(r.approvedOperations));
+      all.sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime());
+      const next = all[0];
+      if (!next) return null;
+      const lease = `${WARM_LEASE_PREFIX}${workerId}:${randomBytes(6).toString("hex")}`;
+      next.approvedOperations = withVerificationClaim(next.approvedOperations, lease);
+      next.updatedAt = now;
+      return { job: this.jobs.get(next.scanJobId)!, remediation: next, lease };
     });
   }
 }

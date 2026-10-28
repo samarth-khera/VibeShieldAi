@@ -434,8 +434,9 @@ describe("Signed verification worker protocol", () => {
     const { job, finding } = await seedScan(store);
     const preview = await createPreview(job.id, finding.id, deps);
     await approveRemediation(job.id, preview.id, deps);
-    // Another user's scan occupies the only slot.
+    // Another user's scan is claimed by an executor and occupies the only slot (waiting scans do not).
     await store.create({ owner: "a", repo: "b", repositoryUrl: "https://github.com/a/b", expiresAt: new Date(Date.now() + 1e6) });
+    expect(await store.claimNextScan({ kind: "github-actions" }, deps.config!)).not.toBeNull();
 
     const err = await applyAndVerify(job.id, preview.id, deps).catch((e) => e);
     expect(err).toBeInstanceOf(RemediationError);

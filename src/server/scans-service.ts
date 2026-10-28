@@ -146,22 +146,71 @@ export async function submitScan(req: Request, deps: ScanDeps): Promise<Response
     }
   }
 
-  try {
-    await deps.enqueue(job.id, 0, parsed.url);
-  } catch {
-    // Nothing was queued: remove the orphan row so no job is left pretending to be pending.
-    await deps.store
-      .update(job.id, {
-        status: "failed",
-        failureCategory: "queue_unavailable",
-        errorMessage: "The scan queue is unavailable.",
-        completedAt: now,
-      })
-      .catch(() => undefined);
-    log("error", "enqueue_failed", { jobId: job.id });
+  if (!deps.store.claimNextScan) {
+    // Stores without slot claiming (simple test doubles) dispatch directly.
+    try {
+      await deps.enqueue(job.id, 0, parsed.url);
+    } catch {
+      await markQueueUnavailable(job.id, deps, now);
+      return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
+    }
+    return ok(toPublicJob(job), 202);
+  }
+
+  // The job is accepted as waiting; start it now if a slot is free, otherwise it keeps its place in line.
+  await pumpQueue(deps).catch((err) => log("error", "queue_pump_failed", { cause: err instanceof Error ? err.name : "unknown" }));
+  const fresh = (await deps.store.get(job.id).catch(() => null)) ?? job;
+  if (fresh.status === "failed" && fresh.failureCategory === "queue_unavailable") {
     return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
   }
-  return ok(toPublicJob(job), 202);
+  return ok(await publicJobWithQueue(fresh, deps), 202);
+}
+
+async function markQueueUnavailable(jobId: string, deps: ScanDeps, now: Date) {
+  await deps.store
+    .update(jobId, {
+      status: "failed",
+      failureCategory: "queue_unavailable",
+      errorMessage: "The scan queue is unavailable.",
+      completedAt: now,
+    })
+    .catch(() => undefined);
+  log("error", "enqueue_failed", { jobId });
+}
+
+/**
+ * Hands waiting scans to the GitHub Actions executor while slots are free. When a warm worker is
+ * healthy it gets `warmWorkerGraceMs` to claim a job first; GitHub Actions only takes jobs that
+ * waited longer. Called on submit, on completion callbacks and while clients poll a waiting job,
+ * so no scheduler is needed.
+ */
+export async function pumpQueue(deps: ScanDeps): Promise<number> {
+  const { store, config } = deps;
+  if (!store.claimNextScan) return 0;
+  const now = (deps.now ?? (() => new Date()))();
+  const warmHealthy =
+    config.warmWorkerEnabled && store.warmWorkerHealthy ? await store.warmWorkerHealthy(now, config.warmWorkerHealthyMs) : false;
+  const minWaitMs = warmHealthy ? config.warmWorkerGraceMs : 0;
+
+  let dispatched = 0;
+  for (let i = 0; i < config.maxConcurrentHeavyScans; i++) {
+    const claimed = await store.claimNextScan({ kind: "github-actions" }, config, now, { minWaitMs });
+    if (!claimed) break;
+    try {
+      await deps.enqueue(claimed.job.id, claimed.job.attempts, claimed.job.repositoryUrl);
+      dispatched++;
+      log("info", "scan_dispatched", { jobId: claimed.job.id, executor: "github-actions", warmHealthy });
+    } catch {
+      await markQueueUnavailable(claimed.job.id, deps, now);
+    }
+  }
+  return dispatched;
+}
+
+async function publicJobWithQueue(job: JobRecord, deps: ScanDeps, workerOnline?: boolean) {
+  const waiting = job.status === "queued" && !job.startedAt;
+  const position = waiting && deps.store.queuePosition ? await deps.store.queuePosition(job.id).catch(() => null) : null;
+  return toPublicJob(job, workerOnline, { queuePosition: position });
 }
 
 /** GET /api/scans/:id */
@@ -171,14 +220,17 @@ export async function getScan(id: string, deps: ScanDeps): Promise<Response> {
   if (job === undefined) return fail(503, "service_unavailable", "The service is temporarily unavailable.");
   if (!job) return fail(404, "not_found", "Scan job not found.");
   const now = (deps.now ?? (() => new Date()))();
-  if (ACTIVE_STATUSES.includes(job.status) && job.updatedAt.getTime() < now.getTime() - deps.config.jobTimeoutMs) {
-    // The worker stopped reporting: fail it explicitly instead of showing "queued" forever.
-    await deps.store.reapStale(now, deps.config.jobTimeoutMs).catch(() => undefined);
+  const waiting = job.status === "queued" && !job.startedAt;
+  const lapsed = ACTIVE_STATUSES.includes(job.status) && job.updatedAt.getTime() < now.getTime() - deps.config.warmLeaseMs;
+  if (waiting || lapsed) {
+    // Release lapsed leases and start waiting work; a polling client is the queue's heartbeat.
+    await deps.store.reapStale(now, deps.config).catch(() => undefined);
+    if (waiting) await pumpQueue(deps).catch(() => undefined);
     const fresh = await deps.store.get(id).catch(() => null);
-    if (fresh) return ok(toPublicJob(fresh));
+    if (fresh) return ok(await publicJobWithQueue(fresh, deps));
   }
   const online = job.status === "queued" ? await deps.workerOnline() : undefined;
-  return ok(toPublicJob(job, online));
+  return ok(await publicJobWithQueue(job, deps, online));
 }
 
 /** GET /api/scans/:id/repository */
@@ -213,28 +265,29 @@ async function requeueAndDispatch(
   if (!reserved.ok) {
     if ("rateLimit" in reserved && reserved.rateLimit) {
       const limit = reserved.rateLimit;
-      return fail(429, limit.reason || "rate_limited", limit.message || "All scan worker slots are busy.", {
+      return fail(429, limit.reason || "rate_limited", limit.message || "The scan queue is full.", {
         "Retry-After": String(limit.retryAfterSeconds),
       });
     }
     return notAllowed();
   }
 
-  try {
-    await deps.enqueue(job.id, job.attempts + 1, job.repositoryUrl);
-  } catch {
-    await deps.store
-      .update(job.id, {
-        status: "failed",
-        failureCategory: "queue_unavailable",
-        errorMessage: "The scan queue is unavailable.",
-        completedAt: now,
-      })
-      .catch(() => undefined);
-    return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
+  if (deps.store.claimNextScan) {
+    // Re-queued work goes through the same slot reservation as a new submission.
+    await pumpQueue(deps).catch(() => undefined);
+  } else {
+    try {
+      await deps.enqueue(job.id, job.attempts + 1, job.repositoryUrl);
+    } catch {
+      await markQueueUnavailable(job.id, deps, now);
+      return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
+    }
   }
   const fresh = (await deps.store.get(job.id)) ?? job;
-  return ok(toPublicJob(fresh), 202);
+  if (fresh.status === "failed" && fresh.failureCategory === "queue_unavailable") {
+    return fail(503, "queue_unavailable", "The scan queue is unavailable. Please try again shortly.");
+  }
+  return ok(await publicJobWithQueue(fresh, deps), 202);
 }
 
 /** POST /api/scans/:id/scan — explicit action to start or retry security scan */

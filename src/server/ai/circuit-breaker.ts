@@ -79,7 +79,7 @@ export async function checkAiQuotaAndCircuitBreaker(
       },
     });
 
-    if (ipHourlyCount >= (config.aiMaxRequestsPerIpHourly ?? 5)) {
+    if (ipHourlyCount >= (config.aiMaxRequestsPerIpHourly ?? 8)) {
       return {
         allowed: false,
         reason: "ip_hourly_limit",
@@ -96,7 +96,7 @@ export async function checkAiQuotaAndCircuitBreaker(
       },
     });
 
-    if (ipDailyCount >= (config.aiMaxRequestsPerIpDaily ?? 15)) {
+    if (ipDailyCount >= (config.aiMaxRequestsPerIpDaily ?? 25)) {
       return {
         allowed: false,
         reason: "ip_daily_limit",

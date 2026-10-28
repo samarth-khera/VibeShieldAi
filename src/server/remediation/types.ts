@@ -1,3 +1,4 @@
+import type { PrAvailability, PullRequestState } from "./github-pr";
 export type RemediationEligibilityType = "safe" | "potentially_breaking" | "unsuitable";
 
 export type RemediationStatus =
@@ -57,8 +58,10 @@ export type RescanComparison = {
   scannerStatuses?: { gitleaks: string; semgrep: string; osvScanner: string };
   timings?: VerificationTimings;
   /** Where verification ran and what it ran against. */
-  runtime?: "github-actions" | "local";
+  runtime?: "github-actions" | "warm-worker" | "local";
   snapshot?: { commitSha: string; fileCount: number };
+  /** Whether the repository archive came from the worker's commit-keyed cache. */
+  archiveCache?: "hit" | "miss" | "none";
   workflowRunUrl?: string;
 };
 
@@ -110,11 +113,14 @@ export type PublicRemediation = {
   rescanSummary: RescanComparison | null;
   branchName: string | null;
   pullRequestUrl: string | null;
+  /** Whether this deployment can open a PR for the repository, and the last attempt's outcome. */
+  pullRequest: (Partial<PullRequestState> & { availability?: PrAvailability }) | null;
   createdAt: string;
   updatedAt: string;
 };
 
-export function toPublicRemediation(r: RemediationRecord): PublicRemediation {
+export function toPublicRemediation(r: RemediationRecord, availability?: PrAvailability): PublicRemediation {
+  const last = (r.approvedOperations as { pullRequest?: PullRequestState } | null)?.pullRequest;
   return {
     id: r.id,
     scanJobId: r.scanJobId,
@@ -133,6 +139,7 @@ export function toPublicRemediation(r: RemediationRecord): PublicRemediation {
     rescanSummary: r.rescanSummary ?? null,
     branchName: r.branchName,
     pullRequestUrl: r.pullRequestUrl,
+    pullRequest: last || availability ? { ...(last ?? {}), availability } : null,
     createdAt: r.createdAt.toISOString(),
     updatedAt: r.updatedAt.toISOString(),
   };

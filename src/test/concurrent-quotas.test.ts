@@ -20,12 +20,13 @@ function makeScanRequest(repo: string, ip: string): Request {
 }
 
 describe("Atomic Quota Reservation & Concurrency Hardening", () => {
-  it("prevents active scan race: exactly 1 of 10 simultaneous requests is accepted", async () => {
+  it("queues simultaneous submissions instead of dropping them, but executes exactly `cap` at once", async () => {
     const store = new InMemoryJobStore();
     const baseConfig = getConfig();
     const config: ServerConfig = {
       ...baseConfig,
-      maxConcurrentHeavyScans: 1, // Only 1 active scan allowed at a time
+      maxConcurrentHeavyScans: 1, // Only 1 scan may execute at a time
+      maxQueuedScans: 10,
       maxScansPerIpHourly: 10,
       maxScansPerIpDaily: 20,
       globalDailyScanCap: 50,
@@ -39,27 +40,22 @@ describe("Atomic Quota Reservation & Concurrency Hardening", () => {
       workerOnline: vi.fn().mockResolvedValue(true),
     };
 
-    // Fire 10 simultaneous scan submissions concurrently
-    const requests = Array.from({ length: 10 }, (_, i) =>
-      submitScan(makeScanRequest(`repo-concurrent-${i}`, `198.51.100.${i + 1}`), deps),
+    const responses = await Promise.all(
+      Array.from({ length: 10 }, (_, i) => submitScan(makeScanRequest(`repo-concurrent-${i}`, `198.51.100.${i + 1}`), deps)),
     );
+    expect(responses.map((r) => r.status)).toEqual(Array(10).fill(202));
+    // Exactly one executor dispatch; nothing beyond the cap runs.
+    expect(deps.enqueue).toHaveBeenCalledTimes(1);
 
-    const responses = await Promise.all(requests);
-    const statuses = responses.map((r) => r.status);
+    const jobs = await Promise.all(responses.map((r) => r.json()));
+    const positions = jobs.map((j) => j.data.queue?.position).filter((p) => p != null).sort((a, b) => a - b);
+    expect(positions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
-    const accepted = statuses.filter((s) => s === 202);
-    const rejected = statuses.filter((s) => s === 429);
-
-    expect(accepted.length).toBe(1);
-    expect(rejected.length).toBe(9);
-
-    // Verify 429 responses have concurrency_limit reason
-    for (const res of responses) {
-      if (res.status === 429) {
-        const body = await res.json();
-        expect(body.error.code).toBe("concurrency_limit");
-      }
-    }
+    // The waiting queue is bounded: once 10 are waiting, the next submission is rejected explicitly.
+    expect((await submitScan(makeScanRequest("repo-10", "198.51.100.50"), deps)).status).toBe(202);
+    const full = await submitScan(makeScanRequest("repo-11", "198.51.100.51"), deps);
+    expect(full.status).toBe(429);
+    expect((await full.json()).error.code).toBe("queue_full");
   });
 
   it("prevents per-IP hourly race: exactly 3 of 10 simultaneous requests from same IP succeed", async () => {
@@ -144,6 +140,7 @@ describe("Atomic Quota Reservation & Concurrency Hardening", () => {
     const config: ServerConfig = {
       ...baseConfig,
       maxConcurrentHeavyScans: 50,
+      maxQueuedScans: 50,
       maxScansPerIpHourly: 50,
       maxScansPerIpDaily: 50,
       globalDailyScanCap: 20, // Exact global cap: 20 per day
@@ -195,10 +192,13 @@ describe("Atomic Quota Reservation & Concurrency Hardening", () => {
       scanJob: {
         count: mockCount,
         create: mockCreate,
+        findMany: vi.fn().mockResolvedValue([]),
         updateMany: vi.fn().mockResolvedValue({ count: 0 }),
       },
+      finding: { deleteMany: vi.fn() },
       remediation: {
         count: vi.fn().mockResolvedValue(0),
+        findMany: vi.fn().mockResolvedValue([]),
         updateMany: vi.fn().mockResolvedValue({ count: 0 }),
       },
     };
@@ -230,5 +230,26 @@ describe("Atomic Quota Reservation & Concurrency Hardening", () => {
     } finally {
       txSpy.mockRestore();
     }
+  });
+});
+
+describe("default free-tier limits", () => {
+  it("allows 6 submissions per IP per hour, 10 per day, 40 globally and 20 waiting, and still rejects beyond them", async () => {
+    vi.stubEnv("MAX_SCANS_PER_IP_HOURLY", "");
+    vi.stubEnv("MAX_SCANS_PER_IP_DAILY", "");
+    vi.stubEnv("GLOBAL_DAILY_SCAN_CAP", "");
+    vi.stubEnv("MAX_QUEUED_SCANS", "");
+    vi.stubEnv("MAX_CONCURRENT_HEAVY_SCANS", "");
+    const { evaluateQuota } = await import("@/server/quota");
+    const c = getConfig();
+    expect(c.maxConcurrentHeavyScans).toBe(2); // execution concurrency deliberately unchanged
+    expect(evaluateQuota({ waiting: 0, ipHourly: 5, ipDaily: 5, globalDaily: 5 }, c).allowed).toBe(true);
+    expect(evaluateQuota({ waiting: 0, ipHourly: 6, ipDaily: 6, globalDaily: 6 }, c).reason).toBe("hourly_ip_limit");
+    expect(evaluateQuota({ waiting: 0, ipHourly: 0, ipDaily: 10, globalDaily: 10 }, c).reason).toBe("daily_ip_limit");
+    expect(evaluateQuota({ waiting: 0, ipHourly: 0, ipDaily: 0, globalDaily: 40 }, c).reason).toBe("global_daily_limit");
+    expect(evaluateQuota({ waiting: 19, ipHourly: 0, ipDaily: 0, globalDaily: 0 }, c).allowed).toBe(true);
+    expect(evaluateQuota({ waiting: 20, ipHourly: 0, ipDaily: 0, globalDaily: 0 }, c).reason).toBe("queue_full");
+    expect(evaluateQuota({ active: 2 }, c).reason).toBe("concurrency_limit");
+    vi.unstubAllEnvs();
   });
 });

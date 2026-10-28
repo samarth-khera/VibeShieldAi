@@ -412,25 +412,28 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
         pullRequestUrl: null,
       });
 
-      // Call without write token to test graceful fallback; never let ambient credentials reach GitHub.
-      vi.stubEnv("GITHUB_TOKEN", "");
+      // Ambient read tokens must never be used as a write credential.
+      vi.stubEnv("GITHUB_TOKEN", "ambient-read-token");
       vi.stubEnv("GITHUB_WRITE_TOKEN", "");
+      const fetchSpy = vi.fn();
       const result = await createRemediationPullRequest({
         owner: job.owner,
         repo: job.repo,
-        defaultBranch: job.defaultBranch || "main",
-        commitSha: job.commitSha || "HEAD",
+        commitSha: job.commitSha!,
         scanJobId: job.id,
         remediationId: rem.id,
-        patchSummary: rem.patchSummary,
         unifiedDiff: rem.unifiedDiff,
+        title: "t",
+        body: "b",
+        allowedRepositories: ["acme/webapp"],
+        fetchImpl: fetchSpy,
       });
 
-      expect(result.hasWriteAccess).toBe(false);
-      expect(result.branchName).toBe(`vibeshield/fixes/${job.id.slice(0, 12)}`);
-      expect(result.branchName).not.toBe("main");
-      expect(result.branchName).not.toBe(job.defaultBranch);
-      expect(result.message).toMatch(/GitHub write authorization is not configured/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(result.status).toBe("failed");
+      expect(result.code).toBe("not_configured");
+      expect(result.branch).toMatch(/^vibeshield\/fix-/);
+      expect(result.branch).not.toBe(job.defaultBranch);
     });
   });
 
@@ -2788,7 +2791,7 @@ export function getSafeComputedNonJsonConfig() {
       expect(verified.rescanSummary?.newFindingsCount).toBe(0);
       expect(verified.rescanSummary?.remainingFingerprints).toHaveLength(0);
       expect(verified.rescanSummary?.postRescanFindingsCount).toBe(0);
-    });
+    }, 60_000); // live OSV API
 
     it("preserves Python environment markers, extras, and comments during requirements patch", () => {
       const manifest = [

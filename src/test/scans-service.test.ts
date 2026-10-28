@@ -14,6 +14,7 @@ describe("scans-service API logic", () => {
     store = new InMemoryJobStore();
     enqueued = [];
     config = {
+      pullRequestRepositories: [],
       maxArchiveBytes: 50 * 1024 * 1024,
       maxUnpackedBytes: 200 * 1024 * 1024,
       maxFileCount: 10000,
@@ -29,6 +30,12 @@ describe("scans-service API logic", () => {
       globalDailyScanCap: 20,
       maxConcurrentHeavyScans: 1,
       jobTimeoutMs: 900_000,
+      maxQueuedScans: 10,
+      queueTimeoutMs: 1_800_000,
+      warmWorkerEnabled: false,
+      warmLeaseMs: 60_000,
+      warmWorkerHealthyMs: 30_000,
+      warmWorkerGraceMs: 10_000,
       scanDispatchBackend: "bullmq",
       githubRepository: "samarth-khera/VibeShieldAi",
       githubWorkflowRef: "main",

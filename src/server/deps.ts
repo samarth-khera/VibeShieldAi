@@ -103,6 +103,10 @@ export function getRemediationDeps(config: ServerConfig = getConfig()): Remediat
       if (!res.success) throw new Error(res.error);
     };
   }
+  if (config.warmWorkerEnabled) {
+    deps.warmWorkerHealthy = () =>
+      prismaJobStore.warmWorkerHealthy?.(new Date(), config.warmWorkerHealthyMs) ?? Promise.resolve(false);
+  }
   return deps;
 }
 

@@ -2,7 +2,7 @@ import { runGitleaksScan } from "./gitleaks";
 import { runSemgrepScan } from "./semgrep";
 import { runOsvScan } from "./osv";
 import { runSubprocess } from "./runner";
-import type { NormalizedFinding, ScanCoverage, ScanEngineResult, ScannerVersions } from "./types";
+import type { NormalizedFinding, ScanCoverage, ScanEngineResult, ScannerVersions, SingleScannerResult } from "./types";
 
 let cachedVersions: ScannerVersions | null = null;
 
@@ -41,6 +41,12 @@ export type ScanEngineOptions = {
   semgrepRulesPath?: string;
   osvBinary?: string;
   timeoutMs?: number;
+  /**
+   * Called as soon as each scanner finishes (in completion order), so its findings can be
+   * published before the slower scanners are done. The engine awaits every callback before
+   * resolving, so the final aggregate is never reported ahead of a partial result.
+   */
+  onScannerComplete?: (result: SingleScannerResult) => Promise<void> | void;
 };
 
 export async function runSecurityScanEngine(
@@ -49,22 +55,37 @@ export async function runSecurityScanEngine(
 ): Promise<ScanEngineResult> {
   const versions = await detectScannerVersions();
 
-  // Run all three scanners
+  // Run all three scanners in parallel; publish each result as it lands.
+  const callbacks: Promise<void>[] = [];
+  const settle = (p: Promise<SingleScannerResult>) =>
+    p.then((r) => {
+      if (options?.onScannerComplete) {
+        callbacks.push(Promise.resolve(options.onScannerComplete(r)).catch(() => undefined));
+      }
+      return r;
+    });
   const [gitleaksRes, semgrepRes, osvRes] = await Promise.all([
-    runGitleaksScan(targetDir, {
-      binaryPath: options?.gitleaksBinary,
-      timeoutMs: options?.timeoutMs,
-    }),
-    runSemgrepScan(targetDir, {
-      binaryPath: options?.semgrepBinary,
-      rulesPath: options?.semgrepRulesPath,
-      timeoutMs: options?.timeoutMs,
-    }),
-    runOsvScan(targetDir, {
-      binaryPath: options?.osvBinary,
-      timeoutMs: options?.timeoutMs,
-    }),
+    settle(
+      runGitleaksScan(targetDir, {
+        binaryPath: options?.gitleaksBinary,
+        timeoutMs: options?.timeoutMs,
+      }),
+    ),
+    settle(
+      runSemgrepScan(targetDir, {
+        binaryPath: options?.semgrepBinary,
+        rulesPath: options?.semgrepRulesPath,
+        timeoutMs: options?.timeoutMs,
+      }),
+    ),
+    settle(
+      runOsvScan(targetDir, {
+        binaryPath: options?.osvBinary,
+        timeoutMs: options?.timeoutMs,
+      }),
+    ),
   ]);
+  await Promise.all(callbacks);
 
   // Aggregate findings with deduplication by fingerprint
   const seenFingerprints = new Set<string>();

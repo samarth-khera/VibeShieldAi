@@ -123,12 +123,56 @@ function ScanProgressBanner({ job, repoName }: { job: PublicScanJob; repoName: s
             </li>
           ))}
         </ol>
+        {job.queue?.waitingForSlot && (
+          <p className="font-mono text-xs text-foreground">
+            All worker slots are busy — your scan is accepted and
+            {job.queue.position ? ` #${job.queue.position} in line.` : " waiting in line."}
+          </p>
+        )}
+        {current === PHASES.length - 1 && <ScannerChips job={job} now={now} />}
         <p className="font-mono text-xs text-muted">
           Queue wait {formatMs(queueWait)}
           {workerStarted != null && ` · Worker active ${formatMs(now - workerStarted)}`}
+          {job.executor && ` · ${job.executor === "warm-worker" ? "Warm worker" : "GitHub Actions runner"}`}
         </p>
       </div>
     </div>
+  );
+}
+
+const SCANNERS = [
+  { key: "gitleaks", label: "Gitleaks" },
+  { key: "semgrep", label: "Semgrep" },
+  { key: "osvScanner", label: "OSV-Scanner" },
+] as const;
+
+/** Live per-scanner state; findings from finished scanners are already listed below. */
+function ScannerChips({ job, now }: { job: PublicScanJob; now: number }) {
+  const started = job.scanCoverage?.progress?.scanningAt ? Date.parse(job.scanCoverage.progress.scanningAt) : null;
+  return (
+    <ul className="flex flex-wrap justify-center gap-2 font-mono text-[11px]" aria-label="Scanner status">
+      {SCANNERS.map(({ key, label }) => {
+        const s = job.scanners?.[key];
+        const state = s?.status === "completed" || s?.status === "failed" ? s.status : "running";
+        return (
+          <li
+            key={key}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md border px-2 py-1",
+              state === "completed" && "border-accent/40 text-accent",
+              state === "failed" && "border-sev-high/50 text-sev-high",
+              state === "running" && "border-line text-muted",
+            )}
+          >
+            {state === "running" ? <Loader2 className="size-3 animate-spin" aria-hidden /> : state === "completed" ? <CheckCircle2 className="size-3" aria-hidden /> : <AlertCircle className="size-3" aria-hidden />}
+            {label}{" "}
+            {state === "running"
+              ? started != null ? `running ${formatMs(now - started)}` : "running"
+              : `${state} ${formatMs(s?.durationMs ?? 0)}`}
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 const sevOrder: Severity[] = ["critical", "high", "medium", "low", "info"];
@@ -146,13 +190,20 @@ export function RealReportView({ jobId }: { jobId: string }) {
   const [selectedFindingIds, setSelectedFindingIds] = useState<Set<string>>(new Set());
   const lastTrigger = useRef<HTMLElement | null>(null);
 
+  // Findings are refetched only when the worker published new results (revision changed), and
+  // once more when the scan reaches its final state.
+  const loadedRevision = useRef<string | null>(null);
   const loadData = useCallback(async () => {
     try {
       const j = await fetchScan(jobId);
       setJob(j);
 
-      if (["completed", "completed_with_warnings"].includes(j.status)) {
+      const final = ["completed", "completed_with_warnings"].includes(j.status);
+      const partial = j.status === "scanning" && (j.scanCoverage?.progress?.revision ?? 0) > 0;
+      const revision = `${j.status}:${j.scanCoverage?.progress?.revision ?? 0}`;
+      if ((final || partial) && loadedRevision.current !== revision) {
         const res = await fetchFindings(jobId, { limit: 200 });
+        loadedRevision.current = revision;
         setFindings(res.findings);
       }
       setLoading(false);
@@ -164,7 +215,6 @@ export function RealReportView({ jobId }: { jobId: string }) {
     }
   }, [jobId]);
 
-  // Findings are only fetched once the scan reaches a final state (see loadData).
   const poll = useCallback(async () => {
     const current = await loadData();
     return Boolean(current && ACTIVE_SCAN_STATUSES.includes(current.status));
@@ -286,9 +336,15 @@ export function RealReportView({ jobId }: { jobId: string }) {
         <header className="mt-6 flex flex-col gap-6 rounded-xl border border-line-bright bg-surface p-6 sm:flex-row sm:items-start sm:justify-between sm:p-8">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-3">
-              <span className="inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-accent/10 px-3 py-1 font-mono text-xs font-semibold text-accent">
-                <ShieldCheck className="size-3.5" /> VERIFIED SCAN REPORT
-              </span>
+              {isScanning ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-sev-medium/50 bg-sev-medium/10 px-3 py-1 font-mono text-xs font-semibold text-sev-medium">
+                  <Loader2 className="size-3.5 animate-spin" /> PARTIAL — SCAN STILL RUNNING
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-accent/10 px-3 py-1 font-mono text-xs font-semibold text-accent">
+                  <ShieldCheck className="size-3.5" /> VERIFIED SCAN REPORT
+                </span>
+              )}
               <span className="font-mono text-xs text-muted">
                 {job.completedAt ? `Scanned ${new Date(job.completedAt).toLocaleString()}` : "In progress"}
               </span>
@@ -306,7 +362,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
               {findings.length}
             </div>
             <div className="mt-1 font-mono text-[11px] uppercase tracking-wider text-muted">
-              Verified Finding{findings.length === 1 ? "" : "s"}
+              {isScanning ? "Findings so far" : `Verified Finding${findings.length === 1 ? "" : "s"}`}
             </div>
           </div>
         </header>
@@ -599,8 +655,24 @@ export function RealReportView({ jobId }: { jobId: string }) {
             </div>
           )}
 
-          {/* Clean repository / No findings state */}
-          {findings.length === 0 ? (
+          {/* No findings: never presented as clean until every scanner completed */}
+          {findings.length === 0 && job.status !== "completed" ? (
+            <div className="mt-6 rounded-xl border border-dashed border-line-bright p-12 text-center">
+              {isScanning ? (
+                <Loader2 className="mx-auto size-8 animate-spin text-accent" aria-hidden />
+              ) : (
+                <AlertTriangle className="mx-auto size-8 text-sev-medium" aria-hidden />
+              )}
+              <h2 className="mt-3 font-display text-lg font-bold">
+                {isScanning ? "No findings yet — scan still running" : "No findings from the scanners that completed"}
+              </h2>
+              <p className="mx-auto mt-2 max-w-lg text-sm text-muted">
+                {isScanning
+                  ? "Findings appear here as each scanner finishes. This is not a clean result until all three scanners complete."
+                  : "At least one scanner did not complete, so coverage is incomplete and this is not a clean result."}
+              </p>
+            </div>
+          ) : findings.length === 0 ? (
             <div className="mt-6 rounded-xl border border-accent/30 bg-accent/5 p-12 text-center">
               <ShieldCheck className="mx-auto size-12 text-accent" aria-hidden />
               <h2 className="mt-4 font-display text-2xl font-bold">No Security Findings Detected</h2>
