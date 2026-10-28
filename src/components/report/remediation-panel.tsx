@@ -162,7 +162,7 @@ export function RemediationPanel({
     }
     return fresh.status === "applied";
   }, [jobId, remediation, onRemediationUpdated]);
-  useAdaptivePoll(pollVerification, remediation?.status === "applied", { initialMs: 3000, maxMs: 10_000 });
+  useAdaptivePoll(pollVerification, remediation?.status === "applied", { initialMs: 3000, maxMs: 5000 });
 
   const onApplyAndVerify = async () => {
     if (!remediation) return;
