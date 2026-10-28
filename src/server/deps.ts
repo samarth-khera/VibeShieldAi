@@ -68,7 +68,7 @@ export function getScanDeps(): ScanDeps {
       return { ok: true };
     } catch (err: unknown) {
       if (err instanceof RetrievalError) {
-        return { ok: false, code: err.category, error: err.message };
+        return { ok: false, code: err.category, error: err.publicMessage };
       }
       return { ok: false, code: "invalid_repository", error: "Repository is not accessible." };
     }
