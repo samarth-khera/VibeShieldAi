@@ -1,4 +1,6 @@
 import type { PullRequestState } from "./github-pr";
+import { verificationClaimOf } from "./claims";
+import { isWarmLease } from "../quota";
 export type RemediationEligibilityType = "safe" | "potentially_breaking" | "unsuitable";
 
 export type RemediationStatus =
@@ -116,12 +118,15 @@ export type PublicRemediation = {
   pullRequestUrl: string | null;
   /** Outcome of the last pull-request attempt; GitHub authorization state comes from /api/auth/github/status. */
   pullRequest: PullRequestState | null;
+  /** While status is "applied": whether a worker has claimed the verification yet (never the lease itself). */
+  verification: { claimedAt: string | null; runtime: "warm-worker" | "github-actions" | null } | null;
   createdAt: string;
   updatedAt: string;
 };
 
 export function toPublicRemediation(r: RemediationRecord): PublicRemediation {
   const last = (r.approvedOperations as { pullRequest?: PullRequestState } | null)?.pullRequest;
+  const claim = r.status === "applied" ? verificationClaimOf(r.approvedOperations) : null;
   return {
     id: r.id,
     scanJobId: r.scanJobId,
@@ -141,6 +146,10 @@ export function toPublicRemediation(r: RemediationRecord): PublicRemediation {
     branchName: r.branchName,
     pullRequestUrl: r.pullRequestUrl,
     pullRequest: last ?? null,
+    verification:
+      r.status === "applied"
+        ? { claimedAt: claim?.at ?? null, runtime: claim ? (isWarmLease(claim.lease) ? "warm-worker" : "github-actions") : null }
+        : null,
     createdAt: r.createdAt.toISOString(),
     updatedAt: r.updatedAt.toISOString(),
   };

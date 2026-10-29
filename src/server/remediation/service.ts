@@ -13,7 +13,7 @@ import { canonicalizeDiff, diffFiles, renderFileDiff } from "./canonical-diff";
 import { generateNpmLockfilePatch, isNpmLockfileFinding } from "./npm-lockfile";
 import { parseDiffByFile } from "./strict-apply";
 import { verificationClaimOf, withVerificationClaim } from "./claims";
-import { createRemediationPullRequest, type PullRequestState } from "./github-pr";
+import { createRemediationPullRequest, remediationBranchName, type PrStep, type PullRequestState } from "./github-pr";
 import { fitColumn, REMEDIATION_TEXT_LIMITS, type RemediationRecord, type RescanComparison } from "./types";
 import type { AuthDeps } from "../auth/service";
 
@@ -241,8 +241,11 @@ export async function createPreview(
   return record;
 }
 
-/** Who approves: the job owner's session subject, and their GitHub user when connected. */
-export type ApprovalActor = { ownerSubject: string; githubUserId?: number | null };
+/**
+ * Who approves: the job owner's session subject, their GitHub user when connected, and the
+ * canonical GitHub repository ID recorded for the scan (when the GitHub App is configured).
+ */
+export type ApprovalActor = { ownerSubject: string; githubUserId?: number | null; githubRepoId?: number | null };
 
 /** An approval is valid for this long; after that the owner must review and approve again. */
 export const APPROVAL_TTL_MS = 24 * 3600_000;
@@ -252,6 +255,8 @@ export type ApprovalBinding = {
   approvedBy: "job_owner";
   ownerSubject: string;
   githubUserId: number | null;
+  /** Canonical (immutable) GitHub repository ID of the scanned repository, when known. */
+  githubRepoId: number | null;
   scanJobId: string;
   remediationId: string;
   commitSha: string;
@@ -356,6 +361,7 @@ export async function approveRemediation(
     approvedBy: "job_owner",
     ownerSubject: actor.ownerSubject,
     githubUserId: actor.githubUserId ?? null,
+    githubRepoId: actor.githubRepoId ?? null,
     scanJobId,
     remediationId,
     commitSha: remediation.commitSha,
@@ -561,6 +567,14 @@ export async function recordVerificationResult(
 
 const PR_RECHECK_MS = 15_000;
 
+const PR_STEP_MESSAGES: Record<PrStep, string> = {
+  checking_repository: "Re-checking repository access and write permission with GitHub.",
+  creating_commit: "Creating the commit with exactly the verified change, on top of the scanned commit.",
+  pushing_branch: "Creating and pushing the remediation branch.",
+  creating_pull_request: "Creating the pull request against the default branch.",
+  confirming: "Reading the branch, commit and pull request back from GitHub.",
+};
+
 /** SHA-256 of the exact diff the user approved; a PR may only carry that diff. */
 export const diffDigest = (diff: string) => createHash("sha256").update(diff, "utf8").digest("hex");
 
@@ -680,6 +694,18 @@ export async function requestPullRequest(
   // happened, so the approval's age no longer matters here).
   const problem = approvalProblem(job, remediation, actor, new Date(), { checkExpiry: false });
   if (problem) throw new RemediationError(problem, APPROVAL_MESSAGES[problem], 409);
+  // The approval was for this repository and, when a GitHub account was connected, by this account.
+  const binding = remediation.approvedOperations as Partial<ApprovalBinding> | null;
+  if (binding?.githubRepoId != null && binding.githubRepoId !== actor.repoId) {
+    throw new RemediationError("approval_target_mismatch", APPROVAL_MESSAGES.approval_target_mismatch, 409);
+  }
+  if (binding?.githubUserId != null && binding.githubUserId !== actor.githubUserId) {
+    throw new RemediationError(
+      "approval_user_mismatch",
+      "This patch was approved while a different GitHub account was connected. Review the diff and approve it again.",
+      409,
+    );
+  }
   // The publishing user explicitly confirmed this exact diff, not just "a" fix for the finding.
   if (actor.confirmedDiffSha256 !== currentDigest) {
     throw new RemediationError(
@@ -700,6 +726,24 @@ export async function requestPullRequest(
   const targeted = findings.filter((f) => remediation.findingFingerprints.includes(f.fingerprint));
   const { title, body } = pullRequestText(job, remediation, targeted, actor.login);
 
+  // Each step is stored as it starts, so the report shows real progress and a reload finds it. A run
+  // that stops updating is no longer "in progress" after PR_RECHECK_MS and may be retried safely.
+  const openedBy = { githubUserId: actor.githubUserId, login: actor.login };
+  const onProgress = async (step: PrStep) => {
+    const current = await deps.store.getRemediation(scanJobId, remediationId);
+    const inProgress: PullRequestState = {
+      status: "in_progress",
+      step,
+      message: PR_STEP_MESSAGES[step],
+      branch: remediationBranchName(scanJobId, remediationId),
+      openedBy,
+      at: new Date().toISOString(),
+    };
+    await deps.store.updateRemediation(scanJobId, remediationId, {
+      approvedOperations: { ...((current?.approvedOperations as Record<string, unknown> | null) ?? {}), pullRequest: inProgress },
+    });
+  };
+
   const pullRequest = await createRemediationPullRequest({
     owner: job.owner,
     repo: job.repo,
@@ -713,8 +757,9 @@ export async function requestPullRequest(
     expectedRepoId: actor.repoId,
     fetchImpl: deps.fetchImpl,
     timeoutMs: config.githubApiTimeoutMs,
+    onProgress,
   });
-  pullRequest.openedBy = { githubUserId: actor.githubUserId, login: actor.login };
+  pullRequest.openedBy = openedBy;
   log(pullRequest.status === "failed" ? "warn" : "info", "remediation_pull_request", {
     jobId: scanJobId,
     remediationId,
@@ -724,8 +769,9 @@ export async function requestPullRequest(
   });
 
   const succeeded = pullRequest.status !== "failed";
+  const latest = (await deps.store.getRemediation(scanJobId, remediationId)) ?? remediation;
   const updated = await deps.store.updateRemediation(scanJobId, remediationId, {
-    approvedOperations: { ...((remediation.approvedOperations as Record<string, unknown> | null) ?? {}), pullRequest },
+    approvedOperations: { ...((latest.approvedOperations as Record<string, unknown> | null) ?? {}), pullRequest },
     ...(succeeded ? { branchName: pullRequest.branch, pullRequestUrl: pullRequest.url ?? null } : {}),
   });
   return { remediation: updated, pullRequest };

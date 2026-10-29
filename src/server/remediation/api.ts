@@ -84,9 +84,11 @@ export async function handleApproveRemediation(
 
   try {
     const session = deps.auth?.app ? await loadSession(req, deps.auth).catch(() => null) : null;
+    const scanAccess = deps.auth ? await loadScanAccess(deps.auth, scanJobId) : null;
     const approved = await approveRemediation(scanJobId, remediationId, deps, {
       ownerSubject,
       githubUserId: session?.account?.githubUserId ?? null,
+      githubRepoId: scanAccess?.githubRepoId ?? null,
     });
     return ok(toPublicRemediation(approved));
   } catch (err) {

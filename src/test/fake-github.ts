@@ -8,9 +8,11 @@ type Entry = { path: string; mode: string; type: "blob" | "tree"; sha: string };
 export class FakeGitHub {
   blobs = new Map<string, string>();
   trees = new Map<string, Entry[]>();
-  commits = new Map<string, { tree: string; parents: string[]; message: string; author?: { name: string; email: string } }>();
+  commits = new Map<string, { tree: string; parents: string[]; message: string; author?: { name: string; email: string }; authorLogin?: string }>();
   refs = new Map<string, string>();
-  pulls: { number: number; head: string; base: string; title: string; body: string; state: string; merged_at: null }[] = [];
+  pulls: { number: number; head: string; base: string; title: string; body: string; state: string; merged_at: null; user: string }[] = [];
+  /** Forces a mismatching read-back (e.g. a PR whose head moved), for confirmation tests. */
+  tamperReadBack: "pull" | null = null;
   calls: { method: string; path: string; auth: string | null }[] = [];
   repo = { full_name: "acme/webapp", default_branch: "main", archived: false, permissions: { push: true } };
   repoId = 4242;
@@ -122,7 +124,7 @@ export class FakeGitHub {
       const sha = this.sha("commit", { ...body, n: this.commits.size });
       // As on GitHub: without an explicit author, the token's user authors and commits it.
       const author = body.author ?? (this.actor ? { name: this.actor.login, email: `${this.actor.id}+${this.actor.login}@users.noreply.github.com` } : undefined);
-      this.commits.set(sha, { tree: body.tree, parents: body.parents, message: body.message, author });
+      this.commits.set(sha, { tree: body.tree, parents: body.parents, message: body.message, author, authorLogin: body.author ? undefined : this.actor?.login });
       return json(201, { sha, tree: { sha: body.tree }, ...this.commitMeta(sha, author) });
     }
     if (method === "GET" && (m = path.match(/^\/git\/ref\/heads\/(.+)$/))) {
@@ -142,12 +144,31 @@ export class FakeGitHub {
         this.pulls.filter((p) => p.head === head).map((p) => ({ ...p, html_url: `https://github.com/acme/webapp/pull/${p.number}`, base: { ref: p.base } })),
       );
     }
+    if (method === "GET" && (m = path.match(/^\/pulls\/(\d+)$/))) {
+      const p = this.pulls.find((x) => x.number === Number(m![1]));
+      if (!p) return json(404, { message: "Not Found" });
+      const headSha = this.tamperReadBack === "pull" ? "0".repeat(40) : this.refs.get(`heads/${p.head}`);
+      return json(200, {
+        number: p.number,
+        state: p.state,
+        merged_at: p.merged_at,
+        html_url: `https://github.com/acme/webapp/pull/${p.number}`,
+        head: { ref: p.head, sha: headSha },
+        base: { ref: p.base },
+        user: { login: p.user },
+      });
+    }
+    if (method === "GET" && (m = path.match(/^\/commits\/([0-9a-f]+)$/))) {
+      const c = this.commits.get(m[1]);
+      if (!c) return json(404, { message: "Not Found" });
+      return json(200, { sha: m[1], author: c.authorLogin ? { login: c.authorLogin } : null, committer: { login: "web-flow" }, commit: { message: c.message } });
+    }
     if (method === "POST" && path === "/pulls") {
       if (this.pulls.some((p) => p.head === body.head && p.state === "open")) {
         return json(422, { message: "A pull request already exists" });
       }
       const number = this.pulls.length + 1;
-      this.pulls.push({ number, head: body.head, base: body.base, title: body.title, body: body.body, state: "open", merged_at: null });
+      this.pulls.push({ number, head: body.head, base: body.base, title: body.title, body: body.body, state: "open", merged_at: null, user: this.actor?.login ?? "token-user" });
       return json(201, { number, html_url: `https://github.com/acme/webapp/pull/${number}` });
     }
     return json(404, { message: `unhandled ${method} ${path}` });

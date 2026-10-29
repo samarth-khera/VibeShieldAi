@@ -13,11 +13,17 @@ export type PrFailureCode =
   | "patch_conflict"
   | "branch_conflict"
   | "github_error"
-  | "network_error";
+  | "network_error"
+  | "not_confirmed";
+
+/** Steps of publishing a verified fix, persisted while they run so the UI can show real progress. */
+export type PrStep = "checking_repository" | "creating_commit" | "pushing_branch" | "creating_pull_request" | "confirming";
 
 /** Persisted in Remediation.approvedOperations.pullRequest and returned to the UI. */
 export type PullRequestState = {
-  status: "created" | "exists" | "failed";
+  /** "in_progress" is stored while the steps run; the final state replaces it. */
+  status: "in_progress" | "created" | "exists" | "failed";
+  step?: PrStep;
   code?: PrFailureCode;
   message: string;
   branch: string;
@@ -32,6 +38,8 @@ export type PullRequestState = {
   openedBy?: { githubUserId: number; login: string };
   /** The fix commit exactly as GitHub recorded it (never client-supplied). */
   commit?: CommitAttribution;
+  /** The pull request's author as GitHub reports it. */
+  prAuthor?: string;
   at: string;
 };
 
@@ -49,6 +57,9 @@ export type CommitAttribution = {
   /** GitHub's signature verification of the commit. */
   verified?: boolean;
   verificationReason?: string;
+  /** GitHub accounts GitHub associates with the commit's author and committer. */
+  authorLogin?: string;
+  committerLogin?: string;
 };
 
 function attributionOf(sha: string, json: Record<string, unknown>): CommitAttribution {
@@ -91,6 +102,8 @@ export type CreatePrParams = {
   expectedRepoId?: number;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
+  /** Called before each step; the caller persists it so progress is visible and survives reloads. */
+  onProgress?: (step: PrStep) => Promise<void> | void;
 };
 
 const MESSAGES: Record<PrFailureCode, string> = {
@@ -106,6 +119,8 @@ const MESSAGES: Record<PrFailureCode, string> = {
     "The remediation branch already exists with different content. It was left untouched; no pull request was opened.",
   github_error: "GitHub rejected the request.",
   network_error: "Could not reach the GitHub API. Nothing was confirmed; retrying is safe.",
+  not_confirmed:
+    "GitHub accepted the request, but reading the branch, commit or pull request back did not match. It is not reported as created; retrying is safe.",
 };
 
 class PrError extends Error {
@@ -169,12 +184,16 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
     return { status: res.status, json, headers: res.headers };
   };
   const ghMessage = (r: GhResponse) => String(r.json.message ?? `HTTP ${r.status}`).slice(0, 200);
+  const progress = async (step: PrStep) => {
+    await params.onProgress?.(step);
+  };
 
   try {
     const validation = validateUnifiedDiff(params.unifiedDiff);
     if (!validation.valid) throw new PrError("patch_conflict", validation.error);
 
     // 1. The credential can see and push to exactly the scanned repository.
+    await progress("checking_repository");
     const repoRes = await gh("GET", "");
     if (repoRes.status === 404 || repoRes.status === 403) throw new PrError("repository_not_found");
     if (repoRes.status !== 200) throw new PrError("github_error", ghMessage(repoRes));
@@ -242,6 +261,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
     }
 
     // 3. Trees are content-addressed, so the same verified patch always yields the same tree SHA.
+    await progress("creating_commit");
     const treeRes = await gh("POST", "/git/trees", {
       base_tree: baseTree,
       tree: [...patched].map(([path, content]) => ({ path, mode: modes.get(path), type: "blob", content })),
@@ -279,6 +299,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
       if (commit.status === 404 || commit.status === 403) throw new PrError("access_denied");
       if (commit.status !== 201) throw new PrError("github_error", ghMessage(commit));
       const commitSha = String(commit.json.sha);
+      await progress("pushing_branch");
       const ref = await gh("POST", "/git/refs", { ref: `refs/heads/${branch}`, sha: commitSha });
       if (ref.status === 201) {
         headSha = commitSha;
@@ -295,6 +316,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
     const baseAdvanced = baseRef.status === 200 && String((baseRef.json.object as { sha?: string })?.sha) !== params.commitSha;
 
     // 5. One pull request per remediation branch, whatever its state.
+    await progress("creating_pull_request");
     const findExisting = async (): Promise<PullRequestState | null> => {
       const list = await gh("GET", `/pulls?head=${encodeURIComponent(`${params.owner}:${branch}`)}&state=all&per_page=5`);
       if (list.status !== 200) return null;
@@ -316,8 +338,41 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
         at: at(),
       };
     };
+    // 6. Report only what GitHub shows when read back: branch → commit, commit content and parent,
+    //    and the pull request's head, base and author.
+    const confirm = async (state: PullRequestState): Promise<PullRequestState> => {
+      await progress("confirming");
+      const ref = await gh("GET", `/git/ref/heads/${branch}`);
+      if (ref.status !== 200 || String((ref.json.object as { sha?: string } | undefined)?.sha) !== headSha) {
+        throw new PrError("not_confirmed", "branch");
+      }
+      const gitCommit = await gh("GET", `/git/commits/${headSha}`);
+      const parents = (gitCommit.json.parents ?? []) as { sha: string }[];
+      if (gitCommit.status !== 200 || (gitCommit.json.tree as { sha?: string } | undefined)?.sha !== newTree || parents.length !== 1 || parents[0].sha !== params.commitSha) {
+        throw new PrError("not_confirmed", "commit");
+      }
+      const prRes = await gh("GET", `/pulls/${state.number}`);
+      const pr = prRes.json as { head?: { ref?: string; sha?: string }; base?: { ref?: string }; user?: { login?: string }; html_url?: string; state?: string; merged_at?: string | null };
+      if (prRes.status !== 200 || pr.head?.ref !== branch || pr.head?.sha !== headSha || pr.base?.ref !== baseBranch) {
+        throw new PrError("not_confirmed", "pull request");
+      }
+      const restCommit = await gh("GET", `/commits/${headSha}`);
+      const login = (v: unknown) => (v && typeof v === "object" && typeof (v as { login?: unknown }).login === "string" ? String((v as { login: string }).login).slice(0, 39) : undefined);
+      return {
+        ...state,
+        url: typeof pr.html_url === "string" ? pr.html_url : state.url,
+        state: pr.merged_at ? "merged" : pr.state === "open" ? "open" : "closed",
+        prAuthor: login(pr.user),
+        commit: {
+          ...attributionOf(headSha!, gitCommit.json),
+          ...(commitInfo ?? {}),
+          ...(restCommit.status === 200 ? { authorLogin: login(restCommit.json.author), committerLogin: login(restCommit.json.committer) } : {}),
+        },
+      };
+    };
+
     const existing = await findExisting();
-    if (existing) return existing;
+    if (existing) return await confirm(existing);
 
     const pr = await gh("POST", "/pulls", {
       title: params.title,
@@ -327,7 +382,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
       draft: false,
     });
     if (pr.status === 201) {
-      return {
+      return await confirm({
         status: "created",
         message: "Pull request created on GitHub.",
         branch,
@@ -339,11 +394,11 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
         baseAdvanced,
         commit: commitInfo,
         at: at(),
-      };
+      });
     }
     if (pr.status === 422) {
       const raced = await findExisting();
-      if (raced) return raced;
+      if (raced) return await confirm(raced);
     }
     if (pr.status === 404 || pr.status === 403) throw new PrError("access_denied");
     throw new PrError("github_error", ghMessage(pr));
