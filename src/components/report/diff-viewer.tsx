@@ -24,7 +24,7 @@ export function DiffViewer({
   };
 
   return (
-    <div className="rounded-lg border border-line bg-surface-subtle overflow-hidden text-xs font-mono">
+    <div data-testid="diff-viewer" className="code-literal rounded-lg border border-line bg-surface-subtle overflow-hidden text-xs font-mono">
       <div className="flex items-center justify-between border-b border-line px-3 py-2 bg-surface">
         <div className="flex items-center gap-2 text-muted">
           <FileCode className="size-4 text-accent" />

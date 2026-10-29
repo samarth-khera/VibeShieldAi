@@ -115,6 +115,9 @@ body {
 .reveal { opacity: 0; transform: translateY(20px); transition: opacity 0.8s var(--ease-luxury), transform 0.8s var(--ease-luxury); }
 .reveal.is-visible { opacity: 1; transform: none; }
 .marquee-track:hover { animation-play-state: paused; }
+/* Code shown for security review (diffs) must show literal characters: no ligatures or contextual
+   alternates, so ">=" never renders as "≥" and "==" never merges into one long sign. */
+.code-literal { font-variant-ligatures: none; font-feature-settings: "liga" 0, "clig" 0, "calt" 0, "dlig" 0; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
