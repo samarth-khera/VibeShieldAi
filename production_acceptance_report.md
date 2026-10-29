@@ -1,173 +1,280 @@
-# VibeShield AI — Authorization Hardening Before GitHub App Launch
+# VibeShield AI — GitHub App Activation, Live Production Acceptance and Defect Fixes
 
-**Date:** 2026-10-28 · **Starting HEAD:** `e8274e4` (verified as local = remote, clean tree) · **Fix commit:** `cf5ff08` (deployed, §7) · **Production:** https://vibeshield-ai-phi.vercel.app
+**Dates:** 2026-10-28 (activation, first live session) and 2026-10-29 (final acceptance run, then three defect fixes)
+**Production:** https://vibeshield-ai-phi.vercel.app
+**Code under acceptance test (§2–§6):** `9e9d5d9`. Nothing was changed or deployed while those tests ran.
+**Fixes (§7) deployed afterwards:** `dd7cdd5`, `27a3e75`, `9cccccf` → production `dpl_7wt3B6w6SBtsaz7duqZ3dmHiG2JP` at `9cccccf`
 
-The previous report, on per-user GitHub App authorization, is in git history (`git show e8274e4:production_acceptance_report.md`). Everything below was measured or read in this session.
+The previous report (job ownership and private-scan hardening) is in git history: `git show 9e9d5d9:production_acceptance_report.md`.
+
+Everything below was observed during these sessions. Statuses are `PASS`, `FAIL`, `BLOCKED` or `NOT TESTED`.
 
 ---
 
-## 1. Root causes and code paths
+## 1. Summary
 
-### Issue 1: a report link could change someone else's job
-
-- **Job IDs are not secret.** The public scanner workflow has `run-name: VibeShield <mode> <job_id>`, and `JOB_ID` is in its step environment, so every job ID is listed at `github.com/samarth-khera/VibeShieldAi/actions`.
-- **Every state-changing route trusted that ID.** Each route called `gateScanAccess`, which returns immediately when the GitHub App is not configured (production) and passes public jobs even when it is. Affected routes:
-  - `POST /api/scans/:id/remediation/preview`
-  - `…/:rid/approve`
-  - `…/:rid/apply` (starts a verification run and takes a heavy-worker slot)
-  - `…/:rid/pr`
-  - `POST /api/scans/:id/retry`
-  - `POST /api/scans/:id/scan` (rescan)
-  - `POST /api/scans/:id/findings/:fid/explain` (spends shared Gemini quota)
-- **Approval wasn't bound to anything** except a diff digest; `approvedBy` was a free-text string.
-
-So anyone could approve and verify any public scan's fix and spend shared quota. With the GitHub App configured, a stranger could have approved a fix that the owner later published.
-
-### Issue 2: private jobs would run on the public workflow
-
-- `repositoryUrlForWorker` replaced a private repository's URL with `private`, but still dispatched the job to GitHub-hosted runners of this public repository. Their run names and logs expose job IDs and timings.
-- **No private job has ever existed in production.** The private path is only installed when `GITHUB_APP_*` is configured, which it never has been (`/api/health` → `githubApp: not_configured`). Before that, `fetchRepoMetadata` rejected non-public repositories.
-- Visibility was "public unless `private === true`", so a response missing the field counted as public.
-
-## 2. Authorization policy (now enforced server-side)
-
-| Action | Who | Notes |
-|---|---|---|
-| Submit a public scan | Anyone (rate-limited) | No GitHub connection needed. The submitting browser becomes the job owner. |
-| View a public-repo report: status, findings, finding detail, stored AI explanations, remediation list, verification details, `.patch` download | Anyone with the report link (read-only) | The data derives from public source code. The UI shows "Read-only report" and no actions to non-owners. |
-| Generate a fix preview, request an AI explanation, approve, apply/verify, retry, rescan, open a PR | **Job owner only**, same-origin request | A job ID, report URL, or client-supplied identity is never enough |
-| Open a PR | Job owner **and** that user's live GitHub App authorization with write access to the exact repository (immutable ID), plus confirmation of the exact diff digest | Unchanged from the previous round; now also requires the approving owner session |
-| Private repository: anything | **Refused** while no private worker exists (§4) | Legacy or future private records stay visible only to their authorizing GitHub user |
-
-## 3. How ownership and approval are bound
-
-**Owner grant (`src/server/auth/ownership.ts`)**
-- The response that creates a job sets `__Host-vibeshield_owner`: HttpOnly, Secure, SameSite=Lax, Path=/, host-only, Max-Age 7 days (job retention).
-- Its value is a random 128-bit session ID plus up to 30 job IDs created by that browser, each timestamped. It is HMAC-SHA256 signed with a key derived from `SCAN_CALLBACK_SECRET` under a fixed label; `OWNER_SESSION_SECRET` overrides it.
-- A grant entry is only ever added from the server's own 202 response, never from request input. It never appears in a URL or local storage.
-- There is no database change, so no migration was needed.
-
-**Every change is checked by `requireJobOwner`:**
-- `Sec-Fetch-Site: same-origin`, or `Origin` equal to the app origin. This is CSRF protection on top of SameSite=Lax.
-- A valid grant containing this job.
-
-Failures return `403 forbidden_origin`, `403 not_job_owner`, or `503 ownership_unavailable` if no key is configured, which fails closed.
-
-**Approval binding (`approvedOperations`, all derived server-side):**
-- `ownerSubject` (SHA-256 of the grant's session ID)
-- `scanJobId`, `remediationId`
-- `commitSha` (must equal the job's scanned commit)
-- `findingFingerprints`, `approvedFiles`
-- `diffSha256`
-- `approvedAt`, plus `githubUserId` when the session is GitHub-connected
-
-On apply, every field is re-derived. On any mismatch the remediation is reset to `preview`, so it must be re-approved:
-
-| Mismatch | Error code |
+| Area | Status |
 |---|---|
-| Different session | `approval_session_mismatch` |
-| Job, commit or finding changed | `approval_target_mismatch` |
-| Diff changed | `approval_diff_changed` |
-| Approval older than 24 h | `approval_expired` |
+| Production migration | **PASS**. Applied; no pending migrations; existing data unchanged. |
+| GitHub App configuration | **PASS**. `/api/health` → `githubApp: "configured"`. Real consent, install and callback flows worked. |
+| Deployment | **PASS**. Acceptance ran on `9e9d5d9`. The fixes are deployed at `9cccccf` (READY, production domain, health `healthy`, §8). |
+| Authorization boundaries (ownership, CSRF, installation scope, write access, disconnect) | **PASS**, live |
+| Token refresh after expiry | **PASS**, live |
+| Fresh scan → approve → full rescan → real PR → duplicate check | **BLOCKED** (§9). The one allowed scan failed with `archive_too_large`. No suitable small repository is in the installation yet, and the quota window has not reset. |
+| Failed scan shown as "VERIFIED SCAN REPORT" with 0 findings | Found as **FAIL**. **Fixed** in `dd7cdd5` and verified in production (§7.1). |
+| `.patch` fallback with plain `git apply` | Found as **FAIL**. **Fixed** in `27a3e75`. Verified locally with real git and real scanners; production generation of a new patch is BLOCKED by quota (§7.2). |
+| Diff viewer shows `>=`/`==` as ligatures | Found as **FAIL**. **Fixed** in `9cccccf` and verified in production (§7.3). |
 
-The PR step re-checks the same binding, except expiry.
+---
 
-**Session expiry and recovery:** a grant entry lasts as long as the job (7 days). If the cookie is cleared or the user switches browser, ownership is lost on purpose; the report becomes read-only and the user can start a new scan. There is no recovery link, because any link would be a shareable ownership token.
+## 2. Starting state and reuse of earlier work
 
-**Existing data:** jobs created before `cf5ff08` have no owner, so they are read-only for everyone. Their unbound approvals can no longer be applied. This is a deliberate, controlled expiry.
+- **Scheduled run.** The run scheduled for 2026-10-28 17:56 UTC **never ran**: the session ended first. No scan, remediation or PR was created, and there are no Actions runs between 2026-10-28 13:24 UTC and the final run.
+- **Lost local material.** The browser profiles and logs of the 2026-10-28 session lived in a session-scoped temporary folder that was cleared. That included the GitHub-connected profile and the JSON database backup (§3). Results from that session are quoted from the logs as they were observed.
+- **Persistent folder.** The final run kept its state, log and screenshots in `~/.vibeshield-e2e/` so they survive.
+- **Profile lost on 2026-10-28.** The browser profile that owned the earlier FraudAi job lost its owner cookie. A plain-Chrome relaunch could not decrypt the cookies stored under the automation keychain, and Chrome deleted them. Ownership could not be recovered (and was not forged). This is the intended behaviour: losing the cookie loses the right to act.
 
-## 4. Private scanning: fail-closed
+---
 
-`PRIVATE_SCANNING_AVAILABLE = false` (`src/server/auth/private-source.ts`). Every path:
+## 3. Production database migration (2026-10-28)
 
-| Path | Behaviour | Proof |
-|---|---|---|
-| `POST /api/scans` | Anything not confirmed public → `400 not_found_or_private`, "Private repository scanning is currently unavailable", before quota reservation, job, access record or dispatch | Test with connected user who has push access; negative control; **visible Chrome against real GitHub** (§6) |
-| `submitScan` itself | A private gate result → `403 private_scanning_unavailable` (defence in depth) | Test + negative control |
-| Visibility | Requires an explicit `private: false` (and `visibility: "public"` if present); missing → non-public | Test + negative control |
-| Queue → Actions dispatch | `repositoryUrlForWorker` throws, so the job fails and nothing is dispatched | Test (`pumpQueue` with a private record: nothing enqueued, job failed) + negative control |
-| Warm-worker claim | The private job is failed (`private_scanning_unavailable`) and not handed out | Code |
-| Retry / rescan / apply routes | `refusePrivateExecution` → `403` before queueing | Route-wiring tests |
-| Verification spec, signed source endpoint | No archive URL is issued (`private_scanning_unavailable`) | Test |
-
-**Existing exposure:** none. No private job could be created in any deployed version (see §1).
-
-**Future private worker:** `docs/private-worker.md` covers the minimum secure design: a dedicated non-public host, a signed outbound-only channel, private-only routing, short-lived archive URLs, isolation, no repository data in logs, and truthful status. **Not deployed.**
-
-## 5. Tests
-
-| Suite | Result |
+| Item | Result |
 |---|---|
-| `npx vitest run` | **29 files: 26 passed, 3 skipped. 376 tests: 358 passed, 18 skipped, 0 failed.** The skipped tests are the Postgres, real-scanner and live-Gemini suites; the first two were run separately below. Live Gemini was not run (no key locally). |
-| `npm run test:postgres` (disposable Postgres 16) | 17/17 |
-| `npm run test:scanners` (real Gitleaks, Semgrep, OSV) | 61/61 |
-| New `ownership.test.ts` (29) | Requested cases 1–17:<br>• cross-user approve; link-only visitor; forged grant, re-signed grant, client-supplied identity<br>• CSRF (cross-site, same-site sibling, foreign Origin, header-less)<br>• patch changed after approval; commit or finding substituted; other session; expiry<br>• verification result signed for another job (400, state unchanged)<br>• idempotent approve and apply; public scan without the GitHub App, with the grant issued only from the 202 response<br>• unknown visibility; patch-download fallback; route wiring for all 7 mutating routes, private refusal on retry, rescan and apply, and only the submit route issuing grants |
-| Updated `github-app-auth.test.ts` (32) | Private refusal before job, access record and dispatch, even for a user with push access; a private job reaching the queue is never dispatched; no source URL issued; PR refused for another owner session; disconnect mid-remediation; prior GitHub App cases |
-| Negative controls (12) | Each guard was removed in the working tree with the original bytes held in memory; the targeted test failed; the file was restored and byte-compared. Guards covered:<br>• owner check · CSRF check · grant signature<br>• approval session · target · diff · expiry<br>• private refusal in the gate · in `submitScan` · at dispatch<br>• visibility default · approve-route gate<br>Each removal made 1–2 targeted tests fail; after restore, 61/61 passed. |
-| `tsc` · `eslint` · `next build` | Clean · clean · success (all 27 API routes request-time) |
-| Gitleaks (history) · Semgrep `p/default` · OSV (lockfile) | No leaks · 0 · 0 |
+| Linked project | Vercel `vibeshield-ai` (`prj_OTyt39WFCETQdYiLK9DHRuhsoNCF`). Production domain verified in deployment aliases. |
+| Database | Neon (pooled and direct URLs agree). Confirmed different from the local `.env` database before running anything. |
+| Pending before | **2:** `20261028050000_add_worker_heartbeat` and `20261028120000_add_github_app_authorization`. The heartbeat migration from an earlier round had also never been applied. |
+| Safety review | Both are additive only: `CREATE TABLE`, indexes, and one foreign key between new tables. No `DROP` or `ALTER` of existing tables, and no data rewrite. |
+| Backup | A full logical JSON export of every table, plus the schema, was taken before migrating. **That export was later lost** with the temporary folder (§2). The Neon restore point is the pre-migration timestamp **2026-10-28 15:54:00 UTC**. |
+| Command | `npm run db:migrate` (`prisma migrate deploy`), with production env loaded only in the shell, never printed. No `db push` and no reset. |
+| After | "Database schema is up to date!" `prisma migrate diff` (DB → `schema.prisma`) reports no drift. |
+| Data unchanged | Row counts before and after are identical: ScanJob 16, Finding 157, Remediation 7, AiRequestLog 7, AiCircuitBreaker 0. New tables are empty. |
 
-*Process note:* my first negative-control run used a shell loop whose backups silently failed, which left all nine mutations in the working tree. I caught this before committing, reversed each mutation exactly, re-ran the suites (118/118), and repeated the controls with the in-memory harness. The committed code was diff-reviewed after the restore.
+## 4. GitHub App configuration
 
-## 6. Visible Chrome acceptance (non-headless)
-
-**Production `cf5ff08`.** Two separate Chrome profiles: A = owner, B = unrelated visitor holding only the copied report URL.
-
-| Step | Result |
+| Item | Result |
 |---|---|
-| A submits FraudAi via the form, no GitHub | `202`, job `M0p3IuJtJVEKDtaxQkGgORRD8BuwKJN9`. Cookie `__Host-vibeshield_owner`: httpOnly ✓, secure ✓, sameSite Lax, host-only, path `/`. |
-| Scan completes; A reloads | `completed`, 8 findings, `viewer.isOwner: true`, no read-only notice |
-| A previews and approves via the UI | Approve `200`, remediation `0ba8c59b-…` |
-| B opens the copied URL | "Read-only report" notice; panel note; explain note; **no** Preview, Approve, Verify or Explain buttons |
-| B's direct API calls | approve, approve with a forged identity body, apply, preview, explain, retry, rescan, PR: **all `403 not_job_owner`** |
-| B's reads | scan `200` (`isOwner: false`), findings `200`, remediations `200`, patch `200` (public read policy) |
-| State after B's attempts | Remediation still `approved` with A's original `approvedAt` |
-| A's real cookie replayed cross-site | `403 forbidden_origin` |
-| A verifies | "Fix Verified by Security Rescan", Actions run `40696196753`; Gitleaks, Semgrep and OSV completed; 8 → 6 findings, 0 new; 38.4 s |
-| GitHub card | "GitHub authorization is not configured yet", with the patch download (`200`) |
-| Private-repo attempt in production | **Not exercised.** My IP had used its 10 daily scans, so the request got `429 daily_ip_limit` before the visibility check. No job was created, and no workflow run appeared (only the 2 runs for A's public job since the baseline). |
-| Console / network | Only the deliberate 403s from B's direct calls; no other errors |
+| Production variables | `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`, `GITHUB_APP_SLUG` and `GITHUB_APP_TOKEN_ENCRYPTION_KEY` are present in Production and marked Sensitive (values not readable or printed). `DATABASE_URL` and `DATABASE_URL_UNPOOLED` are present. |
+| `APP_URL` | Sensitive, so not readable through the CLI. Verified in behaviour: the generated `redirect_uri` is exactly `https://vibeshield-ai-phi.vercel.app/api/auth/github/callback`. |
+| Callback URL | GitHub showed the **"Authorize VibeShield AI"** consent page with no redirect-URI error. After consent the user returned to the report, and the server recorded `github_connect / success`. |
+| Setup URL | After installation GitHub redirected to `/api/auth/github/setup`, which returned to the same report and finding with `github=installed`. The server verified the installation against the user's own token (`github_install / verified`, installation `176245393`). |
+| App slug | `vibeshield-ai` |
+| Token expiry | Enabled: 8-hour access tokens and 6-month refresh tokens, observed in stored expiry metadata. |
+| `/api/health` | `githubApp: "configured"` (it was `not_configured` before the redeploy). |
+| PKCE and state | The authorize URL carries `code_challenge_method=S256` and a 43-character single-use state. |
 
-**Private refusal, visible Chrome, local server running the deployed build, real GitHub metadata.** The server's read token can see the repository (`private: true`, verified separately; name withheld):
-
-| Attempt | Result |
-|---|---|
-| A real private repository I own | `400 not_found_or_private` with "Repository not found or not public. Private repository scanning is currently unavailable." No job (DB count 1 → 1), no owner cookie, no dispatch. |
-| A nonexistent repository | Same response, so existence is not revealed |
-
-Screenshots are kept locally and contain no credentials or private repository names.
-
-## 7. Deployment
+## 5. Deployment and health
 
 | Item | Value |
 |---|---|
-| Commit | `cf5ff08`, fast-forward from `e8274e4` (then this report) |
-| Remote `main` | `cf5ff08` at verification time |
-| Vercel | `dpl_2oALTy9aYNAi2iMU3h2WuuQm6AmP`, `githubCommitSha cf5ff08`, READY, aliased to production |
-| Actions | Scan `40696078893` and verify `40696196753` on the deployed code: success |
-| `/api/health` | `healthy`; database healthy; dispatcher ready; warm worker disabled; **`githubApp: not_configured`** |
-| Schema | Unchanged this round. The GitHub App migration from the previous round is still **not applied** in production. |
+| Redeploy by me (2026-10-28 15:56 UTC) | `dpl_HDv3Crvd6h6Q75qEx8EcQLZENeTM`, source `9e9d5d9`, READY, production |
+| Current production | `dpl_5ujXNKsLzAA4F29SkAEqaksuyor3`: a dashboard **redeploy of the same commit `9e9d5d9`** at 2026-10-28 16:17 UTC (not started by me). No environment variable changed afterwards. |
+| Remote `main` | `9e9d5d9`. Local tree clean. |
+| `/api/health` (2026-10-29) | `healthy`; database healthy; dispatcher ready; warm worker disabled (fallback github-actions); `githubApp: configured` |
 
-## 8. One-time GitHub App setup (still pending, owner action)
+---
 
-Unchanged; see `docs/github-app-setup.md`.
-1. Register the app with the callback and setup URLs, user-token expiry on, and Contents RW, Pull requests RW and Metadata R.
-2. `npx prisma migrate deploy` on production.
-3. Set `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`, `GITHUB_APP_SLUG` and `GITHUB_APP_TOKEN_ENCRYPTION_KEY` in Vercel.
-4. Redeploy, then run the live checklist.
+## 6. Live test results
 
-**Recommended:** also set a dedicated `OWNER_SESSION_SECRET` (32+ random characters). Without it the owner-grant key is derived from `SCAN_CALLBACK_SECRET`, which the GitHub Actions workers also hold.
+### 6.1 Scan budget (final run, 2026-10-29)
 
-## 9. Private worker
+| Attempt | Time (UTC) | Outcome |
+|---|---|---|
+| 1 | 16:03:32 | **Never reached the server.** The script typed before React hydrated, so the URL field was empty and the browser blocked the submit. Confirmed: no `ScanJob` row and no Actions run. |
+| 2 | 16:06:24 | **Accepted:** `202`, job `RJ2D5vXW08VrNUvDAdKGKzlJEssWR4QB`, owner cookie set, GitHub not connected. |
 
-**Pending, not deployed.** Private scanning is refused on every path (§4). Enabling it requires a deployed and verified private worker, private-only routing, and an end-to-end test (`docs/private-worker.md`).
+**New production scan jobs created: 1** (budget 1). The job details:
+- FraudAi `main` at `8d76bcbc6c8c5ab89d8a0a21b71be38b6ced4e0d`
+- Actions run `40908267334`
+- failed after 30 s (16:06:25 → 16:06:55) with `rejected_by_limits:archive_too_large`
+- Gitleaks, Semgrep and OSV-Scanner **did not run** (`scanPerformed: false`)
+- FraudAi reports about 27 MB on GitHub after today's merges; the cap is `MAX_ARCHIVE_MB = 25`
 
-## 10. Residual limitations
+No retry was made: it would fail the same way, and raising the cap would change production mid-test.
 
-1. **GitHub App not configured.** PR creation is unavailable in production by design. It has not been tested live.
-2. **Read access by link:** public-repo reports, including findings and patches, remain readable by anyone with the job ID, and job IDs are public in the Actions logs. This is the chosen policy for public data. It can be tightened to owner-only reads if wanted.
-3. **Ownership is per browser.** Clearing cookies or switching device loses the ability to act on a job; start a new scan.
-4. **Shared key:** the owner-grant key is derived from a secret the Actions workers also hold. Set `OWNER_SESSION_SECRET` to separate them.
-5. **Signed grants can't be revoked individually** before they expire (7 days). Rotating the key revokes all of them.
-6. **Production private-scan refusal** was not exercised live because of the per-IP quota. It is proven by tests, negative controls, and the local run of the deployed build against real GitHub.
-7. **Unchanged:** Turnstile not configured; Semgrep toolchain pins carry advisories; PR #10 on FraudAi from an earlier round is still open, and was not merged or touched.
+### 6.2 Results
+
+| # | Test | Status | Evidence |
+|---|---|---|---|
+| 1 | Public scan submission without GitHub connected | **PASS** (submission and dispatch) | `202` and owner cookie with GitHub disconnected; job dispatched to Actions |
+| 2 | Scan completion with all three scanners | **BLOCKED** | `archive_too_large` (above). The same deployed commit completed FraudAi scans on 2026-10-28, when the repo was under the cap. |
+| 3 | Connect GitHub (real consent) and return to the same report and finding | **PASS** | 2026-10-28: returned to `/report/M0p3…?finding=cmvs5byem0004…&mode=autofix`, and the drawer showed PYSEC-2026-1845 in `ml/requirements.txt`. 2026-10-29: reconnected as `samarth-khera`. |
+| 4 | Authorize this repository (installation flow) | **PASS** | 2026-10-28: `github=installed`; audit `github_install / verified` |
+| 5 | FraudAi access after narrowing the installation | **PASS** | 2026-10-29: `canPush, installed, appCanWrite, readyToWrite: true` for both FraudAi jobs (`8d76bcb`, `69581cd`) |
+| 6 | Repository not in the installation (VibeShieldAi) | **PASS** | `canPush: true` but `installed: false`, so `readyToWrite: false` with reason `not_installed`. This is the same live check the PR route runs before writing. Before narrowing, it correctly showed `installed: true`. |
+| 7 | No write access (pallets/itsdangerous) | **PASS** | `canPush: false`, `readyToWrite: false` |
+| 8 | Write gate on an owned job, live | **PASS** | Not connected → `401 not_connected` (audit `pull_request / denied / not_connected`). Connected → `404 remediation_not_found`, meaning the live write authorization for FraudAi passed and only then was the nonexistent remediation rejected. |
+| 9 | Approval and mutation from a browser that didn't start the scan | **PASS** | 2026-10-28, from a GitHub-connected browser that wasn't the owner: preview, approve (with forged `ownerSubject`), apply, PR, retry, rescan and explain all returned `403 not_job_owner`; remediations unchanged; UI read-only. 2026-10-29: same 7 routes via same-origin requests → `403 not_job_owner`. |
+| 10 | Forged owner cookie | **PASS** | Forged `__Host-vibeshield_owner` with a bad MAC → `403 not_job_owner` |
+| 11 | CSRF and same-origin | **PASS** | From `https://example.com`, credentialed POSTs to disconnect, approve and preview → 403; session stayed connected. With curl, a foreign `Origin`, `Sec-Fetch-Site: cross-site`, `same-site`, or no browser headers → `403 forbidden_origin` on approve and disconnect. |
+| 12 | Approve the exact displayed diff | **BLOCKED** | Needs a completed owned scan (test 2) |
+| 13 | Full security rescan of the approved fix | **BLOCKED** | Same |
+| 14 | Altered or hash-mismatched diff rejected at PR time | **BLOCKED** (live) | Needs an owned verified remediation. Covered by regression tests (`diff_confirmation_mismatch`, `approval_diff_changed`, `patch_mismatch`). |
+| 15 | Create a real PR and inspect it on GitHub | **BLOCKED** | No owned verified remediation. **No PR was created.** PR #10 on FraudAi is still open and untouched. |
+| 16 | Duplicate PR prevention | **BLOCKED** (live) | Same. Covered by regression tests (idempotent branch and PR lookup). |
+| 17 | Token expiry → refresh | **PASS** | Stored access-token expiry set to the past (metadata only; no token read or changed). The next request refreshed with GitHub: access expiry `2026-10-29 16:10:31` → `2026-10-30 00:11:34`, refresh expiry renewed to `2027-04-29 16:11:34`, session stayed connected. |
+| 18 | Disconnect → grant revoked → writes refused | **PASS** | Audit `github_disconnect / revoked` (grant revoked at GitHub); stored accounts `0` (tokens deleted); next PR write → `401 not_connected` (audit and re-check from the same browser) |
+| 19 | `.patch` download integrity | **PASS** | `200 text/x-diff`, `attachment; filename="vibeshield-fix-<id>.patch"`, `Cache-Control: no-store`, byte-identical to the stored reviewed diff (2 remediations) |
+| 20 | `.patch` applies with plain `git apply` at the scanned commit | **FAIL** on `9e9d5d9`; **fixed** in `27a3e75` | §7.2 |
+| 21 | Private repository scans refused | **PASS** (not re-run live) | Fail-closed on every path. Evidence is from the previous round: regression tests, negative controls, and a local run of the deployed build against real GitHub. Not re-submitted to production, to protect the quota. |
+| 22 | Displayed diff fidelity | **FAIL** on `9e9d5d9`; **fixed** in `9cccccf` and verified in production | §7.3 |
+| 23 | Failed scan presented truthfully | **FAIL** on `9e9d5d9`; **fixed** in `dd7cdd5` and verified in production | §7.1 |
+
+**Correction.** An earlier progress message (2026-10-28) listed `nosniff` on the patch download. That was wrong: the response carries **no** `X-Content-Type-Options` header. The risk is low (attachment with `text/x-diff`), but it is recorded here.
+
+### 6.3 Local regression suites (code `9e9d5d9`)
+
+| Suite | Result |
+|---|---|
+| `tsc --noEmit`, `eslint --max-warnings=0` | Pass (2026-10-29) |
+| `vitest run` | 26 files passed, 3 skipped; **358 tests passed, 18 skipped, 0 failed** (2026-10-29). The skipped suites are the Postgres, real-scanner and live-Gemini suites, which need opt-in environments. |
+| `test:postgres` (disposable Postgres container) | 17/17 passed (2026-10-28) |
+| `test:scanners` (real Gitleaks, Semgrep, OSV) | 61/61 passed (2026-10-28) |
+| `next build` | Pass; all `/api/auth/github/*` routes dynamic (2026-10-28) |
+
+These suites are regression evidence, not production evidence.
+
+---
+
+## 7. Defects found and fixed (one commit each)
+
+Each fix has focused regression tests. Each was checked with a negative control: the old behaviour was put back temporarily, the new tests were confirmed to fail, then the file was restored and checked byte for byte.
+
+### 7.1 Failed scans presented as clean: `dd7cdd5` (highest priority)
+
+**Root cause.**
+- `real-report-view.tsx` showed "VERIFIED SCAN REPORT" for every status that was not actively scanning, including `failed`. Header count, zero tiles and scanner "pending" labels were drawn regardless.
+- Separately, the scan worker flattened structured `RetrievalError`s (`rejected_by_limits` / `archive_too_large`, with a safe public message) into category `scan_failed` with the raw text `rejected_by_limits:archive_too_large`.
+
+**Fix.**
+- **API:** `toPublicJob` now returns `reportState`, one of `in_progress`, `complete`, `partial`, `failed` or `cancelled`, plus `incompleteScanners`.
+  - `complete` requires status `completed` **and** all three scanners `completed`.
+  - `summary` stays `null` unless scanners ran.
+- **Legacy failures:** `<status>:<category>` failure text is mapped to the category and a safe, actionable message.
+- **Worker:** reports a `RetrievalError` with its real category and public message.
+- **Report page:**
+  - Only `complete` gets the verified badge.
+  - Failed or cancelled scans show "SCAN FAILED / CANCELLED — NOT SCANNED", an alert with the reason and reason code, and "This is not a clean result". The header shows "— Not scanned"; scanners read "not run"; there are no severity tiles and no findings workflow.
+  - No retry is offered for size or safety-limit failures.
+  - Partial scans name the scanners that did not finish and never call an empty list clean.
+- **Home card:** zero findings are called clean only for `complete`.
+
+**Tests.** `src/test/scan-report-state.test.tsx`, 17 tests:
+- API projection for failed-before-scanning (the exact stored shape of job `RJ2D…`), structured and unknown legacy failures, partial (`completed_with_warnings`, and `completed` with a missing scanner), cancelled, in-progress and genuinely clean
+- the worker posting `archive_too_large`, and unexpected errors staying `scan_failed`
+- report page: failed, after reload, partial, cancelled, clean-with-zero-findings
+- home card
+
+Negative controls: verified badge for every finished state → 4 failed; raw legacy failure text → 4 failed; executor flattening → 1 failed.
+
+**Live evidence.**
+- **Local production build** (visible Chrome): the failed `RJ2D`-shaped job, before and after reload, shows the failed badge, the reason and `archive_too_large`, the "not a clean result" note, no tiles, and three "not run" scanners. The partial job shows the partial badge and is not called clean. The clean job shows the verified badge and "No Security Findings Detected".
+- **Production (`9cccccf`)**, job `RJ2D5vXW08VrNUvDAdKGKzlJEssWR4QB`:
+  - API: `reportState: failed`, `scanPerformed: false`, `summary: null`, `incompleteScanners` = all three, failure `archive_too_large` with "The repository archive is larger than the scan size limit, so no scanner ran."
+  - Visible Chrome, load and reload: no verified badge, failure alert with reason and code, no zero tiles, 3× "not run", no clean claim.
+  - Completed job `M0p3…` still shows "VERIFIED SCAN REPORT".
+
+### 7.2 `.patch` downloads needed `--unidiff-zero`: `27a3e75`
+
+**Root cause.** Generated hunks carried no context lines (`@@ -5,1 +5,1 @@`). Plain `git apply` anchors such a hunk to the end of the file, so any change that was not on a file's last line was rejected. Verification only passed because the worker used `git apply --unidiff-zero`.
+
+**Fix.**
+- **New `canonical-diff.ts`.** Strictly applies the generated diff to the real files at the scanned commit, then re-renders it with up to 3 context lines. It merges nearby hunks and handles "No newline at end of file" and CRLF. The result is accepted only if strictly applying the new diff reproduces exactly the same files.
+- **Preview.** Every preview is canonicalized this way. A patch that does not match the real file, or whose source cannot be fetched, is marked unsuitable instead of offered. This is stricter than before: a malformed LLM hunk or an evidence-based patch pointing at the wrong line used to pass a header-only check.
+- **Older zero-context remediations.** These are regenerated before approval or verification. If the diff hash changes, the approval is voided, the remediation returns to preview with the new diff, and the server answers `409 patch_regenerated`. The owner must approve the new exact diff, and the approval binding carries the new hash. The panel reloads the stored diff and clears the approval tick after any refused approval.
+- **Verification worker (`sandbox.ts`).** Uses plain `git apply` with no `--unidiff-zero`. After applying, it checks that the files equal the strict-apply result byte for byte (`patch_integrity_mismatch` otherwise). The PR path already used the same strict applier, so preview, approval, verification and PR now share one patch semantics.
+- **Verified remediations stay as they are.** Their approval and verification are bound to their exact stored diff, so it is not rewritten. Their downloads stay the old zero-context form.
+
+**Tests.** `src/test/patch-git-apply.test.ts`, 12 tests, using real `git` in a clean checkout of the exact commit:
+- production pipeline (`createPreview`): the FraudAi line-5-of-13 case (whose zero-context form plain git rejects), last line, first line, and `package.json`
+- a two-file patch
+- short and unusual files: 1 line, 2 lines, no trailing newline (end and middle), CRLF, two distant changes giving two hunks
+- `git apply --check` and plain `git apply` succeed; `git status` shows only the intended files; contents equal the strict-apply result byte for byte
+- a mismatching patch and a missing source are refused
+- the worker rescans exactly the approved tree, and rejects a zero-context mid-file patch, wrong context, and file creation
+- the legacy zero-context diff is regenerated (hash changes, approval void), then freshly approved with the new hash
+
+Fixtures were updated to canonical diffs. A stale patch is now refused at approval (`patch_does_not_apply`) instead of at verification.
+
+Negative controls: worker back on `--unidiff-zero` → 1 failed; preview not canonicalized → 5 failed; legacy upgrade disabled → 1 failed.
+
+**Live evidence (local production build, visible Chrome, real GitHub source and real scanners).**
+- **Preview.** For FraudAi `69581cd`, `backend/requirements.txt` line 5 of 13, the preview is `@@ -2,7 +2,7 @@` with 3 context lines each side. The download is byte-identical.
+- **Plain git.** In a clean checkout of `69581cd`, `git apply --check` and `git apply` succeed. `git status` shows only `backend/requirements.txt` (1 insertion, 1 deletion), and line 5 becomes `pytest==9.0.3`.
+- **Verification.** Approve, then in-process verification with plain `git apply` and the real Gitleaks, Semgrep and OSV, against the real 8-finding baseline: **"Fix Verified by Security Rescan"**, target resolved, no new findings, 28 s.
+- **Legacy remediation** (`ml/requirements.txt`, `@@ -6,1 +6,1 @@`): Approve → `409 patch_regenerated` → the diff shown changes to `@@ -3,4 +3,4 @@` with context, approval cleared, tick cleared → approved again (200), and the diff is unchanged since regeneration.
+
+**Production.** Generating a **new** patch in production needs a new owned scan, which is BLOCKED for this window (§9). Production downloads of the existing older remediations are unchanged, and they stay byte-identical to their stored diffs.
+
+### 7.3 Diff viewer ligatures: `9cccccf`
+
+**Root cause.** JetBrains Mono's ligatures and contextual alternates render `>=` as `≥` and merge `==`.
+
+**Fix.** A `.code-literal` utility (`font-variant-ligatures: none; font-feature-settings: "liga" 0, "clig" 0, "calt" 0, "dlig" 0`) on `DiffViewer`. That one component renders both the Auto-Fix preview and the pull-request confirmation dialog. Stored patch text is unchanged.
+
+**Tests.** `src/test/diff-viewer-literal.test.tsx`, 3 tests:
+- `>=`, `==`, `!=`, `<=`, `===`, `=>` and `->` are rendered literally, with no `≥≤≠⇒→`
+- the class and its CSS rule are present
+- both panels use this viewer
+
+Negative control: class removed → 1 failed.
+
+**Live evidence.**
+- **Local:** computed style `font-variant-ligatures: none`, features `"calt" 0, "clig" 0, "dlig" 0, "liga" 0`; the screenshot shows `pytest>=8.0` and `pytest==9.0.3` literally.
+- **Production:** the deployed stylesheet contains `.code-literal`, and the diff line's computed style is the same. The screenshot shows literal `>=` and `==`. No console errors.
+- **Not tested live:** the PR confirmation dialog in production, which needs an owned verified remediation and a connected GitHub user (§9). It renders the same component.
+
+**Build-cache note.** The first local build after this change served stale CSS from `.next/cache/turbopack`; the rule was missing. A clean build fixed it. The production deployment was checked in the browser for the same problem, and its stylesheet does contain the rule.
+
+### 7.4 Other observations
+
+- **Repository size:** FraudAi exceeds the 25 MB archive cap. The cap is unchanged, pending a separate size-limit review.
+- **Missing header:** the `.patch` download has no `X-Content-Type-Options: nosniff`. Not changed.
+
+## 8. Fix verification and deployment
+
+| Item | Result |
+|---|---|
+| Commits | `dd7cdd5` (Fix 1), `27a3e75` (Fix 2), `9cccccf` (Fix 3), pushed fast-forward from `9e9d5d9` |
+| `tsc --noEmit`, `eslint --max-warnings=0` | Pass after each fix |
+| `vitest run` (final) | 29 files passed, 3 skipped; **390 passed, 18 skipped, 0 failed**. Before the fixes: 358. |
+| `test:scanners` (real Gitleaks, Semgrep, OSV) | 61/61 (after Fix 2) |
+| `test:postgres` (disposable container) | 17/17 (after Fix 2; a first attempt failed only because Docker was not running) |
+| `next build` | Pass. `prisma:error` lines during prerender come from the unreachable local dev database and are unrelated. |
+| Vercel | `dpl_7wt3B6w6SBtsaz7duqZ3dmHiG2JP`, READY, target production, `githubCommitSha 9cccccf391abf4d373cf8967efdf2c5dcf2d39ba`, aliased to `vibeshield-ai-phi.vercel.app` |
+| `/api/health` | `healthy`; database healthy; dispatcher ready; warm worker disabled; `githubApp: configured` |
+
+## 9. Remaining blockers and owner actions
+
+1. **Real PR acceptance (scan → approve → rescan → PR → duplicate → altered diff on a live PR): BLOCKED.**
+   - **No suitable repository is in the installation.** It covers only FraudAi, which is over 25 MB.
+   - **Existing small repos don't work.** Job-portal and Chat-app have real OSV advisories, but against `package-lock.json`; VibeShield auto-fixes only `requirements.txt` and `package.json` declarations, so they correctly yield "manual review". The portfolio has no advisories. No PR will be opened on these real projects.
+   - **Needed from the owner:**
+     - authorize a dedicated disposable test repository and add **only** that repository to the VibeShield AI installation (not "All repositories")
+     - decide its contents; a real, currently vulnerable pinned dependency in `requirements.txt` gives an eligible fix
+   - **Then:** after the quota window resets (24 h after the `RJ2D…` submission, i.e. after **2026-10-30 16:06 UTC**), run at most one scan and the full flow on that job, without merging anything.
+2. **Private worker: pending, not deployed.** Private scans remain refused on every path.
+3. **Turnstile:** not configured.
+4. **`OWNER_SESSION_SECRET`:** not set.
+5. **PR #10 on FraudAi:** open, not merged, not modified.
+
+## 10. Test-profile cleanup
+
+- **GitHub sign-out:** the temporary GitHub-connected profile was signed out with GitHub's own **Sign out** for that browser session only; `logged_in` went from `yes` to `no`, and `user_session` was removed.
+- **Profiles deleted:** `~/.vibeshield-e2e/owner-profile`, plus the visitor, local and production-check profiles and the scratch clones. No session-cookie files remain.
+- **Already revoked:** the VibeShield GitHub authorization for that profile was revoked at GitHub by the earlier disconnect test (§6.2 #18).
+- **Kept:** evidence (logs with OAuth values redacted, and screenshots) in `~/.vibeshield-e2e/`.
+
+## 11. Evidence locations
+
+- `~/.vibeshield-e2e/state.json`: scan attempts and job ID
+- `~/.vibeshield-e2e/final-e2e.log`: scan run
+- `~/.vibeshield-e2e/connect-tests.log`: connect, scope and write-gate checks; OAuth `state` and `code_challenge` values redacted
+- `~/.vibeshield-e2e/evidence/*.png`: unsubmitted form, failed-scan report before the fix, connected, after disconnect
+- `~/.vibeshield-e2e/evidence/local-build/`: local visible-Chrome screenshots of the fixes and the downloaded `backend.patch`
+- `~/.vibeshield-e2e/evidence/prod-fixes/`: production screenshots of the fixed failed-scan report and the diff viewer
+- **Gap:** log lines after the refresh step were lost when the log file was replaced during redaction. The refresh and disconnect outcomes above come from the database, the audit log, and a re-check from the same browser.
+- **Production audit log** (`AuditEvent`), 2026-10-29 16:08–16:12 UTC:
+  - `pull_request / denied / not_connected`
+  - `github_connect / success`
+  - `github_disconnect / revoked`
+  - `pull_request / denied / not_connected`
