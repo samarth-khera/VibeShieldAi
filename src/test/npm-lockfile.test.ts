@@ -161,7 +161,9 @@ describe("npm lockfile remediation", () => {
     const rem = await createPreview(job.id, target.id, deps);
     expect(rem).toMatchObject({ eligibility: "potentially_breaking", affectedFiles: ["backend/package.json", "backend/package-lock.json"] });
     expect(rem.findingFingerprints).toHaveLength(9);
-    expect(rem.eligibilityReason).toMatch(/identical to running npm install multer@2\.5\.0 --package-lock-only/);
+    // Stored within the VARCHAR(500) column (the full text used to fail the insert with P2000).
+    expect(rem.eligibilityReason).toMatch(/^2\.5\.0 is the lowest multer release that fixes all 9 advisories/);
+    expect(rem.eligibilityReason.length).toBeLessThanOrEqual(500);
     expect(rem.unifiedDiff).toMatch(/^--- a\/backend\/package\.json\n\+\+\+ b\/backend\/package\.json\n@@ /);
     expect(rem.unifiedDiff).toContain('-    "multer": "^2.0.2"\n+    "multer": "^2.5.0"');
 

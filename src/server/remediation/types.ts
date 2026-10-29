@@ -145,3 +145,11 @@ export function toPublicRemediation(r: RemediationRecord): PublicRemediation {
     updatedAt: r.updatedAt.toISOString(),
   };
 }
+
+/** Remediation text columns and their database limits (characters), from prisma/schema.prisma. */
+export const REMEDIATION_TEXT_LIMITS = { patchSummary: 500, eligibilityReason: 500, branchName: 120, pullRequestUrl: 300 } as const;
+
+/** Free text shortened to fit its column instead of failing the write (Prisma P2000). */
+export function fitColumn(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}

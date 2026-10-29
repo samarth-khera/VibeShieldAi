@@ -101,6 +101,38 @@ describe.skipIf(!PG_URL)("PostgreSQL warm-worker queue (live database)", () => {
     await prisma?.$disconnect();
   });
 
+  it("stores a remediation whose explanation exceeds the 500-character column instead of failing with P2000", async () => {
+    // Production regression (2026-10-29): a 594-character npm explanation made prisma.remediation.create
+    // throw P2000, so the eligible fix's preview returned HTTP 500 and nothing was saved.
+    const [jobId] = await waitingJobs(1);
+    const long = `${"multer 2.5.0 fixes all advisories. ".repeat(17)}end`;
+    expect(long.length).toBeGreaterThan(500);
+    const created = await store.createRemediation({
+      id: randomUUID(),
+      scanJobId: jobId,
+      status: "preview",
+      findingFingerprints: ["fp-a"],
+      commitSha: "a".repeat(40),
+      patchSummary: long,
+      unifiedDiff: "",
+      affectedFiles: ["backend/package-lock.json"],
+      eligibility: "potentially_breaking",
+      eligibilityReason: long,
+      requiresRotation: false,
+      warnings: [],
+      approvedAt: null,
+      rescanStatus: null,
+      rescanSummary: null,
+      branchName: null,
+      pullRequestUrl: null,
+    });
+    expect(created.eligibilityReason).toHaveLength(500);
+    expect(created.eligibilityReason.endsWith("…")).toBe(true);
+    expect(created.patchSummary).toHaveLength(500);
+    const updated = await store.updateRemediation(jobId, created.id, { eligibilityReason: long });
+    expect(updated.eligibilityReason).toHaveLength(500);
+  });
+
   it("racing claims from two warm workers and the Actions pump never exceed the cap or claim a job twice", async () => {
     await waitingJobs(6);
     const executors = [

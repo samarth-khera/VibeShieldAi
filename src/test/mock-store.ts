@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { REMEDIATION_TEXT_LIMITS } from "@/server/remediation/types";
 import type { ScanStatus } from "@prisma/client";
 import { evaluateQuota, isWarmLease, WARM_LEASE_PREFIX } from "@/server/quota";
 import { verificationClaimOf, withVerificationClaim } from "@/server/remediation/claims";
@@ -379,6 +380,7 @@ export class InMemoryJobStore implements JobStore {
 
 
   async createRemediation(data: import("@/server/remediation/types").NewRemediation) {
+    assertColumnLimits(data);
     const record: import("@/server/remediation/types").RemediationRecord = {
       ...data,
       createdAt: new Date(),
@@ -404,6 +406,7 @@ export class InMemoryJobStore implements JobStore {
     remediationId: string,
     patch: Partial<import("@/server/remediation/types").RemediationRecord>,
   ) {
+    assertColumnLimits(patch);
     const list = this.remediations.get(scanJobId) || [];
     const index = list.findIndex((r) => r.id === remediationId);
     if (index === -1) throw new Error("Remediation not found");
@@ -422,6 +425,7 @@ export class InMemoryJobStore implements JobStore {
     from: readonly RemediationStatus[],
     patch: Partial<RemediationRecord>,
   ) {
+    assertColumnLimits(patch);
     const current = await this.getRemediation(scanJobId, remediationId);
     if (!current || !from.includes(current.status)) return null;
     return this.updateRemediation(scanJobId, remediationId, patch);
@@ -469,5 +473,15 @@ export class InMemoryJobStore implements JobStore {
       next.updatedAt = now;
       return { job: this.jobs.get(next.scanJobId)!, remediation: next, lease };
     });
+  }
+}
+
+/** PostgreSQL rejects over-length VARCHAR values (Prisma P2000); the test store must too. */
+function assertColumnLimits(data: Partial<Record<keyof typeof REMEDIATION_TEXT_LIMITS, unknown>>) {
+  for (const [column, max] of Object.entries(REMEDIATION_TEXT_LIMITS)) {
+    const v = data[column as keyof typeof REMEDIATION_TEXT_LIMITS];
+    if (typeof v === "string" && v.length > max) {
+      throw Object.assign(new Error(`P2000: value for Remediation.${column} is too long (${v.length} > ${max})`), { code: "P2000" });
+    }
   }
 }

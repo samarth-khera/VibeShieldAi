@@ -14,7 +14,7 @@ import { generateNpmLockfilePatch, isNpmLockfileFinding } from "./npm-lockfile";
 import { parseDiffByFile } from "./strict-apply";
 import { verificationClaimOf, withVerificationClaim } from "./claims";
 import { createRemediationPullRequest, type PullRequestState } from "./github-pr";
-import type { RemediationRecord, RescanComparison } from "./types";
+import { fitColumn, REMEDIATION_TEXT_LIMITS, type RemediationRecord, type RescanComparison } from "./types";
 import type { AuthDeps } from "../auth/service";
 
 export type RemediationDeps = {
@@ -224,11 +224,11 @@ export async function createPreview(
     status: "preview",
     findingFingerprints,
     commitSha: commitSha ?? "",
-    patchSummary,
+    patchSummary: fitColumn(patchSummary, REMEDIATION_TEXT_LIMITS.patchSummary),
     unifiedDiff,
     affectedFiles,
     eligibility: eligibility.eligibility,
-    eligibilityReason: eligibility.reason,
+    eligibilityReason: fitColumn(eligibility.reason, REMEDIATION_TEXT_LIMITS.eligibilityReason),
     requiresRotation: eligibility.requiresRotation,
     warnings: eligibility.warnings,
     approvedAt: null,

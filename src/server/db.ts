@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { fitColumn, REMEDIATION_TEXT_LIMITS } from "./remediation/types";
 import { verificationClaimOf, withVerificationClaim as withClaim } from "./remediation/claims";
 import { Prisma, PrismaClient } from "@prisma/client";
 import {
@@ -352,11 +353,11 @@ export const prismaJobStore: JobStore = {
           status: data.status,
           findingFingerprints: data.findingFingerprints as Prisma.InputJsonValue,
           commitSha: data.commitSha,
-          patchSummary: data.patchSummary,
+          patchSummary: fitColumn(data.patchSummary, REMEDIATION_TEXT_LIMITS.patchSummary),
           unifiedDiff: data.unifiedDiff,
           affectedFiles: data.affectedFiles as Prisma.InputJsonValue,
           eligibility: data.eligibility,
-          eligibilityReason: data.eligibilityReason,
+          eligibilityReason: fitColumn(data.eligibilityReason, REMEDIATION_TEXT_LIMITS.eligibilityReason),
           requiresRotation: data.requiresRotation,
           warnings: (data.warnings || []) as Prisma.InputJsonValue,
           approvedAt: data.approvedAt,
@@ -462,6 +463,10 @@ export const prismaJobStore: JobStore = {
 function remediationPatchData(patch: Partial<import("./remediation/types").RemediationRecord>) {
   return {
     ...patch,
+    ...(typeof patch.patchSummary === "string" ? { patchSummary: fitColumn(patch.patchSummary, REMEDIATION_TEXT_LIMITS.patchSummary) } : {}),
+    ...(typeof patch.eligibilityReason === "string"
+      ? { eligibilityReason: fitColumn(patch.eligibilityReason, REMEDIATION_TEXT_LIMITS.eligibilityReason) }
+      : {}),
     findingFingerprints: patch.findingFingerprints ? (patch.findingFingerprints as Prisma.InputJsonValue) : undefined,
     affectedFiles: patch.affectedFiles ? (patch.affectedFiles as Prisma.InputJsonValue) : undefined,
     warnings: patch.warnings ? (patch.warnings as Prisma.InputJsonValue) : undefined,
