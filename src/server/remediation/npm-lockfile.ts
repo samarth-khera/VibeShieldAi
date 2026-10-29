@@ -279,53 +279,89 @@ export type NpmUpgradeInput = {
 };
 
 export type NpmUpgradeResult = {
+  /** Unchanged for a transitive dependency. */
   manifestText: string;
   lockText: string;
-  oldSpec: string;
-  newSpec: string;
+  dependency: NpmDependency;
+  /** The declared range before and after (direct dependencies only). */
+  oldSpec: string | null;
+  newSpec: string | null;
   /** Lockfile locations npm prunes because nothing depends on them any more. */
   removed: string[];
 };
 
-/** Lock entry fields npm copies from the package manifest (arborist's pkgMetaKeys we support). */
+/** How the project depends on a package: declared in package.json, or only through other packages. */
+export type NpmDependency =
+  | { kind: "direct"; section: "dependencies" | "devDependencies" | "optionalDependencies"; spec: string }
+  | { kind: "transitive"; dependents: { location: string; name: string; version: string; spec: string }[] };
+
+const packageNameAt = (loc: string) => loc.slice(loc.lastIndexOf("node_modules/") + "node_modules/".length);
+
+/**
+ * npm's lockfile entry for a registry package: the manifest fields in arborist's pkgMetaKeys, plus
+ * resolved/integrity from the registry. Every key npm would copy is either handled here or refused;
+ * none is silently dropped.
+ */
+const NPM_META_KEYS = [
+  "version",
+  "dependencies",
+  "peerDependencies",
+  "peerDependenciesMeta",
+  "optionalDependencies",
+  "bundleDependencies",
+  "acceptDependencies",
+  "funding",
+  "engines",
+  "os",
+  "cpu",
+  "_integrity",
+  "license",
+  "_hasShrinkwrap",
+  "hasInstallScript",
+  "bin",
+  "deprecated",
+  "workspaces",
+] as const;
+
 function lockEntryFor(m: NpmVersionManifest, previous: LockEntry): LockEntry {
   const nonEmpty = (v: unknown) => (isObj(v) ? Object.keys(v).length > 0 : Array.isArray(v) ? v.length > 0 : Boolean(v));
-  for (const key of [
-    "hasInstallScript",
-    "deprecated",
-    "bundleDependencies",
-    "bundledDependencies",
-    "_hasShrinkwrap",
-    "os",
-    "cpu",
-    "peerDependencies",
-    "optionalDependencies",
-    "acceptDependencies",
-    "workspaces",
-  ]) {
-    if (nonEmpty(m[key])) refuse(`${m.name}@${m.version} declares "${key}", which VibeShield does not update automatically.`);
+  const entry: LockEntry = { version: m.version, resolved: m.dist.tarball, integrity: m.dist.integrity };
+  for (const key of NPM_META_KEYS) {
+    const value = m[key];
+    if (!nonEmpty(value) || key === "version" || key === "_integrity") continue;
+    switch (key) {
+      case "dependencies":
+        entry.dependencies = value as Record<string, string>;
+        break;
+      case "peerDependenciesMeta":
+        entry.peerDependenciesMeta = value as Record<string, { optional?: boolean }>;
+        break;
+      case "engines":
+        entry.engines = value;
+        break;
+      case "license": {
+        const license = isObj(value) && typeof value.type === "string" ? value.type : value;
+        if (typeof license !== "string") refuse(`${m.name}@${m.version} has an unrecognized license field.`);
+        entry.license = license;
+        break;
+      }
+      case "funding": {
+        const ok = (f: unknown) => isObj(f) && typeof f.url === "string";
+        if (!(ok(value) || (Array.isArray(value) && value.every(ok)))) refuse(`${m.name}@${m.version} has an unrecognized funding field.`);
+        entry.funding = value;
+        break;
+      }
+      case "bin":
+        if (JSON.stringify(value) !== JSON.stringify(previous.bin)) refuse(`${m.name}@${m.version} changes its executables ("bin").`);
+        entry.bin = value;
+        break;
+      default:
+        // Install scripts, platform restrictions, bundled/peer/optional dependencies, deprecation,
+        // shrinkwraps and workspaces need npm's full resolution (or a human) to update correctly.
+        refuse(`${m.name}@${m.version} declares "${key.replace(/^_/, "")}", which VibeShield does not update automatically.`);
+    }
   }
-  if (nonEmpty(m.bin) && JSON.stringify(m.bin) !== JSON.stringify(previous.bin)) {
-    refuse(`${m.name}@${m.version} changes its executables ("bin").`);
-  }
-  const entry: LockEntry = {
-    version: m.version,
-    resolved: m.dist.tarball,
-    integrity: m.dist.integrity,
-  };
-  const license = isObj(m.license) && typeof m.license.type === "string" ? m.license.type : m.license;
-  if (license !== undefined && license !== null && license !== "") {
-    if (typeof license !== "string") refuse(`${m.name}@${m.version} has an unrecognized license field.`);
-    entry.license = license;
-  }
-  if (nonEmpty(m.dependencies)) entry.dependencies = m.dependencies as Record<string, string>;
-  if (nonEmpty(m.engines)) entry.engines = m.engines;
-  if (nonEmpty(m.funding)) {
-    const ok = (f: unknown) => isObj(f) && typeof f.url === "string";
-    if (!(ok(m.funding) || (Array.isArray(m.funding) && m.funding.every(ok)))) refuse(`${m.name}@${m.version} has an unrecognized funding field.`);
-    entry.funding = m.funding;
-  }
-  if (nonEmpty(m.bin)) entry.bin = m.bin;
+  if (nonEmpty(m.bundledDependencies)) refuse(`${m.name}@${m.version} declares "bundledDependencies", which VibeShield does not update automatically.`);
   return entry;
 }
 
@@ -344,69 +380,61 @@ export function planNpmUpgrade(input: NpmUpgradeInput): NpmUpgradeResult {
     refuse(`The registry tarball or integrity for ${name}@${toVersion} is not in the expected form.`);
   }
 
-  // The lockfile must be exactly what npm writes, so the rewrite changes only what npm would change.
-  if (input.lockText.includes("\r")) refuse("package-lock.json uses CRLF line endings.");
-  let lock: { lockfileVersion?: number; packages?: Packages; dependencies?: unknown } & Record<string, unknown>;
-  try {
-    lock = JSON.parse(input.lockText);
-  } catch {
-    return refuse("package-lock.json is not valid JSON.");
-  }
-  if (lock.lockfileVersion !== 3 || !isObj(lock.packages) || lock.dependencies !== undefined) {
-    refuse("Only npm lockfileVersion 3 is updated automatically.");
-  }
-  const indent = /^\{\n([ \t]+)"/.exec(input.lockText)?.[1] ?? "  ";
-  if (stringifyNpmLock(lock, indent) !== input.lockText) refuse("package-lock.json is not in the exact format npm writes.");
-  const packages = lock.packages!;
-  const root = packages[""];
-  if (!root) refuse("package-lock.json has no root package entry.");
-  for (const [loc, e] of Object.entries(packages)) {
-    if (e.link || e.inBundle || (loc === "" && (e.workspaces || e.peerDependencies))) {
-      refuse("Lockfiles with links, workspaces, bundled or root peer dependencies are not updated automatically.");
-    }
-  }
-
-  // A directly declared registry dependency, installed once, at the version the scan found.
+  const { lock, indent, packages } = readLock(input.lockText);
   const loc = `node_modules/${name}`;
   const current = packages[loc];
-  if (!current || current.version !== fromVersion) refuse(`${name}@${fromVersion} is not installed at the top level of this lockfile.`);
-  if (!current.resolved?.startsWith(REGISTRY)) refuse(`${name} is not installed from the public npm registry.`);
-  const elsewhere = Object.keys(packages).filter((k) => k !== loc && (k.endsWith(`/node_modules/${name}`)));
-  if (elsewhere.length) refuse(`${name} is also installed as a nested dependency (${elsewhere[0]}).`);
-  const section = (["dependencies", "devDependencies", "optionalDependencies"] as const).find((s) => typeof root[s]?.[name] === "string");
-  if (!section) refuse(`${name} is not a direct dependency of this project, so it is only upgraded through its parent package.`);
-  const oldSpec = root[section!]![name];
-  const specMatch = /^(\^|~)?(\d+\.\d+\.\d+)$/.exec(oldSpec);
-  if (!specMatch) refuse(`The declared range "${oldSpec}" for ${name} is not a plain version or ^/~ range.`);
-  const newSpec = `${specMatch![1] ?? ""}${toVersion}`;
+  const dependency = inspectDependency(packages, name, fromVersion);
 
-  let manifest: Record<string, Record<string, string> | unknown>;
-  try {
-    manifest = JSON.parse(input.manifestText);
-  } catch {
-    return refuse("package.json is not valid JSON.");
-  }
-  if ((manifest[section!] as Record<string, string> | undefined)?.[name] !== oldSpec) {
-    refuse(`package.json and package-lock.json disagree about ${name}.`);
+  let oldSpec: string | null = null;
+  let newSpec: string | null = null;
+  let manifest: Record<string, Record<string, string> | unknown> = {};
+  if (dependency.kind === "direct") {
+    oldSpec = dependency.spec;
+    const specMatch = /^(\^|~)?(\d+\.\d+\.\d+)$/.exec(oldSpec);
+    if (!specMatch) refuse(`The declared range "${oldSpec}" for ${name} is not a plain version or ^/~ range.`);
+    newSpec = `${specMatch![1] ?? ""}${toVersion}`;
+    try {
+      manifest = JSON.parse(input.manifestText);
+    } catch {
+      return refuse("package.json is not valid JSON.");
+    }
+    if ((manifest[dependency.section] as Record<string, string> | undefined)?.[name] !== oldSpec) {
+      refuse(`package.json and package-lock.json disagree about ${name}.`);
+    }
+  } else {
+    // npm update semantics: the new version must satisfy every range that depends on it, so
+    // package.json and the dependents stay as they are.
+    for (const d of dependency.dependents) {
+      if (!satisfies(toVersion, d.spec)) {
+        refuse(`${name}@${toVersion} is outside the range "${d.spec}" that ${d.name}@${d.version} declares; ${d.name} itself must be upgraded.`);
+      }
+    }
   }
 
   // npm's flags must be reproducible on the lockfile as committed before we trust them on the result.
   const before = computeFlags(packages);
   for (const [l, e] of Object.entries(packages)) {
     if (l === "") continue;
-    if (!before.reachable.has(l)) refuse(`package-lock.json contains packages nothing depends on (${l}); run npm install first.`);
-    if (!sameSet(before.flags.get(l)!, recordedFlags(e))) refuse(`package-lock.json dependency flags for ${l} differ from npm's; run npm install first.`);
+    // A lockfile written by another npm version: npm would also rewrite unrelated entries, so an
+    // exact, minimal change cannot be produced here.
+    if (!before.reachable.has(l) || !sameSet(before.flags.get(l)!, recordedFlags(e))) {
+      refuse(
+        `This package-lock.json does not match what the current npm writes (first difference: ${l}), so npm would also rewrite unrelated entries. VibeShield only proposes minimal lockfile changes; update it with npm in the project.`,
+      );
+    }
   }
 
   // Apply: root spec, the upgraded entry, then prune and re-flag.
   const next: Packages = structuredClone(packages);
-  next[""][section!] = { ...next[""][section!], [name]: newSpec };
+  if (dependency.kind === "direct") next[""][dependency.section] = { ...next[""][dependency.section], [name]: newSpec! };
   next[loc] = lockEntryFor(m, current);
   for (const [dep, range] of Object.entries(next[loc].dependencies ?? {})) {
     const at = resolveFrom(next, loc, dep);
-    if (!at) refuse(`${name}@${toVersion} needs ${dep}, which is not in the lockfile; npm would install a new package.`);
+    if (!at) refuse(`${name}@${toVersion} needs ${dep}, which is not installed yet, so npm would add packages. VibeShield only proposes single-package updates.`);
     if (!satisfies(String(next[at!].version), range)) {
-      refuse(`${name}@${toVersion} needs ${dep}@${range}, but ${next[at!].version} is locked; npm would change other packages.`);
+      refuse(
+        `${name}@${toVersion} needs ${dep}@${range}, but ${dep} ${next[at!].version} is installed, so npm would upgrade ${dep} too. VibeShield only proposes single-package updates.`,
+      );
     }
   }
   const after = computeFlags(next);
@@ -418,18 +446,76 @@ export function planNpmUpgrade(input: NpmUpgradeInput): NpmUpgradeResult {
     for (const f of after.flags.get(l)!) e[f] = true;
   }
 
+  const lockText = stringifyNpmLock({ ...lock, packages: next }, indent);
+  if (dependency.kind === "transitive") {
+    return { manifestText: input.manifestText, lockText, dependency, oldSpec, newSpec, removed };
+  }
+
   // package.json: change only the one value, in place, keeping the file's formatting.
   const lines = input.manifestText.split("\n");
-  const keyRe = new RegExp(`^(\\s*"${name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}"\\s*:\\s*)"${oldSpec.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"(,?\\s*)$`);
+  const keyRe = new RegExp(`^(\\s*"${name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}"\\s*:\\s*)"${oldSpec!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"(,?\\s*)$`);
   const hits = lines.flatMap((l, i) => (keyRe.test(l) ? [i] : []));
   if (hits.length !== 1) refuse(`Could not locate the single "${name}" declaration in package.json.`);
   lines[hits[0]] = lines[hits[0]].replace(keyRe, `$1"${newSpec}"$2`);
   const manifestText = lines.join("\n");
   const expected = structuredClone(manifest) as Record<string, Record<string, string>>;
-  expected[section!][name] = newSpec;
+  expected[dependency.section][name] = newSpec!;
   if (JSON.stringify(JSON.parse(manifestText)) !== JSON.stringify(expected)) refuse("package.json could not be updated in place.");
 
-  return { manifestText, lockText: stringifyNpmLock({ ...lock, packages: next }, indent), oldSpec, newSpec, removed };
+  return { manifestText, lockText, dependency, oldSpec, newSpec, removed };
+}
+
+type Lock = { lockfileVersion?: number; packages?: Packages; dependencies?: unknown } & Record<string, unknown>;
+
+/** Parses a lockfile and requires exactly the format npm writes, so a rewrite changes only what npm would. */
+function readLock(lockText: string): { lock: Lock; indent: string; packages: Packages } {
+  if (lockText.includes("\r")) refuse("package-lock.json uses CRLF line endings.");
+  let lock: Lock;
+  try {
+    lock = JSON.parse(lockText);
+  } catch {
+    return refuse("package-lock.json is not valid JSON.");
+  }
+  if (lock.lockfileVersion !== 3 || !isObj(lock.packages) || lock.dependencies !== undefined) {
+    refuse("Only npm lockfileVersion 3 is updated automatically.");
+  }
+  const indent = /^\{\n([ \t]+)"/.exec(lockText)?.[1] ?? "  ";
+  if (stringifyNpmLock(lock, indent) !== lockText) refuse("package-lock.json is not in the exact format npm writes.");
+  const packages = lock.packages!;
+  if (!packages[""]) refuse("package-lock.json has no root package entry.");
+  for (const [loc, e] of Object.entries(packages)) {
+    if (e.link || e.inBundle || (loc === "" && (e.workspaces || e.peerDependencies))) {
+      refuse("Lockfiles with links, workspaces, bundled or root peer dependencies are not updated automatically.");
+    }
+  }
+  return { lock, indent, packages };
+}
+
+/** A registry package installed once, at the top level, at the version the scan found. */
+function inspectDependency(packages: Packages, name: string, fromVersion: string): NpmDependency {
+  const loc = `node_modules/${name}`;
+  const current = packages[loc];
+  if (!current || current.version !== fromVersion) refuse(`${name}@${fromVersion} is not installed at the top level of this lockfile.`);
+  if (!current.resolved?.startsWith(REGISTRY)) refuse(`${name} is not installed from the public npm registry.`);
+  const elsewhere = Object.keys(packages).filter((k) => k !== loc && k.endsWith(`/node_modules/${name}`));
+  if (elsewhere.length) refuse(`${name} is also installed as a nested dependency (${elsewhere[0]}).`);
+  const root = packages[""];
+  const section = (["dependencies", "devDependencies", "optionalDependencies"] as const).find((s) => typeof root[s]?.[name] === "string");
+  if (section) return { kind: "direct", section, spec: root[section]![name] };
+  const dependents = Object.keys(packages).flatMap((l) => {
+    if (l === "" || !edgesOf(packages, l).some((e) => e.to === loc)) return [];
+    const e = packages[l];
+    const spec = e.optionalDependencies?.[name] ?? e.peerDependencies?.[name] ?? e.dependencies?.[name];
+    return spec ? [{ location: l, name: packageNameAt(l), version: String(e.version), spec }] : [];
+  });
+  if (!dependents.length) refuse(`Nothing in package-lock.json depends on ${name}; run npm install first.`);
+  return { kind: "transitive", dependents };
+}
+
+/** How the lockfile depends on `name` (throws NpmUpgradeError when it cannot be upgraded automatically). */
+export function inspectNpmDependency(lockText: string, name: string, fromVersion: string): NpmDependency {
+  if (!NAME_RE.test(name)) refuse(`Invalid package name "${name}".`);
+  return inspectDependency(readLock(lockText).packages, name, fromVersion);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -462,6 +548,37 @@ export type NpmLockfilePatch = {
  * Upgrades the vulnerable package to the lowest release that fixes every advisory the scan reported
  * for that installed version, updating package.json and package-lock.json together.
  */
+/** Published, non-deprecated release versions of a package (npm's abbreviated metadata). */
+export async function fetchNpmReleaseVersions(name: string, fetchImpl: FetchLike): Promise<string[]> {
+  if (!NAME_RE.test(name)) refuse(`Invalid package name "${name}".`);
+  const path = name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
+  let res: Response;
+  try {
+    res = await fetchImpl(`${REGISTRY}${path}`, {
+      headers: { Accept: "application/vnd.npm.install-v1+json", "User-Agent": "VibeShield-AI-Remediation" },
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    return refuse(`The npm registry could not be reached to list ${name} releases.`);
+  }
+  const text = res.ok ? await res.text() : "";
+  if (!res.ok || text.length > 25_000_000) refuse(`The npm registry did not return the ${name} release list.`);
+  const doc = JSON.parse(text) as { name?: string; versions?: Record<string, { deprecated?: unknown }> };
+  if (doc.name !== name || !isObj(doc.versions)) refuse(`The npm registry returned unexpected metadata for ${name}.`);
+  return Object.entries(doc.versions!)
+    .filter(([v, meta]) => parseVersion(v) && !meta?.deprecated)
+    .map(([v]) => v);
+}
+
+const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
+
+/**
+ * Builds the fix for a vulnerable npm package found in package-lock.json:
+ *  - declared in package.json: the lowest stable release fixing every advisory the scan reported
+ *    for that installed version (`npm install <pkg>@<version>`), updating package.json and the lockfile;
+ *  - only reached through other packages: the highest release every dependent's declared range
+ *    allows (`npm update <pkg>`), if that release contains the fix; package.json is unchanged.
+ */
 export async function generateNpmLockfilePatch(params: {
   finding: DependencyFinding;
   /** All findings of the same scan (siblings for the same package are fixed together). */
@@ -473,15 +590,50 @@ export async function generateNpmLockfilePatch(params: {
   const { finding } = params;
   const pkg = pkgOf(finding);
   if (!pkg.name || !pkg.version) return refuse("The finding does not name the installed package and version.");
+  if (typeof params.lockText !== "string" || !params.lockText) return refuse(`${finding.filePath} could not be read at the scanned commit.`);
   if (!pkg.fixedVersion || !parseVersion(pkg.fixedVersion)) {
     return refuse(`No stable fixed release of ${pkg.name} is published for ${finding.ruleId}.`);
   }
+  if (!parseVersion(pkg.version)) return refuse(`The installed ${pkg.name} version "${pkg.version}" is not a release version.`);
+  if (compareVersions(pkg.fixedVersion, pkg.version) <= 0) {
+    return refuse(
+      `The advisory's recorded fix (${pkg.fixedVersion}) is not newer than the installed ${pkg.name} ${pkg.version}: it belongs to another release line, so the fixed version for ${pkg.version} is not known.`,
+    );
+  }
+  // Every advisory the scan reported for this exact installed package, with a usable fixed version.
   const related = params.scanFindings.filter((f) => {
     const p = pkgOf(f);
-    return f.filePath === finding.filePath && isNpmLockfileFinding(f) && p.name === pkg.name && p.version === pkg.version && p.fixedVersion && parseVersion(p.fixedVersion);
+    return (
+      f.fingerprint !== finding.fingerprint &&
+      f.filePath === finding.filePath &&
+      isNpmLockfileFinding(f) &&
+      p.name === pkg.name &&
+      p.version === pkg.version &&
+      !!p.fixedVersion &&
+      !!parseVersion(p.fixedVersion) &&
+      compareVersions(p.fixedVersion, pkg.version!) > 0
+    );
   });
-  const targets = [finding, ...related.filter((f) => f.fingerprint !== finding.fingerprint)];
-  const toVersion = targets.map((f) => pkgOf(f).fixedVersion!).reduce((a, b) => (compareVersions(a, b) >= 0 ? a : b));
+  const fixedOf = (f: DependencyFinding) => pkgOf(f).fixedVersion!;
+  const dependency = inspectNpmDependency(params.lockText, pkg.name, pkg.version);
+
+  let toVersion: string;
+  let targets: DependencyFinding[];
+  if (dependency.kind === "direct") {
+    targets = [finding, ...related];
+    toVersion = targets.map(fixedOf).reduce((a, b) => (compareVersions(a, b) >= 0 ? a : b));
+  } else {
+    const ranges = dependency.dependents.map((d) => `${d.name}@${d.version} requires "${d.spec}"`).join(", ");
+    const allowed = (await fetchNpmReleaseVersions(pkg.name, params.fetchImpl)).filter((v) => dependency.dependents.every((d) => satisfies(v, d.spec)));
+    const best = allowed.reduce<string | null>((a, b) => (a === null || compareVersions(b, a) > 0 ? b : a), null);
+    if (!best || compareVersions(best, pkg.fixedVersion) < 0) {
+      return refuse(
+        `${pkg.name} is not in package.json; it is installed because ${ranges}. The fix (${pkg.fixedVersion}) is outside that range${best ? ` (newest allowed: ${best})` : ""}, so ${dependency.dependents.map((d) => d.name).join(" and ")} must be upgraded first.`,
+      );
+    }
+    toVersion = best;
+    targets = [finding, ...related.filter((f) => compareVersions(fixedOf(f), best) <= 0)];
+  }
 
   const dir = finding.filePath.includes("/") ? finding.filePath.slice(0, finding.filePath.lastIndexOf("/") + 1) : "";
   const manifestPath = `${dir}package.json`;
@@ -490,18 +642,32 @@ export async function generateNpmLockfilePatch(params: {
   const registryManifest = await fetchNpmVersionManifest(pkg.name, toVersion, params.fetchImpl);
   const plan = planNpmUpgrade({ manifestText, lockText: params.lockText, name: pkg.name, fromVersion: pkg.version, toVersion, registryManifest });
 
-  const ids = targets.map((f) => f.ruleId);
-  const pruned = plan.removed.length ? ` npm no longer needs ${plan.removed.length} package(s), which are removed from the lockfile as npm would.` : "";
+  // Kept short: it is stored in a VARCHAR(500) column. The targeted advisories travel as
+  // findingFingerprints and are listed in the pull request body.
+  const advisories = `${targets.length} ${plural(targets.length, "advisory", "advisories")}`;
+  const pruned = plan.removed.length ? `; ${plan.removed.length} package(s) npm no longer needs are removed` : "";
+  const integrity = `the npm registry's published tarball and sha512 integrity for ${toVersion}${pruned}`;
+  const fingerprints = targets.map((f) => f.fingerprint);
+  if (plan.dependency.kind === "transitive") {
+    const parents = plan.dependency.dependents.map((d) => `${d.name}@${d.version} ("${d.spec}")`).join(", ");
+    return {
+      files: [{ path: finding.filePath, before: params.lockText, after: plan.lockText }],
+      patchSummary: `Update ${pkg.name} ${pkg.version} → ${toVersion} in ${finding.filePath} (transitive; fixes ${advisories}; package.json unchanged)`,
+      reason:
+        `${pkg.name} is not in package.json; ${parents} installs it. ${toVersion} is the newest release that range allows and fixes ${advisories} reported for ${pkg.version}. ` +
+        `Only package-lock.json changes, using ${integrity}. Same result as \`npm update ${pkg.name} --package-lock-only\`.`,
+      findingFingerprints: fingerprints,
+    };
+  }
   return {
     files: [
       { path: manifestPath, before: manifestText, after: plan.manifestText },
       { path: finding.filePath, before: params.lockText, after: plan.lockText },
     ],
-    patchSummary: `Upgrade ${pkg.name} ${pkg.version} → ${toVersion} in ${manifestPath} and ${finding.filePath} (fixes ${ids.length} advisor${ids.length === 1 ? "y" : "ies"})`,
+    patchSummary: `Upgrade ${pkg.name} ${pkg.version} → ${toVersion} in ${manifestPath} and ${finding.filePath} (fixes ${advisories})`,
     reason:
-      `${toVersion} is the lowest ${pkg.name} release that fixes all ${ids.length} advisor${ids.length === 1 ? "y" : "ies"} reported for ${pkg.version} in this scan (${ids.join(", ")}). ` +
-      `The declared range changes from "${plan.oldSpec}" to "${plan.newSpec}", and the lockfile entry uses the npm registry's published tarball and integrity for ${toVersion}.${pruned} ` +
-      `The result is identical to running npm install ${pkg.name}@${toVersion} --package-lock-only.`,
-    findingFingerprints: targets.map((f) => f.fingerprint),
+      `${toVersion} is the lowest ${pkg.name} release that fixes all ${advisories} reported for ${pkg.version} in this scan. ` +
+      `package.json: "${plan.oldSpec}" → "${plan.newSpec}"; the lockfile entry uses ${integrity}. Same result as \`npm install ${pkg.name}@${toVersion} --package-lock-only\`.`,
+    findingFingerprints: fingerprints,
   };
 }

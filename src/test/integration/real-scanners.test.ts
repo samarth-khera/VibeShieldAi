@@ -219,4 +219,37 @@ describe.skipIf(missing.length > 0)("Real scanners: npm lockfile fix for Job-por
     expect(result.rescanStatus).toBe("verified");
     expect(result.rescanFindings.filter((f) => f.packageInfo?.name === "multer")).toEqual([]);
   }, 180_000);
+
+  it("verifies the transitive proxy-addr update (npm update semantics) with a full rescan", async () => {
+    const proxy = baseline.find((f) => f.scanner === "osv-scanner" && f.packageInfo?.name === "proxy-addr");
+    expect(proxy).toBeDefined();
+    const patch = await generateNpmLockfilePatch({
+      finding: proxy!,
+      scanFindings: baseline,
+      lockText: files["backend/package-lock.json"],
+      readFile: async (p) => files[p],
+      fetchImpl: fetch,
+    });
+    expect(patch.files.map((f) => f.path)).toEqual(["backend/package-lock.json"]); // package.json unchanged
+    const diff = patch.files.map((f) => renderFileDiff(f.path, f.before, f.after)).join("");
+    console.log(`[npm-fix] ${patch.patchSummary}`);
+    const result = await verifyRemediationOnSnapshot({
+      owner: "samarth-khera",
+      repo: "Job-portal",
+      commitSha: JP_SHA,
+      unifiedDiff: diff,
+      targetedFingerprints: patch.findingFingerprints,
+      baselineFindings: baseline.map(toBaselineFinding),
+      config: getConfig(),
+      fetchImpl: async (url: string) => {
+        if (url === `https://api.github.com/repos/samarth-khera/Job-portal/tarball/${JP_SHA}`) return new Response(new Uint8Array(tarball), { status: 200 });
+        throw new Error(`Unexpected request: ${url}`);
+      },
+    });
+    expect(result.summary.scannerStatuses).toEqual({ gitleaks: "completed", semgrep: "completed", osvScanner: "completed" });
+    expect(result.summary.resolvedFingerprints).toEqual(patch.findingFingerprints);
+    expect(result.summary.regressions).toEqual([]);
+    expect(result.rescanStatus).toBe("verified");
+    expect(result.rescanFindings.filter((f) => f.packageInfo?.name === "proxy-addr")).toEqual([]);
+  }, 180_000);
 });

@@ -18,6 +18,7 @@ const read = (f: string) => readFileSync(path.join(FIX, f), "utf8");
 const MANIFEST = read("original.package.json");
 const LOCK = read("original.package-lock.json");
 const REGISTRY = JSON.parse(read("registry-multer-2.5.0.json")) as NpmVersionManifest;
+const PROXY_ADDR = JSON.parse(read("registry-proxy-addr-2.0.8.json")) as NpmVersionManifest;
 const SHA = "7f90143a47c6280f6bcf9d55bb7c4767a48c1542";
 
 const plan = (over: Partial<Parameters<typeof planNpmUpgrade>[0]> = {}) =>
@@ -65,11 +66,16 @@ const finding = (id: string, fixed: string | null, over: Record<string, unknown>
   ...over,
 });
 
+const RECORDED: Record<string, string> = {
+  "https://registry.npmjs.org/multer/2.5.0": read("registry-multer-2.5.0.json"),
+  "https://registry.npmjs.org/proxy-addr/2.0.8": read("registry-proxy-addr-2.0.8.json"),
+  "https://registry.npmjs.org/proxy-addr": read("registry-proxy-addr.versions.json"),
+  "https://registry.npmjs.org/brace-expansion": read("registry-brace-expansion.versions.json"),
+};
 function registryFetch(calls: { url: string; headers: Headers }[]) {
   return async (url: string, init?: RequestInit) => {
     calls.push({ url, headers: new Headers(init?.headers) });
-    if (url === "https://registry.npmjs.org/multer/2.5.0") return new Response(JSON.stringify(REGISTRY), { status: 200 });
-    return new Response("{}", { status: 404 });
+    return RECORDED[url] ? new Response(RECORDED[url], { status: 200 }) : new Response("{}", { status: 404 });
   };
 }
 
@@ -104,6 +110,57 @@ describe("npm lockfile upgrade reproduces npm exactly", () => {
       resolved: "https://registry.npmjs.org/multer/-/multer-2.5.0.tgz",
       integrity: REGISTRY.dist.integrity,
     });
+  });
+});
+
+describe("transitive dependencies (npm update semantics)", () => {
+  const proxyAddr = (fixed: string, over: Record<string, unknown> = {}) =>
+    finding("GHSA-jqcg-44mw-7w3h", fixed, { packageInfo: { name: "proxy-addr", version: "2.0.7", ecosystem: "npm", fixedVersion: fixed }, ...over });
+
+  it("updates proxy-addr within express's range exactly as `npm update proxy-addr` does, leaving package.json alone", async () => {
+    const calls: { url: string; headers: Headers }[] = [];
+    const p = await generateNpmLockfilePatch({
+      finding: proxyAddr("2.0.8"),
+      scanFindings: [proxyAddr("2.0.8")],
+      lockText: LOCK,
+      readFile: async () => MANIFEST,
+      fetchImpl: registryFetch(calls),
+    });
+    expect(p.files.map((f) => f.path)).toEqual(["backend/package-lock.json"]);
+    expect(p.files[0].after).toBe(read("npm-update-proxy-addr.package-lock.json"));
+    expect(p.patchSummary).toBe("Update proxy-addr 2.0.7 → 2.0.8 in backend/package-lock.json (transitive; fixes 1 advisory; package.json unchanged)");
+    expect(p.reason).toMatch(/express@5\.1\.0 \("\^2\.0\.7"\) installs it\. 2\.0\.8 is the newest release that range allows/);
+    expect(p.reason).toMatch(/Same result as `npm update proxy-addr --package-lock-only`/);
+    expect(p.reason.length).toBeLessThanOrEqual(500);
+    // The release list and the chosen version's metadata come from the public registry, without credentials.
+    expect(calls.map((c) => c.url)).toEqual(["https://registry.npmjs.org/proxy-addr", "https://registry.npmjs.org/proxy-addr/2.0.8"]);
+    expect(calls.every((c) => c.headers.get("authorization") === null)).toBe(true);
+  });
+
+  it("explains why a fix outside the parent's range needs the parent upgraded instead of forcing it", async () => {
+    const brace = (id: string, fixed: string) =>
+      finding(id, fixed, { packageInfo: { name: "brace-expansion", version: "1.1.12", ecosystem: "npm", fixedVersion: fixed } });
+    await expect(
+      generateNpmLockfilePatch({
+        finding: brace("GHSA-qhr7-859c-m2p7", "5.0.11"),
+        scanFindings: [brace("GHSA-qhr7-859c-m2p7", "5.0.11"), brace("GHSA-rgw5-rvv9-x895", "1.1.18")],
+        lockText: LOCK,
+        readFile: async () => MANIFEST,
+        fetchImpl: registryFetch([]),
+      }),
+    ).rejects.toThrow(/brace-expansion is not in package\.json; it is installed because minimatch@3\.1\.2 requires "\^1\.1\.7"\. The fix \(5\.0\.11\) is outside that range \(newest allowed: 1\.1\.\d+\), so minimatch must be upgraded first/);
+  });
+
+  it("does not trust an advisory fix recorded for another release line", async () => {
+    await expect(
+      generateNpmLockfilePatch({
+        finding: finding("GHSA-old-line", "1.4.4"),
+        scanFindings: [],
+        lockText: LOCK,
+        readFile: async () => MANIFEST,
+        fetchImpl: registryFetch([]),
+      }),
+    ).rejects.toThrow(/recorded fix \(1\.4\.4\) is not newer than the installed multer 2\.0\.2: it belongs to another release line/);
   });
 });
 
@@ -161,8 +218,7 @@ describe("npm lockfile remediation", () => {
     const rem = await createPreview(job.id, target.id, deps);
     expect(rem).toMatchObject({ eligibility: "potentially_breaking", affectedFiles: ["backend/package.json", "backend/package-lock.json"] });
     expect(rem.findingFingerprints).toHaveLength(9);
-    // Stored within the VARCHAR(500) column (the full text used to fail the insert with P2000).
-    expect(rem.eligibilityReason).toMatch(/^2\.5\.0 is the lowest multer release that fixes all 9 advisories/);
+    expect(rem.eligibilityReason).toMatch(/Same result as `npm install multer@2\.5\.0 --package-lock-only`/);
     expect(rem.eligibilityReason.length).toBeLessThanOrEqual(500);
     expect(rem.unifiedDiff).toMatch(/^--- a\/backend\/package\.json\n\+\+\+ b\/backend\/package\.json\n@@ /);
     expect(rem.unifiedDiff).toContain('-    "multer": "^2.0.2"\n+    "multer": "^2.5.0"');
@@ -214,6 +270,13 @@ describe("npm lockfile remediation", () => {
   });
 });
 
+describe("npm lockfile entry metadata", () => {
+  it("copies every field npm copies (e.g. peerDependenciesMeta) instead of dropping it", () => {
+    const r = plan({ registryManifest: { ...REGISTRY, peerDependenciesMeta: { debug: { optional: true } } } });
+    expect(JSON.parse(r.lockText).packages["node_modules/multer"].peerDependenciesMeta).toEqual({ debug: { optional: true } });
+  });
+});
+
 describe("npm lockfile upgrade fails closed", () => {
   const cases: [string, Partial<Parameters<typeof planNpmUpgrade>[0]>, RegExp][] = [
     ["a version that is not newer", { toVersion: "2.0.2" }, /not newer/],
@@ -223,8 +286,10 @@ describe("npm lockfile upgrade fails closed", () => {
     ["a tarball outside the public registry", { registryManifest: { ...REGISTRY, dist: { ...REGISTRY.dist, tarball: "https://evil.example/multer-2.5.0.tgz" } } }, /tarball or integrity/],
     ["install scripts", { registryManifest: { ...REGISTRY, hasInstallScript: true } }, /hasInstallScript/],
     ["deprecated releases", { registryManifest: { ...REGISTRY, deprecated: "do not use" } }, /deprecated/],
-    ["new packages npm would have to add", { registryManifest: { ...REGISTRY, dependencies: { ...(REGISTRY.dependencies as object), "left-pad": "^1.3.0" } } }, /left-pad, which is not in the lockfile/],
-    ["locked versions outside the new range", { registryManifest: { ...REGISTRY, dependencies: { ...(REGISTRY.dependencies as object), busboy: "^2.0.0" } } }, /needs busboy@\^2\.0\.0/],
+    ["platform restrictions", { registryManifest: { ...REGISTRY, os: ["linux"] } }, /declares "os"/],
+    ["optional peer-only metadata with real peers", { registryManifest: { ...REGISTRY, peerDependencies: { debug: "*" } } }, /declares "peerDependencies"/],
+    ["new packages npm would have to add", { registryManifest: { ...REGISTRY, dependencies: { ...(REGISTRY.dependencies as object), "left-pad": "^1.3.0" } } }, /left-pad, which is not installed yet, so npm would add packages/],
+    ["locked versions outside the new range", { registryManifest: { ...REGISTRY, dependencies: { ...(REGISTRY.dependencies as object), busboy: "^2.0.0" } } }, /needs busboy@\^2\.0\.0, but busboy 1\.6\.0 is installed, so npm would upgrade busboy too/],
     ["CRLF lockfiles", { lockText: LOCK.replace(/\n/g, "\r\n") }, /CRLF/],
     [
       "lockfiles not in npm's exact format",
@@ -239,11 +304,20 @@ describe("npm lockfile upgrade fails closed", () => {
       /exact format npm writes/,
     ],
     ["lockfileVersion 2", { lockText: lockWith((l) => (l.lockfileVersion = 2)) }, /lockfileVersion 3/],
-    ["inconsistent dependency flags", { lockText: lockWith((l) => (l.packages["node_modules/busboy"].dev = true)) }, /flags for node_modules\/busboy differ/],
-    ["extraneous packages", { lockText: lockWith((l) => (l.packages["node_modules/orphan"] = { version: "1.0.0" })) }, /nothing depends on/],
+    ["inconsistent dependency flags", { lockText: lockWith((l) => (l.packages["node_modules/busboy"].dev = true)) }, /does not match what the current npm writes \(first difference: node_modules\/busboy\)/],
+    ["extraneous packages", { lockText: lockWith((l) => (l.packages["node_modules/orphan"] = { version: "1.0.0" })) }, /first difference: node_modules\/orphan\)/],
     ["a custom registry", { lockText: lockWith((l) => (l.packages["node_modules/multer"].resolved = "https://npm.internal.example/multer-2.0.2.tgz")) }, /public npm registry/],
     ["a nested copy of the package", { lockText: lockWith((l) => (l.packages["node_modules/express/node_modules/multer"] = { version: "1.4.5" })) }, /also installed as a nested dependency/],
-    ["transitive-only packages", { name: "busboy", fromVersion: "1.6.0", toVersion: "1.6.1", registryManifest: { ...REGISTRY, name: "busboy", version: "1.6.1", dist: { tarball: "https://registry.npmjs.org/busboy/-/busboy-1.6.1.tgz", integrity: REGISTRY.dist.integrity } } }, /not a direct dependency/],
+    [
+      "a transitive version outside its dependents' ranges",
+      {
+        name: "proxy-addr",
+        fromVersion: "2.0.7",
+        toVersion: "3.0.0",
+        registryManifest: { ...PROXY_ADDR, version: "3.0.0", dist: { ...PROXY_ADDR.dist, tarball: "https://registry.npmjs.org/proxy-addr/-/proxy-addr-3.0.0.tgz" } },
+      },
+      /proxy-addr@3\.0\.0 is outside the range "\^2\.0\.7" that express@5\.1\.0 declares; express itself must be upgraded/,
+    ],
     ["ranges other than ^/~/exact", { lockText: lockWith((l) => (l.packages[""].dependencies!.multer = ">=2.0.0")), manifestText: MANIFEST.replace('"^2.0.2"', '">=2.0.0"') }, /not a plain version/],
     ["package.json disagreeing with the lockfile", { manifestText: MANIFEST.replace('"^2.0.2"', '"^2.0.1"') }, /disagree/],
   ];
