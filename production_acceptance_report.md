@@ -3,6 +3,12 @@
 > **Update 2026-10-30:** in-product per-repository authorization and npm lockfile Auto-Fix were
 > implemented and deployed (`6d3a08f`). See **§12**. The live Job-portal test is **BLOCKED** on
 > the owner's one-time GitHub App permission change and on the scan quota window (§12.6).
+>
+> **Update 2026-10-30 (later):** the Auto-Fix workflow on the existing Job-portal report was
+> diagnosed from production logs, the database and visible Chrome. A production bug stopped every
+> eligible npm fix at the preview (HTTP 500). It is fixed and deployed at `41fb7e9`, together with
+> transitive npm fixes and a truthful status UI. See **§13**. The live PR step needs the owner's
+> own browser session (§13.8).
 
 **Dates:** 2026-10-28 (activation, first live session) and 2026-10-29 (final acceptance run, then three defect fixes)
 **Production:** https://vibeshield-ai-phi.vercel.app
@@ -453,4 +459,227 @@ Planned single run, with at most one scan and no retries:
 | npm fix eligibility for Job-portal | **PASS** (npm byte equality, plain `git apply`, real-scanner rescan) |
 | Live in-product authorization of Job-portal | **BLOCKED** (item 1) |
 | Live scan → approve → rescan → real PR → duplicate check | **BLOCKED** (items 1–3) |
+
+---
+
+## 13. Auto-Fix-to-commit workflow on the existing Job-portal report (2026-10-29/30)
+
+**Code:** `bedc5b4`, `85f8df3`, `9b177a9`, `41fb7e9` (fast-forward from `d58bb1b`).
+**Production:** `dpl_5UjFFDWHF2axQrNpiKUjyQYwiCqZ`, READY, target production,
+`meta.githubCommitSha` = `41fb7e9b649d424e076e40e710ae32bdceac2480`, aliased to
+`vibeshield-ai-phi.vercel.app`. `/api/health` reported `healthy`, database `healthy`,
+`githubApp: "configured"`, dispatcher `ready`. **No production scan was submitted.** The existing
+job was reused, and the Job-portal repository was not modified.
+
+### 13.1 Starting state (observed)
+
+- **Deployed commit:** `d58bb1b` (`dpl_5yupkqGBysaMi8RDnerLGELpAnbH`), healthy.
+- **GitHub App registration:** `contents: write`, `metadata: read`, `pull_requests: write`. The
+  installation-repository-access permission is still not granted. There are no
+  `repository_authorization` audit events, so Job-portal was added to installation `176245393` on
+  GitHub's own page, and "Repository authorized" was GitHub's live answer for that.
+- **Existing job:** `A-NZKPwxBNay-TeEZnpfGGpWYqlikg9p` (`samarth-khera/Job-portal`, public, repository
+  ID `1106558267`, commit `7f90143a47c6280f6bcf9d55bb7c4767a48c1542`). Created 20:54:52 UTC and
+  completed 20:55:27 UTC, with Gitleaks, Semgrep and OSV-Scanner all `completed` and 180 findings.
+  GitHub was connected at 20:56:08 UTC (`samarth-khera`).
+
+### 13.2 What actually happened (Vercel request logs and database records)
+
+| UTC | Request | HTTP | Result |
+|---|---|---|---|
+| 20:57:42 | `POST …/remediation/preview` (finding `cmvu0vp9v000ti708v1nuwqxr`, proxy-addr) | 201 | Remediation `e2823631-…` saved: `unsuitable`, empty diff, reason "proxy-addr is not a direct dependency of this project…" |
+| 20:58:05 | `POST …/findings/cmvu0vp9v000ti708v1nuwqxr/explain` | 200 | AI explanation |
+| 20:58:50 | `POST …/remediation/preview` (brace-expansion) | 201 | Remediation `39c0b4c7-…` saved: `unsuitable`, empty diff |
+| 20:59:49 | `POST …/remediation/preview` (a directly declared package such as multer) | **500** | `prisma.remediation.create()`: **P2000 "The provided value for the column is too long for the column's type"**. Nothing saved. The UI showed "Failed to generate remediation preview." |
+
+No approval, verification, branch, commit or pull request was requested. No GitHub write took
+place. The journey stopped at the preview.
+
+### 13.3 Root causes
+
+1. **Production bug, which blocked every eligible npm fix.** The npm lockfile fix from `06db3f9`
+   generated a 594-character explanation for the `VARCHAR(500)` column `Remediation.eligibilityReason`,
+   so the insert failed with P2000. I introduced this in the previous round. It was missed because
+   the in-memory test store accepted any length. Fixed in `bedc5b4`:
+   - text is fitted to its column in the service and in the Prisma store;
+   - the test store now enforces PostgreSQL's limits;
+   - the explanations are short by design (`85f8df3`).
+2. **Engine gap.** Every package not declared in `package.json` was refused. The selected finding is
+   `GHSA-jqcg-44mw-7w3h` (CVE-2026-90711, critical, osv-scanner, `proxy-addr` 2.0.7, fixed in 2.0.8,
+   `backend/package-lock.json`). It is fixable as npm fixes it: `express@5.1.0` declares `"^2.0.7"`,
+   and `npm update proxy-addr` changes only that lockfile entry. Fixed in `85f8df3`.
+3. **The UI hid the server's decision.** For a remediation with an empty diff, the panel rendered
+   only the "Manual Review Required" badge. The reason and warnings lived inside the diff section,
+   and there was no next step. Fixed in `41fb7e9`.
+4. **The badges and selection summary used an optimistic client-side guess.** Any dependency with a
+   fixed version counted as "eligible for automated fix", so they disagreed with the server
+   ("1 eligible" versus "Manual Review Required"). Fixed in `41fb7e9`.
+
+**Answers to the Phase 1 questions:**
+1. **The finding:** ID `cmvu0vp9v000ti708v1nuwqxr`, osv-scanner, `GHSA-jqcg-44mw-7w3h`, `proxy-addr@2.0.7`
+   (fixed in 2.0.8), `backend/package-lock.json`, commit `7f90143…`.
+2. **The server's decision:** `unsuitable`, reason "not a direct dependency" (the engine gap).
+3. **Why the panel said "Manual Review Required":** the stored remediation had
+   `eligibility: unsuitable`, and the reason was never rendered.
+4. **Why the summary disagreed:** it used the client-side guess.
+5. **Did clicking send a request:** yes, three preview POSTs (above).
+6. **The requests:** see §13.2.
+7. **What was created:** two remediation records (no diff), and nothing else.
+8. **What was wrong in the UI:** the error was hidden (the reason was not shown), there was no
+   action, and the eligible preview failed with a generic message.
+
+### 13.4 Eligibility of every finding in the existing scan (real engine, files at the scanned commit, live registry)
+
+| Lockfile | Package (installed) | Findings | Decision |
+|---|---|---|---|
+| backend | multer 2.0.2 (direct) | 9 | **Eligible** → 2.5.0, `package.json` and lockfile; fixes all 9 |
+| backend | proxy-addr 2.0.7 (via express `^2.0.7`) | 1 | **Eligible** → 2.0.8, lockfile only |
+| backend | jws 3.2.2 | 1 | **Eligible** → 3.2.3, lockfile only |
+| backend | path-to-regexp 8.3.0 | 2 | **Eligible** → 8.4.2, lockfile only |
+| backend | brace-expansion 1.1.12 (via minimatch `^1.1.7`) | 7 | 1 eligible → 1.1.21. 6 manual: fixed only in 5.x, outside minimatch's range |
+| backend | body-parser 2.2.1 / qs 6.14.0 | 2 / 5 | Manual: the fixed release needs other packages upgraded too |
+| backend | minimatch 3.1.2 / picomatch 2.3.1 | 3 / 2 | Manual: the fix is outside the parent's range (nodemon / anymatch, readdirp) |
+| backend | mongoose 9.0.0 | 2 | Manual: OSV's recorded fix (6.13.x) is for another release line |
+| root | moment 2.30.1 (direct) | 1 | **Eligible** → 2.31.0 |
+| root | follow-redirects 1.15.11 | 1 | **Eligible** → 1.16.2, lockfile only |
+| root | axios 1.13.2 / react-router 7.9.5 / form-data 4.0.4 | 35 / 13 / 1 | Manual: needs form-data upgraded / outside react-router-dom's exact `7.9.5` / another release line |
+| frontend | all 30 packages | 105 | Manual: today's npm rewrites 72 unrelated lines of this lockfile (written by another npm version), so no minimal change exists |
+| backend/.env | generic-api-key (Gitleaks) | 1 | Rotate credential; never auto-fixed |
+
+**Proof for every eligible fix:**
+- Each generated file is byte-identical to npm 10.9.3's own output for the same change. npm ran in
+  an empty directory with no `.npmrc`, with `--package-lock-only --ignore-scripts`; the command was
+  `npm install <pkg>@<v>` for direct dependencies and `npm update <pkg>` for transitive ones.
+- Each result installs with `npm ci --ignore-scripts` and passes `npm ls --all`.
+- Real Gitleaks/Semgrep/OSV-Scanner rescans verify `multer` (9/9 resolved) and `proxy-addr`
+  (1/1), with no regressions.
+
+One planner gap found by this oracle was fixed before the release: `peerDependenciesMeta`, published
+by follow-redirects 1.16.2, had been dropped. Unknown fields are now refused, never dropped.
+
+### 13.5 Changes
+
+- **`bedc5b4`:** previews can no longer fail on long text, enforced at the service and the store.
+- **`85f8df3`:** transitive npm fixes with npm-update semantics, accurate refusal reasons,
+  release-line checks, and complete lockfile metadata.
+- **`9b177a9`:** approvals bind the canonical repository ID, and the PR is refused for another
+  repository ID or GitHub account. PR steps are stored while they run. The branch ref, commit
+  (tree and single parent) and PR (head, base, author) are read back from GitHub before anything is
+  reported as created; otherwise the result is `not_confirmed`. Verification exposes whether a
+  worker has claimed it.
+- **`41fb7e9`:** the status line covers every stage:
+  - not eligible, manual review with the actual reason, generating
+  - preview ready / waiting for approval, approved
+  - queued, then running Gitleaks, Semgrep and OSV-Scanner, with elapsed time
+  - verified, failed or timed out
+  - publishing steps, PR created, rate-limited, authorization revoked
+
+  It also adds "Check again", server-based badges and selection counts, persisted PR progress and
+  interruption handling, and shows the commit and PR authors as GitHub reports them.
+
+**Unchanged:** failed-scan reporting, the plain `git apply` context fix, the ligature fix, the
+authorization guards and the patch-integrity rules. Their suites pass.
+
+### 13.6 Evidence
+
+- **Production before the fix (visible Chrome, read-only).**
+  - The proxy-addr row was badged "Potentially Breaking"; selecting it showed
+    "1 findings selected (1 eligible for automated fix)".
+  - The panel text was only "AI Auto-Fix & Verification | MODE B: AUTO-FIX | Manual Review
+    Required". The reason was in the API response but not rendered; no console errors.
+  - Evidence: `~/.vibeshield-e2e/evidence/autofix-diagnosis/prod-before/`.
+- **Owner view on the deployed code (`d58bb1b`).** Local production build, local PostgreSQL holding a
+  copy of the job's 180 findings and 2 remediations, local owner grant, visible Chrome.
+  - proxy-addr: badge only, no reason.
+  - multer: Preview → `POST /remediation/preview` **500** `{"code":"internal_error","message":"Failed
+    to generate remediation preview."}`; the server log shows P2000.
+  - Evidence: `…/local-before-d58bb1b/`.
+- **Owner view on the fixed build (same data).**
+  - proxy-addr shows its reason and package facts. "Check again" returns 201 with the lockfile-only
+    2.0.8 diff; the status becomes "Patch preview ready — waiting for your explicit approval".
+  - multer preview returns 201 with the two-file diff. After the explicit approval, verification
+    ran with the real scanners:
+    - Gitleaks, Semgrep and OSV-Scanner all `completed`
+    - 9/9 targets resolved, 0 new findings, findings 180 → 171
+    - approved diff SHA-256 = stored diff
+  - After a reload the status is "Fix verified — ready to open a pull request".
+  - The report badges show the server's "Fix Ready". Selecting proxy-addr, jws and mongoose shows
+    "1 eligible for automated fix · 2 checked when previewed". No console errors.
+  - Evidence: `…/local-after-fixed/`.
+- **Production after the deploy (visible Chrome, read-only).** proxy-addr shows "Status: Manual review
+  required" with the stored reason and facts; the summary shows "0 eligible"; no console errors.
+  Evidence: `…/prod-after/`.
+
+| Suite | Result |
+|---|---|
+| `vitest` (unit and integration) | **490 passed**, 20 skipped (Postgres, real scanners and live-GitHub suites run separately) |
+| Real scanners | **63/63**, including multer and proxy-addr fixes verified by full rescans |
+| PostgreSQL | **19/19**, including an over-length explanation stored without P2000 |
+| Negative controls | Without the column fitting, real Postgres raises the exact production P2000 and the service test fails |
+| Typecheck, lint, production build | Clean |
+| Gitleaks (commits `d58bb1b..41fb7e9`, `src`) / `npm audit --omit=dev` | No leaks / 0 vulnerabilities |
+| Semgrep on the changed server and UI files | 5 notices, all reviewed: linear regexes with validated inputs (ReDoS false positives) and the existing retry jitter |
+
+**Phase 6 test matrix:**
+
+| Requirement | Tests |
+|---|---|
+| Authorized repository, ineligible finding | `autofix-status-ui` "authorized repository + ineligible finding…"; `autofix-workflow` "an authorized repository does not make an ineligible finding fixable" |
+| Authorized repository, eligible finding | `autofix-workflow` "keeps one remediation ID, one commit and one diff…"; `autofix-status-ui` "authorized repository + eligible finding…" |
+| Authorization does not imply remediation success | `autofix-status-ui` (status "No fix generated yet", no verified/PR claims) |
+| Missing or insufficient permissions | `repository-authorization` (push-only user, missing app permission); `github-app-auth` (no write access); `pull-request-ui` |
+| Missing, stale or revoked authorization | `repository-authorization` (expired → refresh, revoked); `github-app-auth` token lifecycle; `repository-authorization-ui` (reconnect) |
+| Approval missing or for another diff; patch changed after approval | `github-app-auth` "enforces approval, verification and the exact approved diff"; `patch-git-apply` (a regenerated diff needs a fresh approval); `remediation` |
+| Wrong repository ID or commit SHA | `autofix-workflow` (approval for another repository ID or GitHub account); `github-pr` (recreated or renamed repository); `github-app-auth` (`commit_mismatch`) |
+| Verification failure or incomplete scanners | `remediation` (failing engine, regression); `real-scanners` (still-vulnerable bump); `autofix-status-ui` (timeout) |
+| Committing an unverified patch | `github-app-auth` (`not_verified`) |
+| Branch or commit creation failure; result not confirmed | `github-pr` (denied writes, branch conflict); `autofix-workflow` (`not_confirmed` read-back) |
+| PR API failure; duplicate retry | `github-pr` (double click, existing closed PR); `pull-request-ui` (refused); `autofix-workflow` (retry returns the same PR) |
+| Commit and PR attribution | `repository-authorization` (spoofed author refused); `autofix-workflow` (PR author and commit login from GitHub); `autofix-status-ui` |
+| Cross-user access, CSRF | `github-app-auth`; `repository-authorization` (substitution, origin); `ownership` |
+| Status UI in progress and failed | `autofix-status-ui` (queued/running, timeout, interrupted, rate-limited, revoked) |
+| Reload persistence | `autofix-status-ui` (stored publish step followed to the confirmed PR); `pull-request-ui` (verified fix and PR restored) |
+
+### 13.7 Stages that truly executed
+
+| Stage | Production (live) | Local (fixed build, real scanners) |
+|---|---|---|
+| Repository authorized (GitHub's live answer) | Yes, in the owner's session (added on GitHub's page; no in-product addition) | n/a (GitHub App not configured locally) |
+| Eligibility decided | Yes: 2 refusals stored, 1 eligible preview failed with 500 | Yes |
+| Patch generated and displayed | **No** (the 500, fixed in `bedc5b4`) | Yes |
+| Explicit approval | Not reached | Yes |
+| All three scanners completed, fix verified | Not reached | Yes (multer, 9/9, 0 new) |
+| Branch, commit, push, PR | None created | n/a locally; covered by tests against the stateful GitHub fake |
+| PR URL | None | None |
+
+### 13.8 One controlled live test: **NOT RUN — needs the owner's browser session**
+
+The job's owner grant is an HttpOnly cookie in the browser that started the scan. It cannot be
+transferred, and recreating it would mean bypassing ownership or submitting a new scan, and both are
+excluded. The live step therefore needs the owner to click in their own browser while the server
+side, the database and GitHub are checked. Recommended: the proxy-addr fix (one lockfile entry):
+
+1. Open the report → AI Auto-Fix → the proxy-addr finding → **Check again**.
+2. Review the diff, tick the box and click **Approve Patch**, then **Verify Fix on Full Repository**.
+3. When the status says **Fix verified**, use **Review & create pull request**, confirm the exact
+   diff and create the pull request.
+
+At most one PR, never merged.
+
+The installation's current repository selection can only be read with the owner's token or on
+GitHub's settings page (`https://github.com/settings/installations/176245393`). The app-level
+permissions are as in §13.1.
+
+### 13.9 Remaining limitations
+
+- **Still manual review:** frontend findings (lockfile written by another npm version); fixes that
+  need several packages (body-parser, qs, root axios); fixes outside a parent's range (minimatch,
+  picomatch, brace-expansion 5.x, react-router); fixes recorded for another release line (mongoose,
+  form-data, rollup); prerelease-only fixes (@babel/core).
+- **Old record:** the stored `unsuitable` proxy-addr record from 20:57 stays until **Check again** is
+  used, so badges show its old decision until then.
+- **Repository authorization:** in-product repository addition still needs the one-time app
+  permission (§12.6); adding repositories on GitHub's page keeps working.
+- **Live run:** the live PR flow on production is not yet observed (§13.8). The PR steps, read-back
+  and binding are covered by tests and the local run only.
 
