@@ -1,5 +1,9 @@
 # VibeShield AI — GitHub App Activation, Live Production Acceptance and Defect Fixes
 
+> **Update 2026-10-30:** in-product per-repository authorization and npm lockfile Auto-Fix were
+> implemented and deployed (`6d3a08f`). See **§12**. The live Job-portal test is **BLOCKED** on
+> the owner's one-time GitHub App permission change and on the scan quota window (§12.6).
+
 **Dates:** 2026-10-28 (activation, first live session) and 2026-10-29 (final acceptance run, then three defect fixes)
 **Production:** https://vibeshield-ai-phi.vercel.app
 **Code under acceptance test (§2–§6):** `9e9d5d9`. Nothing was changed or deployed while those tests ran.
@@ -278,3 +282,175 @@ Negative control: class removed → 1 failed.
   - `github_connect / success`
   - `github_disconnect / revoked`
   - `pull_request / denied / not_connected`
+
+---
+
+## 12. Per-repository authorization and npm lockfile Auto-Fix (2026-10-30)
+
+**Code:** `07d3aac`, `06db3f9`, `466d99b`, `6d3a08f` (fast-forward from `260cb2f`). **Production:**
+`dpl_6EEEqnQgSj5j7jbCcovucUdXKeUk`, READY, target production, `meta.githubCommitSha` =
+`6d3a08f13e77216952de1579a811933126777c10`, aliased to `vibeshield-ai-phi.vercel.app`. `/api/health`
+reported `healthy`, database `healthy`, `githubApp: "configured"`. No production scan was submitted
+and no migration was needed (no schema change).
+
+### 12.1 Why every repository had to be added on GitHub
+
+`checkRepositoryAccess` only looked for an installation that already listed the repository. When
+it was missing, the write check returned `not_installed`, and the UI's only action was a link to
+GitHub's installation pages. No code called GitHub's add-repository API. That API needs a permission
+the app registration does not have. Read-only check on 2026-10-30 (`GET /apps/vibeshield-ai`):
+`{"contents":"write","metadata":"read","pull_requests":"write"}`.
+
+### 12.2 GitHub's requirements (official sources)
+
+- `PUT /user/installations/{installation_id}/repositories/{repository_id}`: "Add a single
+  repository to an installation. The authenticated user must have admin access to the
+  repository." Responses: 204, 304, 403, 404
+  ([REST docs](https://docs.github.com/en/rest/apps/installations)).
+- Required permission: repository permission **"GitHub App installation repository access"
+  (write)**, usable with user access tokens
+  ([permissions reference](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps)).
+  It was introduced on 2026-10-13 as `installation_repositories:write`. "If the caller is a user,
+  they must also be an organization owner or an administrator on the repository in question."
+  ([changelog](https://github.blog/changelog/2026-10-13-github-app-improvements-for-least-privilege-and-management/)).
+- GitHub's published OpenAPI description does not list this key in `app-permissions` yet.
+  VibeShield therefore reads it from the installation's `permissions` (`installation_repositories`).
+  If it is absent, the code treats in-product authorization as unavailable (`app_setup_required`)
+  and makes no request.
+
+### 12.3 What was built
+
+- **Flow.** The user clicks *Authorize repository* in the Auto-Fix "Repository access" card. The
+  server reads GitHub live with the user's own token:
+  - canonical repository ID
+  - owner account ID and type
+  - the user's admin and push role
+  - this app's installation on the owner account, matched by immutable account ID
+  - whether the repository is already selected
+  - whether the installation holds the permission
+
+  It returns one of: `authorized`, `authorization_required`, `app_setup_required`,
+  `installation_required`, `admin_required`, `organization_approval_required`,
+  `no_push_permission` or `app_lacks_permission`.
+- **Confirmation.** For an addable repository the dialog shows exactly what was bound: repository,
+  repository ID, owner, PR base branch, scanned commit, installation and capabilities. That binding
+  is a single-use request with these properties:
+  - It is stored as a SHA-256-hashed `OAuthState` id with purpose `repo_access`, and its binding is
+    AES-256-GCM encrypted.
+  - It is bound to the browser session, the GitHub user, the job-owner grant, the scan, the
+    scanned commit, the repository ID and the installation ID.
+  - It expires after 10 minutes.
+- **Addition.** Confirming consumes the request and rejects any substitution. The server re-checks
+  GitHub and sends one `PUT` for that repository ID. It reports success only after GitHub lists
+  the repository in that installation (up to 3 re-reads).
+  - It never selects "All repositories" and never removes anything.
+  - Refusals are reported honestly, with GitHub-managed links: a 403 on an organization repository
+    means owner approval is required; a non-admin user cannot add a repository; a missing
+    permission means one-time setup.
+- **Audit.** `repository_authorization` events record: requested, added, already_present, denied,
+  rejected, not_confirmed and cancelled. They contain no tokens, cookies or request secrets.
+- **Writes.** These are unchanged: before every PR the user's own token is live-checked for push
+  access, installation scope, repository ID, approved diff hash, scanned commit and verification
+  status. PRs now record GitHub's own commit attribution: author and committer names, a noreply
+  flag (the email is not stored) and signature verification.
+  - The PR body says the change was prepared on the user's behalf.
+  - The PR request schema is strict, so a client-supplied author is rejected with 400.
+- **npm lockfile Auto-Fix.** OSV findings reported against `package-lock.json` were previously
+  refused. They now produce the change `npm install <pkg>@<v> --package-lock-only --ignore-scripts`
+  would make, without running npm or repository code:
+  - the target is the lowest stable release that fixes every advisory reported for that version
+  - only the declared range in `package.json` changes
+  - the lock entry comes from registry metadata, with the tarball host and sha512 checked
+  - orphaned packages are pruned and npm's flags recomputed
+  - the output is serialized with npm's key order
+
+  Anything else is refused as needing manual review.
+- **Private repositories** stay blocked from the public GitHub Actions workers, as before. That code
+  was not changed.
+
+### 12.4 Job-portal fixture (Phase 7 preconditions)
+
+- Repository `samarth-khera/Job-portal`: public, ID `1106558267`, default branch `main`, HEAD
+  `7f90143a47c6280f6bcf9d55bb7c4767a48c1542`. `backend/package.json` declares `"multer": "^2.0.2"`;
+  the lockfile has `multer@2.0.2` (lockfileVersion 3).
+- OSV (queried 2026-10-30) lists nine advisories for multer 2.0.2, fixed in 2.1.0 to 2.5.0:
+  GHSA-3p4h-7m6x-2hcm, GHSA-535w-7cp7-47q4, GHSA-5528-5vmv-3xc2, GHSA-72gw-mp4g-v24j,
+  GHSA-q7qp-rjg7-q26m, GHSA-qvfw-j98x-7q72, GHSA-v52c-386h-88mc, GHSA-wc9g-mqfw-jrwm,
+  GHSA-xf7r-hgr6-v32p. npm `latest` is 2.5.0, which drops `concat-stream`, `mkdirp`,
+  `object-assign` and `xtend` as dependencies.
+- **Eligibility confirmed (local).** VibeShield's generated `package.json` and `package-lock.json`
+  are byte-identical to npm 10.9.3's output. The npm run used an empty directory with no `.npmrc`,
+  scripts disabled and only the lockfile written. Nine packages are pruned
+  (`buffer-from`, `concat-stream`, `minimist`, `mkdirp`, `readable-stream`, `string_decoder`,
+  `typedarray`, `util-deprecate`, `xtend`).
+  - The two-file diff applies with plain `git apply`.
+  - A real Gitleaks/Semgrep/OSV-Scanner rescan resolves all nine multer findings with no
+    regressions.
+
+### 12.5 Test evidence
+
+| Suite | Result |
+|---|---|
+| `vitest` (all unit/integration) | **467 passed**, 19 skipped (was 390) |
+| Real scanners (`npm run test:scanners`) | **62/62**, incl. the Job-portal multer fix verified by a full rescan |
+| PostgreSQL (`npm run test:postgres`) | **18/18**, incl. a `repo_access` request consumed once under 20 concurrent confirmations |
+| Typecheck, lint, production build | clean |
+| Gitleaks on the 4 commits / `npm audit --omit=dev` | no leaks / 0 vulnerabilities |
+| Semgrep (p/typescript, p/secrets, p/nodejsscan) on the new server/UI files | 2 ReDoS warnings in `npm-lockfile.ts`, reviewed as false positives (no nested quantifiers; inputs validated and escaped) |
+
+New tests cover the following:
+- already authorized; added after explicit confirmation; exact repository ID only
+- already present / added meanwhile; replayed and concurrent confirmations
+- admin vs. push-only user; organization 403; missing permission; no installation
+- expired token refreshed; revoked token
+- repository, installation, job, owner-session and GitHub-user substitution
+- another account's installation; repository changed; cancellation
+- CSRF; not connected; not configured
+- the status never shows "authorized" before GitHub confirms
+- commit attribution and spoofed author refused; real PR URL
+- the UI dialog and states; npm byte equality and 19 fail-closed cases
+
+Existing suites still cover approval binding, altered diffs, regression detection, ownership, public
+scans without GitHub and private-scan fail-closed.
+
+**Production, read-only (visible Chrome, no sign-in, no scan):** the `M0p3…` report still shows
+"VERIFIED SCAN REPORT". A non-owner sees the read-only note, no "Repository access" card and no
+Authorize button, and the console shows no errors. The new endpoint returns 403 `forbidden_origin`
+for a cross-site POST and 403 `not_job_owner` without an owner grant. Screenshot:
+`~/.vibeshield-e2e/evidence/prod-repo-auth/`.
+
+An unscoped `prisma migrate deploy` was run once by mistake while preparing the Postgres suite.
+Prisma's CLI reads only `.env`, whose `DATABASE_URL` points to localhost, and this change has no
+migrations, so nothing was applied anywhere. Production was not touched.
+
+### 12.6 Live Job-portal workflow: **BLOCKED**
+
+The live test needs three things, none of which can be done on the owner's behalf:
+
+1. **One-time app change (owner).** In GitHub App settings → Permissions, set
+   **GitHub App installation repository access: Read and write** and save. Then accept the updated
+   permissions on installation `176245393` (`https://github.com/settings/installations/176245393`),
+   keeping "Only select repositories". Details: `docs/github-app-setup.md` §1a. Until then, production
+   correctly reports `app_setup_required` and makes no add request.
+2. **Scan quota window.** The last production scan was at 2026-10-29 16:06:25 UTC, so the window
+   resets after **2026-10-30 16:06 UTC**.
+3. **GitHub sign-in** by the owner in a visible test Chrome profile, as in the earlier runs.
+
+Planned single run, with at most one scan and no retries:
+- scan Job-portal
+- open a multer finding, then Repository access → Authorize repository → confirm, and check on
+  GitHub that the installation lists only FraudAi and Job-portal
+- preview the multer 2.5.0 diff, approve it and run the full rescan
+- create the PR, then repeat the request to check duplicates are prevented
+- inspect the branch, the commit attribution and that the default branch is untouched
+- do not merge
+
+| Requirement | Status |
+|---|---|
+| Already-authorized / add / exact repository ID / idempotency / substitution / denial and cancellation | **PASS** (deterministic tests), **NOT TESTED** live |
+| Push-only user, organization approval, missing permission | **PASS** (tests). Production shows the missing-permission state until the owner's change. |
+| Expired, revoked and refreshed tokens | **PASS** (tests; live refresh passed on 2026-10-28, §6) |
+| npm fix eligibility for Job-portal | **PASS** (npm byte equality, plain `git apply`, real-scanner rescan) |
+| Live in-product authorization of Job-portal | **BLOCKED** (item 1) |
+| Live scan → approve → rescan → real PR → duplicate check | **BLOCKED** (items 1–3) |
+
