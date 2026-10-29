@@ -22,6 +22,7 @@ import {
   explainFindingWithAi,
   type AiFindingExplanation,
   type PublicFinding,
+  type PublicRemediation,
 } from "@/lib/scan-client";
 import { RemediationPanel } from "./remediation-panel";
 
@@ -31,6 +32,7 @@ export function RealFindingDrawer({
   onClose,
   mode = "review",
   readOnly = false,
+  onRemediationUpdated,
 }: {
   jobId: string;
   finding: PublicFinding | null;
@@ -38,6 +40,8 @@ export function RealFindingDrawer({
   mode?: "review" | "autofix";
   /** Not the browser that started the scan: show results, offer no actions. */
   readOnly?: boolean;
+  /** Keeps the report list's fix status in step with the panel. */
+  onRemediationUpdated?: (r: PublicRemediation) => void;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLElement>(null);
@@ -474,7 +478,7 @@ export function RealFindingDrawer({
 
           {/* AI Remediation & Auto-Fix Panel */}
           <section>
-            <RemediationPanel jobId={jobId} finding={finding} mode={mode} readOnly={readOnly} />
+            <RemediationPanel jobId={jobId} finding={finding} mode={mode} readOnly={readOnly} onRemediationUpdated={onRemediationUpdated} />
           </section>
 
           {/* External References */}

@@ -29,8 +29,10 @@ import {
   retryScan,
   type PublicFinding,
   type PublicScanJob,
+  listRemediations,
+  type PublicRemediation,
 } from "@/lib/scan-client";
-import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
+import { findingFixStatus } from "@/lib/remediation-eligibility";
 import { useAdaptivePoll } from "@/lib/use-adaptive-poll";
 import { cn } from "@/lib/utils";
 import { RealFindingDrawer } from "./real-finding-drawer";
@@ -220,6 +222,30 @@ export function RealReportView({ jobId }: { jobId: string }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<"review" | "autofix">("review");
   const [selectedFindingIds, setSelectedFindingIds] = useState<Set<string>>(new Set());
+  // The server's stored fix decisions (a generated diff, or the reason it needs manual review).
+  const [remediations, setRemediations] = useState<PublicRemediation[]>([]);
+  useEffect(() => {
+    if (mode !== "autofix") return;
+    let cancelled = false;
+    listRemediations(jobId)
+      .then((list) => {
+        if (!cancelled) setRemediations(list);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, mode]);
+  const onRemediationUpdated = useCallback((r: PublicRemediation) => {
+    setRemediations((prev) => [...prev.filter((x) => x.id !== r.id), r]);
+  }, []);
+  const decisionFor = useMemo(() => {
+    const latest = new Map<string, PublicRemediation>();
+    for (const r of [...remediations].filter((x) => x.status !== "rejected").sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+      for (const fp of r.findingFingerprints) latest.set(fp, r);
+    }
+    return (fingerprint: string) => latest.get(fingerprint) ?? null;
+  }, [remediations]);
   const lastTrigger = useRef<HTMLElement | null>(null);
   const [githubNotice, setGithubNotice] = useState<string | null>(null);
   const returnHandled = useRef(false);
@@ -308,24 +334,24 @@ export function RealReportView({ jobId }: { jobId: string }) {
   const selectAllEligible = useCallback(() => {
     const eligible = new Set<string>();
     for (const f of filtered) {
-      const elig = classifyRemediationEligibility(f);
-      if (elig.canAutoFix) {
-        eligible.add(f.id);
-      }
+      if (findingFixStatus(f, decisionFor(f.fingerprint)).eligible) eligible.add(f.id);
     }
     setSelectedFindingIds(eligible);
-  }, [filtered]);
+  }, [filtered, decisionFor]);
 
-  const eligibleSelectedCount = useMemo(() => {
-    let count = 0;
+  // Only fixes the server confirmed (or that need no server check) count as eligible; lockfile
+  // findings without a decision yet are counted separately, never as eligible.
+  const selectedFixCounts = useMemo(() => {
+    let eligible = 0;
+    let pending = 0;
     for (const f of findings) {
-      if (selectedFindingIds.has(f.id)) {
-        const elig = classifyRemediationEligibility(f);
-        if (elig.canAutoFix) count++;
-      }
+      if (!selectedFindingIds.has(f.id)) continue;
+      const status = findingFixStatus(f, decisionFor(f.fingerprint));
+      if (status.eligible) eligible++;
+      else if (status.kind === "decided_on_preview") pending++;
     }
-    return count;
-  }, [findings, selectedFindingIds]);
+    return { eligible, pending };
+  }, [findings, selectedFindingIds, decisionFor]);
 
   const readOnly = job?.viewer ? !job.viewer.isOwner : false;
   const selected = useMemo(() => findings.find((f) => f.id === selectedId) ?? null, [findings, selectedId]);
@@ -747,7 +773,8 @@ export function RealReportView({ jobId }: { jobId: string }) {
                   {selectedFindingIds.size} findings selected
                 </span>
                 <span className="font-mono text-muted text-[11px]">
-                  ({eligibleSelectedCount} eligible for automated fix)
+                  ({selectedFixCounts.eligible} eligible for automated fix
+                  {selectedFixCounts.pending > 0 ? ` · ${selectedFixCounts.pending} checked when previewed` : ""})
                 </span>
               </div>
               <Button
@@ -815,7 +842,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
           ) : (
             <ul className="mt-4 divide-y divide-line overflow-hidden rounded-xl border border-line bg-surface">
               {filtered.map((f) => {
-                const elig = classifyRemediationEligibility(f);
+                const fix = findingFixStatus(f, decisionFor(f.fingerprint));
                 const isSelectedForBatch = selectedFindingIds.has(f.id);
 
                 return (
@@ -860,24 +887,26 @@ export function RealReportView({ jobId }: { jobId: string }) {
                               </span>
                             )}
 
-                            {/* Eligibility indicator badge */}
-                            {elig.eligibility === "safe" ? (
-                              <span className="inline-flex items-center gap-1 rounded bg-accent/15 px-2 py-0.5 font-mono text-[10px] text-accent font-semibold">
-                                <CheckCircle2 className="size-3" /> Safe Fix
-                              </span>
-                            ) : elig.eligibility === "potentially_breaking" ? (
-                              <span className="inline-flex items-center gap-1 rounded bg-sev-medium/15 px-2 py-0.5 font-mono text-[10px] text-sev-medium font-semibold">
-                                <AlertTriangle className="size-3" /> Potentially Breaking
-                              </span>
-                            ) : elig.requiresRotation ? (
-                              <span className="inline-flex items-center gap-1 rounded bg-sev-critical/15 px-2 py-0.5 font-mono text-[10px] text-sev-critical font-semibold">
-                                <KeyRound className="size-3" /> Rotate Credential
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center gap-1 rounded bg-surface-subtle border border-line px-2 py-0.5 font-mono text-[10px] text-muted">
-                                Manual Review
-                              </span>
-                            )}
+                            {/* Fix status: the server's stored decision when there is one */}
+                            <span title={fix.reason} data-fix-status={fix.kind}>
+                              {fix.kind === "fix_ready" || fix.kind === "safe" ? (
+                                <span className="inline-flex items-center gap-1 rounded bg-accent/15 px-2 py-0.5 font-mono text-[10px] text-accent font-semibold">
+                                  <CheckCircle2 className="size-3" /> {fix.label}
+                                </span>
+                              ) : fix.kind === "potentially_breaking" ? (
+                                <span className="inline-flex items-center gap-1 rounded bg-sev-medium/15 px-2 py-0.5 font-mono text-[10px] text-sev-medium font-semibold">
+                                  <AlertTriangle className="size-3" /> {fix.label}
+                                </span>
+                              ) : fix.kind === "rotate_credential" ? (
+                                <span className="inline-flex items-center gap-1 rounded bg-sev-critical/15 px-2 py-0.5 font-mono text-[10px] text-sev-critical font-semibold">
+                                  <KeyRound className="size-3" /> {fix.label}
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 rounded bg-surface-subtle border border-line px-2 py-0.5 font-mono text-[10px] text-muted">
+                                  {fix.label}
+                                </span>
+                              )}
+                            </span>
                           </div>
                           <p className="mt-2 font-semibold text-foreground">{f.title}</p>
                           <p className="mt-0.5 break-all font-mono text-xs text-muted">
@@ -903,7 +932,14 @@ export function RealReportView({ jobId }: { jobId: string }) {
         </>
         )}
 
-        <RealFindingDrawer jobId={jobId} finding={selected} onClose={close} mode={mode} readOnly={readOnly} />
+        <RealFindingDrawer
+          jobId={jobId}
+          finding={selected}
+          onClose={close}
+          mode={mode}
+          readOnly={readOnly}
+          onRemediationUpdated={onRemediationUpdated}
+        />
       </div>
     </div>
   );

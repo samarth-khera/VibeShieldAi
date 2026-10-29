@@ -309,6 +309,8 @@ export type PublicRemediation = {
   branchName: string | null;
   pullRequestUrl: string | null;
   pullRequest: RemediationPullRequest | null;
+  /** While verification runs: whether a worker has claimed it yet. */
+  verification?: { claimedAt: string | null; runtime: "warm-worker" | "github-actions" | null } | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -324,11 +326,16 @@ export type PullRequestFailureCode =
   | "patch_conflict"
   | "branch_conflict"
   | "github_error"
-  | "network_error";
+  | "network_error"
+  | "not_confirmed";
+
+/** Steps of publishing a verified fix (stored while they run). */
+export type PullRequestStep = "checking_repository" | "creating_commit" | "pushing_branch" | "creating_pull_request" | "confirming";
 
 /** Outcome of the last pull-request attempt, as GitHub reported it. */
 export type RemediationPullRequest = {
-  status: "created" | "exists" | "failed";
+  status: "in_progress" | "created" | "exists" | "failed";
+  step?: PullRequestStep;
   code?: PullRequestFailureCode;
   message: string;
   branch: string;
@@ -348,7 +355,11 @@ export type RemediationPullRequest = {
     authorEmailIsNoreply?: boolean;
     verified?: boolean;
     verificationReason?: string;
+    authorLogin?: string;
+    committerLogin?: string;
   };
+  /** The pull request's author as GitHub reports it. */
+  prAuthor?: string;
   at: string;
 };
 

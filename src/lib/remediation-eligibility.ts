@@ -6,7 +6,14 @@ export interface RemediationEligibility {
   requiresRotation: boolean;
   reason: string;
   warnings: string[];
+  /**
+   * Only the server can decide (e.g. a vulnerable package reported in a lockfile: fixable only if
+   * the package manager can update it on its own). The UI must not count it as eligible yet.
+   */
+  decidedOnPreview?: boolean;
 }
+
+const LOCKFILE_RE = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml)$/;
 
 /**
  * Typed single-source-of-truth helper for resolving a finding's fixed version.
@@ -65,6 +72,20 @@ export function classifyRemediationEligibility(finding: {
   if (category.includes("dependenc") || finding.packageInfo != null) {
     const fixedVersion = resolveFindingFixedVersion(finding);
     const hasFixed = Boolean(fixedVersion);
+
+    if (hasFixed && LOCKFILE_RE.test(finding.filePath || "")) {
+      return {
+        eligibility: "potentially_breaking",
+        canAutoFix: true,
+        requiresRotation: false,
+        decidedOnPreview: true,
+        reason: `A fixed release (${fixedVersion}) exists. VibeShield can apply it only if the package manager can update this package without changing others; that is checked against the lockfile when you generate the preview.`,
+        warnings: [
+          "Upgrading library versions may introduce breaking changes or transitive dependency conflicts.",
+          "Run the project's automated test suite before merging this remediation.",
+        ],
+      };
+    }
 
     if (hasFixed) {
       return {
@@ -145,4 +166,31 @@ export function classifyRemediationEligibility(finding: {
     reason: "Code modification proposed. Requires review to ensure business logic remains unaffected.",
     warnings: ["Review the exact diff to confirm application behavior is preserved."],
   };
+}
+
+/** What the report shows for a finding: the server's stored decision when there is one. */
+export type FindingFixStatus = {
+  kind: "fix_ready" | "decided_on_preview" | "manual_review" | "not_eligible" | "rotate_credential" | "safe" | "potentially_breaking";
+  label: string;
+  /** Counted as "eligible for automated fix". */
+  eligible: boolean;
+  reason: string;
+};
+
+export function findingFixStatus(
+  finding: Parameters<typeof classifyRemediationEligibility>[0],
+  serverDecision?: { eligibility: RemediationEligibilityType; unifiedDiff: string; eligibilityReason: string } | null,
+): FindingFixStatus {
+  if (serverDecision) {
+    return serverDecision.eligibility === "unsuitable" || !serverDecision.unifiedDiff
+      ? { kind: "manual_review", label: "Manual Review", eligible: false, reason: serverDecision.eligibilityReason }
+      : { kind: "fix_ready", label: "Fix Ready", eligible: true, reason: serverDecision.eligibilityReason };
+  }
+  const e = classifyRemediationEligibility(finding);
+  if (e.requiresRotation) return { kind: "rotate_credential", label: "Rotate Credential", eligible: false, reason: e.reason };
+  if (!e.canAutoFix) return { kind: "not_eligible", label: "Manual Review", eligible: false, reason: e.reason };
+  if (e.decidedOnPreview) return { kind: "decided_on_preview", label: "Checked on Preview", eligible: false, reason: e.reason };
+  return e.eligibility === "safe"
+    ? { kind: "safe", label: "Safe Fix", eligible: true, reason: e.reason }
+    : { kind: "potentially_breaking", label: "Potentially Breaking", eligible: true, reason: e.reason };
 }

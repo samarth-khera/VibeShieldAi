@@ -184,7 +184,8 @@ describe("repository access in Auto-Fix", () => {
       headSha: "abcdef1234567",
       state: "open" as const,
       openedBy: { githubUserId: 1, login: "alice" },
-      commit: { sha: "abcdef1234567", authorName: "alice", authorEmailIsNoreply: true, verified: true },
+      commit: { sha: "abcdef1234567", authorName: "alice", authorLogin: "alice", authorEmailIsNoreply: true, verified: true },
+      prAuthor: "alice",
       at: "2026-10-30T12:00:00Z",
     };
     const rem = {
@@ -214,7 +215,12 @@ describe("repository access in Auto-Fix", () => {
     expect((await screen.findAllByText("Pull request #3 created")).length).toBeGreaterThan(0);
     expect(screen.getByText(/vibeshield\/fix-abc-123 → main · commit abcdef1/)).toBeTruthy();
     expect(screen.getByText("Changed files: backend/package.json, backend/package-lock.json")).toBeTruthy();
-    expect(screen.getByText(/prepared this verified change on behalf of @alice\. GitHub recorded the commit as authored by alice \(GitHub noreply address\), signature verified\./)).toBeTruthy();
+    expect(
+      screen.getByText(
+        /prepared this verified change on behalf of @alice\. GitHub recorded the commit as authored by alice \(@alice\), GitHub noreply address, signature verified\. Pull request author on GitHub: @alice\./,
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText("Branch, commit and pull request were read back from GitHub and match.")).toBeTruthy();
     expect(screen.getByText("View pull request on GitHub").closest("a")!.getAttribute("href")).toBe(pr.url);
   });
 });

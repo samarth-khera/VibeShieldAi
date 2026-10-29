@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertCircle,
   CheckCircle2,
@@ -21,6 +21,7 @@ import {
   disconnectGithub,
   listRemediations,
   type PublicFinding,
+  type PullRequestStep,
   type PublicRemediation,
 } from "@/lib/scan-client";
 import { DiffViewer } from "./diff-viewer";
@@ -49,6 +50,9 @@ const FAILURE_TITLES: Record<string, string> = {
   diff_confirmation_mismatch: "Diff changed; review it again",
   forbidden_origin: "Request blocked",
   network_error: "Could not reach the server",
+  not_confirmed: "GitHub did not confirm the result",
+  approval_user_mismatch: "Approved with a different GitHub account",
+  approval_target_mismatch: "Repository or commit changed since approval",
 };
 
 type Step = { label: string; state: "done" | "pending" | "running" | "blocked"; detail?: string };
@@ -110,6 +114,22 @@ export function GithubPullRequestPanel({
   const verified = remediation.status === "verified" && remediation.rescanStatus === "verified";
   const pr = remediation.pullRequest;
   const prDone = pr?.status === "created" || pr?.status === "exists";
+  // Stored progress of a publish that is running now (in this or another tab); a run that stopped
+  // updating is shown as interrupted instead of spinning forever.
+  const [now, setNow] = useState(() => Date.now());
+  const inProgress = pr?.status === "in_progress" && now - Date.parse(pr.at) < PR_STALE_MS;
+  const interrupted = pr?.status === "in_progress" && !inProgress;
+  useEffect(() => {
+    if (!creating && !inProgress) return;
+    const t = setInterval(async () => {
+      setNow(Date.now());
+      const fresh = await listRemediations(jobId)
+        .then((list) => list.find((r) => r.id === remediation.id))
+        .catch(() => undefined);
+      if (fresh && JSON.stringify(fresh.pullRequest) !== JSON.stringify(remediation.pullRequest)) onRemediationUpdated(fresh);
+    }, 1000);
+    return () => clearInterval(t);
+  }, [creating, inProgress, jobId, remediation.id, remediation.pullRequest, onRemediationUpdated]);
   const repo = status?.repository;
   const lastFailure = prError ?? (pr?.status === "failed" && pr.code ? { code: pr.code, message: pr.message } : null);
   // The repository can be authorized from VibeShield itself (see RepositoryAuthorizationPanel).
@@ -156,15 +176,32 @@ export function GithubPullRequestPanel({
           ? { label: "Fix not verified", state: "blocked", detail: "Pull requests are only offered for verified fixes." }
           : { label: "Security verification", state: "pending" },
   );
-  steps.push(
-    creating
-      ? { label: "Creating branch and commit, opening pull request", state: "running" }
-      : prDone
-        ? { label: pr?.status === "created" ? `Pull request #${pr.number} created` : `Pull request #${pr?.number} exists (${pr?.state})`, state: "done" }
-        : lastFailure
-          ? { label: `Fix or PR creation failed — ${FAILURE_TITLES[lastFailure.code] ?? "GitHub error"}`, state: "blocked", detail: lastFailure.message }
-          : { label: "Pull request", state: "pending" },
-  );
+  if (creating || inProgress) {
+    // Real progress: each step is stored by the server as it starts.
+    const current = PR_STEPS.findIndex(([step]) => step === pr?.step);
+    PR_STEPS.forEach(([, label], i) => {
+      const at = Math.max(current, 0);
+      steps.push({ label, state: i < at ? "done" : i === at ? "running" : "pending" });
+    });
+  } else if (prDone && pr) {
+    steps.push({ label: "Commit created on top of the scanned commit", state: "done", detail: pr.headSha ? `commit ${pr.headSha.slice(0, 12)}` : undefined });
+    steps.push({ label: "Branch pushed", state: "done", detail: pr.branch });
+    steps.push({
+      label: pr.status === "created" ? `Pull request #${pr.number} created` : `Pull request #${pr.number} exists (${pr.state})`,
+      state: "done",
+      detail: "Branch, commit and pull request were read back from GitHub and match.",
+    });
+  } else if (interrupted) {
+    steps.push({
+      label: "Publishing was interrupted",
+      state: "blocked",
+      detail: "No result was confirmed by GitHub. Retrying is safe: it reuses the same branch and pull request.",
+    });
+  } else if (lastFailure) {
+    steps.push({ label: `Fix or PR creation failed — ${FAILURE_TITLES[lastFailure.code] ?? "GitHub error"}`, state: "blocked", detail: lastFailure.message });
+  } else {
+    steps.push({ label: "Pull request", state: "pending" });
+  }
 
   const onCreate = async () => {
     if (creating) return;
@@ -263,8 +300,9 @@ export function GithubPullRequestPanel({
             <p className="mt-1 text-[11px] text-muted">
               VibeShield prepared this verified change on behalf of @{pr.openedBy.login}.
               {pr.commit?.authorName
-                ? ` GitHub recorded the commit as authored by ${pr.commit.authorName}${pr.commit.authorEmailIsNoreply ? " (GitHub noreply address)" : ""}${pr.commit.verified ? ", signature verified" : ""}.`
+                ? ` GitHub recorded the commit as authored by ${pr.commit.authorName}${pr.commit.authorLogin ? ` (@${pr.commit.authorLogin})` : ""}${pr.commit.authorEmailIsNoreply ? ", GitHub noreply address" : ""}${pr.commit.verified ? ", signature verified" : ""}.`
                 : ""}
+              {pr.prAuthor ? ` Pull request author on GitHub: @${pr.prAuthor}.` : ""}
             </p>
           )}
           {pr.baseAdvanced && (
@@ -290,8 +328,9 @@ export function GithubPullRequestPanel({
           </a>
         )}
         {verified && !prDone && repo?.readyToWrite && (
-          <Button onClick={() => setDialogOpen(true)} size="sm" disabled={creating}>
-            <GitPullRequest className="size-3.5" /> {lastFailure ? "Retry pull request" : "Review & create pull request"}
+          <Button onClick={() => setDialogOpen(true)} size="sm" disabled={creating || inProgress}>
+            {creating || inProgress ? <Loader2 className="size-3.5 animate-spin" /> : <GitPullRequest className="size-3.5" />}{" "}
+            {creating || inProgress ? "Publishing…" : lastFailure || interrupted ? "Retry pull request" : "Review & create pull request"}
           </Button>
         )}
         {patchDownloadUrl && (
@@ -369,3 +408,14 @@ export function GithubPullRequestPanel({
     </div>
   );
 }
+
+/** A stored "in progress" state older than this did not finish (the request died); retrying is safe. */
+const PR_STALE_MS = 2 * 60_000;
+
+const PR_STEPS: [PullRequestStep, string][] = [
+  ["checking_repository", "Re-checking repository access and write permission"],
+  ["creating_commit", "Creating commit"],
+  ["pushing_branch", "Creating and pushing branch"],
+  ["creating_pull_request", "Creating pull request"],
+  ["confirming", "Confirming branch, commit and pull request with GitHub"],
+];
