@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   AlertCircle,
   CheckCircle2,
@@ -19,13 +19,12 @@ import {
   createRemediationPr,
   diffSha256,
   disconnectGithub,
-  fetchGithubStatus,
   listRemediations,
-  type GithubStatus,
   type PublicFinding,
   type PublicRemediation,
 } from "@/lib/scan-client";
 import { DiffViewer } from "./diff-viewer";
+import { useGithubStatus, type GithubStatusHandle } from "./repository-authorization";
 
 const FAILURE_TITLES: Record<string, string> = {
   not_configured: "GitHub authorization is not configured",
@@ -87,15 +86,16 @@ export function GithubPullRequestPanel({
   remediation,
   onRemediationUpdated,
   patchDownloadUrl,
+  github,
 }: {
   jobId: string;
   finding: PublicFinding;
   remediation: PublicRemediation;
   onRemediationUpdated: (r: PublicRemediation) => void;
   patchDownloadUrl?: string;
+  /** Status shared with the repository access panel; loaded here when not provided. */
+  github?: GithubStatusHandle;
 }) {
-  const [status, setStatus] = useState<GithubStatus | null>(null);
-  const [statusError, setStatusError] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -103,31 +103,17 @@ export function GithubPullRequestPanel({
   const [disconnecting, setDisconnecting] = useState(false);
   const returnTo = `/report/${jobId}?finding=${finding.id}&mode=autofix`;
 
-  // Bumped after actions so the server re-checks authorization with GitHub.
-  const [statusVersion, setStatusVersion] = useState(0);
-  const loadStatus = () => setStatusVersion((v) => v + 1);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetchGithubStatus(jobId, returnTo)
-      .then((s) => {
-        if (cancelled) return;
-        setStatus(s);
-        setStatusError(null);
-      })
-      .catch((err) => {
-        if (!cancelled) setStatusError(err instanceof Error ? err.message : "Could not load GitHub authorization status.");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [jobId, returnTo, remediation.status, statusVersion]);
+  // Re-checked with GitHub whenever the remediation changes state and after every action.
+  const own = useGithubStatus(jobId, returnTo, remediation.status, !github);
+  const { status, error: statusError, reload: loadStatus } = github ?? own;
 
   const verified = remediation.status === "verified" && remediation.rescanStatus === "verified";
   const pr = remediation.pullRequest;
   const prDone = pr?.status === "created" || pr?.status === "exists";
   const repo = status?.repository;
   const lastFailure = prError ?? (pr?.status === "failed" && pr.code ? { code: pr.code, message: pr.message } : null);
+  // The repository can be authorized from VibeShield itself (see RepositoryAuthorizationPanel).
+  const inProductAuthorization = repo?.authorization?.state === "authorization_required";
 
   const steps: Step[] = [];
   if (status?.configured) {
@@ -147,21 +133,23 @@ export function GithubPullRequestPanel({
       );
       steps.push(
         repo.readyToWrite
-          ? { label: "Repository write access confirmed", state: "done", detail: "App installed on this repository; you can push." }
-          : repo.canRead
-            ? { label: FAILURE_TITLES[repo.reason ?? "not_installed"], state: "blocked", detail: repo.message }
-            : { label: "Repository write access", state: "pending" },
+          ? { label: "Repository authorized", state: "done", detail: "In the VibeShield AI installation; you can push." }
+          : inProductAuthorization
+            ? { label: "Repository authorization required", state: "pending", detail: "Authorize this repository under Repository access." }
+            : repo.canRead
+              ? { label: FAILURE_TITLES[repo.reason ?? "not_installed"], state: "blocked", detail: repo.authorization?.message ?? repo.message }
+              : { label: "Repository write access", state: "pending" },
       );
     }
   }
   steps.push(
     remediation.approvedAt
       ? { label: "Patch approved", state: "done" }
-      : { label: "Patch awaiting your approval", state: "pending" },
+      : { label: "Approval required", state: "pending", detail: "Fix preview ready: review the exact diff and approve it." },
   );
   steps.push(
     remediation.status === "applied"
-      ? { label: "Security verification running", state: "running" }
+      ? { label: "Verifying full repository", state: "running", detail: "Patch applied to the scanned commit; all scanners are rerunning." }
       : verified
         ? { label: "Fix verified by security rescan", state: "done" }
         : remediation.status === "failed" || remediation.status === "needs_review"
@@ -170,11 +158,11 @@ export function GithubPullRequestPanel({
   );
   steps.push(
     creating
-      ? { label: "Creating branch, committing the verified patch, opening pull request", state: "running" }
+      ? { label: "Creating branch and commit, opening pull request", state: "running" }
       : prDone
         ? { label: pr?.status === "created" ? `Pull request #${pr.number} created` : `Pull request #${pr?.number} exists (${pr?.state})`, state: "done" }
         : lastFailure
-          ? { label: `Pull request failed — ${FAILURE_TITLES[lastFailure.code] ?? "GitHub error"}`, state: "blocked", detail: lastFailure.message }
+          ? { label: `Fix or PR creation failed — ${FAILURE_TITLES[lastFailure.code] ?? "GitHub error"}`, state: "blocked", detail: lastFailure.message }
           : { label: "Pull request", state: "pending" },
   );
 
@@ -270,6 +258,15 @@ export function GithubPullRequestPanel({
             {pr.headSha ? ` · commit ${pr.headSha.slice(0, 7)}` : ""}
             {pr.openedBy ? ` · opened as @${pr.openedBy.login} via the VibeShield AI GitHub App` : ""}
           </p>
+          <p className="mt-1 text-[11px] text-muted">Changed files: {remediation.affectedFiles.join(", ")}</p>
+          {pr.openedBy && (
+            <p className="mt-1 text-[11px] text-muted">
+              VibeShield prepared this verified change on behalf of @{pr.openedBy.login}.
+              {pr.commit?.authorName
+                ? ` GitHub recorded the commit as authored by ${pr.commit.authorName}${pr.commit.authorEmailIsNoreply ? " (GitHub noreply address)" : ""}${pr.commit.verified ? ", signature verified" : ""}.`
+                : ""}
+            </p>
+          )}
           {pr.baseAdvanced && (
             <p className="mt-1 text-muted">
               {pr.baseBranch} has new commits since the scan. GitHub shows whether the pull request still merges cleanly.
@@ -282,12 +279,12 @@ export function GithubPullRequestPanel({
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        {status?.configured && !status.connected && (
+        {status?.configured && !status.connected && !github && (
           <a href={status.links.connect} className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-accent px-3 font-medium text-background">
             <KeyRound className="size-3.5" /> {status.authorizationProblem ? "Reconnect GitHub" : "Connect GitHub"}
           </a>
         )}
-        {status?.connected && repo && !repo.readyToWrite && (repo.reason === "not_installed" || repo.reason === "app_lacks_permission") && (
+        {status?.connected && repo && !repo.readyToWrite && !inProductAuthorization && (repo.reason === "not_installed" || repo.reason === "app_lacks_permission") && (
           <a href={status.links.install} className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-accent px-3 font-medium text-background">
             <GitBranch className="size-3.5" /> Authorize this repository
           </a>
@@ -308,7 +305,7 @@ export function GithubPullRequestPanel({
         )}
       </div>
 
-      {status?.connected && repo?.reason === "not_installed" && (
+      {status?.connected && repo?.reason === "not_installed" && !inProductAuthorization && (
         <p className="text-[11px] text-muted">
           If {repo.fullName.split("/")[0]} is an organization, an organization owner may need to approve the VibeShield app
           before it can be installed on this repository. You can review or remove access at any time in{" "}

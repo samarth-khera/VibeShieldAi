@@ -161,6 +161,8 @@ export class ApiRequestError extends Error {
     public readonly code: string,
     message: string,
     public readonly status: number,
+    /** Structured details some errors carry (e.g. GitHub-managed next steps). */
+    public readonly data?: unknown,
   ) {
     super(message);
   }
@@ -184,6 +186,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       json?.error?.code ?? "server_error",
       json?.error?.message ?? "The server returned an unexpected response.",
       res.status,
+      res.ok ? undefined : json?.data,
     );
   }
   return json.data;
@@ -336,8 +339,29 @@ export type RemediationPullRequest = {
   state?: "open" | "closed" | "merged";
   baseAdvanced?: boolean;
   openedBy?: { githubUserId: number; login: string };
+  /** The fix commit as GitHub recorded it. */
+  commit?: {
+    sha: string;
+    url?: string;
+    authorName?: string;
+    committerName?: string;
+    authorEmailIsNoreply?: boolean;
+    verified?: boolean;
+    verificationReason?: string;
+  };
   at: string;
 };
+
+/** Per-repository authorization state, from GitHub's live answer for the user's own token. */
+export type RepositoryAuthorizationState =
+  | "authorized"
+  | "authorization_required"
+  | "app_setup_required"
+  | "installation_required"
+  | "admin_required"
+  | "organization_approval_required"
+  | "no_push_permission"
+  | "app_lacks_permission";
 
 export type GithubAuthFailureCode =
   | "not_configured"
@@ -369,6 +393,16 @@ export type GithubStatus = {
     readyToWrite: boolean;
     reason?: GithubAuthFailureCode;
     message?: string;
+    id?: number;
+    ownerType?: "User" | "Organization";
+    canAdmin?: boolean;
+    authorization?: {
+      state: RepositoryAuthorizationState;
+      message: string;
+      installationId?: number;
+      installationAccount?: string;
+      installationSettingsUrl?: string;
+    };
   };
   authorizationProblem?: GithubAuthFailureCode;
   links: { connect: string; install: string; manageInstallations: string };
@@ -378,6 +412,48 @@ export const fetchGithubStatus = (jobId: string, returnTo: string) =>
   request<GithubStatus>(
     `/api/auth/github/status?jobId=${encodeURIComponent(jobId)}&returnTo=${encodeURIComponent(returnTo)}`,
   );
+
+/** What the server bound for one "authorize this repository" confirmation (shown in the dialog). */
+export type RepositoryAuthorizationPrepared = {
+  state: RepositoryAuthorizationState;
+  message: string;
+  repository: {
+    id: number;
+    fullName: string;
+    defaultBranch: string | null;
+    isPrivate: boolean;
+    ownerType: "User" | "Organization" | null;
+    canPush: boolean;
+    canAdmin: boolean;
+  };
+  installation: { id: number; account: string; repositorySelection: "all" | "selected" } | null;
+  scannedCommit: string;
+  links: { install: string; installationSettings: string | null };
+  request: { intent: string; expiresAt: string } | null;
+};
+
+export type RepositoryAuthorizationResult = Omit<RepositoryAuthorizationPrepared, "request" | "scannedCommit"> & { added: boolean };
+
+const repositoryAuthorization = <T>(jobId: string, body: Record<string, unknown>) =>
+  request<T>(`/api/scans/${encodeURIComponent(jobId)}/repository-authorization`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+export const prepareRepositoryAuthorization = (jobId: string, remediationId?: string) =>
+  repositoryAuthorization<RepositoryAuthorizationPrepared>(jobId, { action: "prepare", ...(remediationId ? { remediationId } : {}) });
+
+export const confirmRepositoryAuthorization = (jobId: string, p: RepositoryAuthorizationPrepared) =>
+  repositoryAuthorization<RepositoryAuthorizationResult>(jobId, {
+    action: "confirm",
+    intent: p.request!.intent,
+    repositoryId: p.repository.id,
+    installationId: p.installation!.id,
+  });
+
+export const cancelRepositoryAuthorization = (jobId: string, intent: string) =>
+  repositoryAuthorization<{ cancelled: true }>(jobId, { action: "cancel", intent });
 
 export const disconnectGithub = () =>
   request<{ connected: false; revokedAtGitHub?: boolean }>("/api/auth/github/disconnect", { method: "POST" });

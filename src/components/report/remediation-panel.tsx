@@ -21,6 +21,7 @@ import {
   type PublicRemediation,
 } from "@/lib/scan-client";
 import { GithubPullRequestPanel } from "./github-pr-panel";
+import { RepositoryAuthorizationPanel, useGithubStatus } from "./repository-authorization";
 import { DiffViewer } from "./diff-viewer";
 import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
 import { useAdaptivePoll } from "@/lib/use-adaptive-poll";
@@ -122,6 +123,13 @@ export function RemediationPanel({
   const [isApplying, setIsApplying] = useState(false);
   const [approvedChecked, setApprovedChecked] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // One live GitHub status for both the repository access card and the pull-request panel.
+  const github = useGithubStatus(
+    jobId,
+    `/report/${jobId}?finding=${finding.id}&mode=autofix`,
+    remediation?.status,
+    mode === "autofix" && !readOnly,
+  );
 
   // Restore the latest remediation for this finding after a reload, so a verified fix and its
   // pull request state are shown instead of offering a fresh preview.
@@ -278,6 +286,10 @@ export function RemediationPanel({
         </div>
       )}
 
+      {mode === "autofix" && !readOnly && !isSecret && (
+        <RepositoryAuthorizationPanel jobId={jobId} remediationId={remediation?.id} github={github} />
+      )}
+
       {/* Action to generate preview if none yet */}
       {!remediation && !isSecret && (
         <div className="space-y-3">
@@ -342,6 +354,7 @@ export function RemediationPanel({
                 onRemediationUpdated?.(r);
               }}
               patchDownloadUrl={patchDownloadUrl}
+              github={github}
             />
           )}
 
