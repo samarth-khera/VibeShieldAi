@@ -42,6 +42,62 @@ export function toPublicFinding(f: FindingRecord) {
   };
 }
 
+/**
+ * What a report may claim. Only `complete` (every scanner finished) may be shown as a verified result;
+ * zero findings mean "clean" only then. `partial` lists the scanners that did not finish, and
+ * `failed`/`cancelled` mean nothing was (fully) scanned, whatever the finding counts say.
+ */
+export type ReportState = "in_progress" | "complete" | "partial" | "failed" | "cancelled";
+
+const SCANNER_NAMES = { gitleaks: "gitleaks", semgrep: "semgrep", osvScanner: "osv-scanner" } as const;
+
+export function reportStateOf(job: JobRecord): { state: ReportState; incompleteScanners: string[] } {
+  const statuses = { gitleaks: job.gitleaksStatus, semgrep: job.semgrepStatus, osvScanner: job.osvStatus };
+  const incomplete = (Object.keys(statuses) as (keyof typeof statuses)[])
+    .filter((k) => statuses[k] !== "completed")
+    .map((k) => SCANNER_NAMES[k]);
+  switch (job.status) {
+    case "queued":
+    case "retrieving":
+    case "ready_for_scan":
+    case "scanning":
+      return { state: "in_progress", incompleteScanners: [] };
+    case "completed":
+      return { state: incomplete.length === 0 ? "complete" : "partial", incompleteScanners: incomplete };
+    case "completed_with_warnings":
+      return { state: "partial", incompleteScanners: incomplete };
+    case "cancelled":
+      return { state: "cancelled", incompleteScanners: incomplete };
+    default:
+      return { state: "failed", incompleteScanners: incomplete };
+  }
+}
+
+/** Safe, user-facing reasons for retrieval and limit failures, keyed by RetrievalError category. */
+const FAILURE_MESSAGES: Record<string, string> = {
+  archive_too_large: "The repository archive is larger than the scan size limit, so no scanner ran.",
+  repo_too_large: "The repository is larger than the supported size limit, so no scanner ran.",
+  file_count: "The repository has more files than the scan limit allows, so no scanner ran.",
+  unpacked_size: "The repository is too large once unpacked, so no scanner ran.",
+  unsafe_entry: "The repository archive contains an unsupported entry type, so it was not scanned.",
+  unsafe_path: "The repository archive contains an unsafe path, so it was not scanned.",
+  timeout: "Retrieving the repository timed out before scanning.",
+  network_error: "GitHub could not be reached, so the repository was not scanned.",
+  github_rate_limited: "GitHub's rate limit was reached, so the repository was not scanned. Try again later.",
+};
+
+// Failures reported before structured categories existed: "<status>:<category>" in the message.
+const LEGACY_FAILURE = /^(?:rejected_by_limits|download_failed|invalid_repository|failed):([a-z_]{1,40})$/;
+
+function publicFailure(job: JobRecord): { category: string | null; message: string } | null {
+  if (!job.errorMessage) return null;
+  const legacy = job.failureCategory === "scan_failed" ? LEGACY_FAILURE.exec(job.errorMessage) : null;
+  if (legacy) {
+    return { category: legacy[1], message: FAILURE_MESSAGES[legacy[1]] ?? "The scan failed before the scanners completed." };
+  }
+  return { category: job.failureCategory, message: job.errorMessage };
+}
+
 /** Whitelisted public projection. Never includes internal fields, error text beyond the sanitized message, or raw secrets. */
 /** Public executor label; lease tokens stored in workflowRunId are never exposed. */
 function executorOf(job: JobRecord): "warm-worker" | "github-actions" | null {
@@ -51,6 +107,7 @@ function executorOf(job: JobRecord): "warm-worker" | "github-actions" | null {
 
 export function toPublicJob(job: JobRecord, workerOnline?: boolean, extra?: { queuePosition?: number | null }) {
   const scanPerformed = ["completed", "completed_with_warnings"].includes(job.status);
+  const { state: reportState, incompleteScanners } = reportStateOf(job);
   const totalFindings =
     (job.criticalCount ?? 0) +
     (job.highCount ?? 0) +
@@ -105,9 +162,11 @@ export function toPublicJob(job: JobRecord, workerOnline?: boolean, extra?: { qu
           total: totalFindings,
         }
       : null,
-    failure: job.errorMessage ? { category: job.failureCategory, message: job.errorMessage } : null,
+    failure: publicFailure(job),
     retryable: RETRYABLE_STATUSES.has(job.status),
     scanPerformed,
+    reportState,
+    incompleteScanners,
     workerOnline: job.status === "queued" ? (workerOnline ?? null) : null,
     // Waiting for a free worker slot (accepted, not yet claimed by an executor).
     queue:

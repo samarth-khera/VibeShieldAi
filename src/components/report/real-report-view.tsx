@@ -17,6 +17,7 @@ import {
   Search,
   SearchX,
   ShieldCheck,
+  ShieldX,
   Sparkles,
 } from "lucide-react";
 import { SeverityBadge, severityStyles } from "@/components/ui/badges";
@@ -24,6 +25,7 @@ import { Button } from "@/components/ui/button";
 import {
   fetchFindings,
   fetchScan,
+  reportStateOf,
   retryScan,
   type PublicFinding,
   type PublicScanJob,
@@ -358,7 +360,16 @@ export function RealReportView({ jobId }: { jobId: string }) {
   }
 
   const isScanning = ACTIVE_SCAN_STATUSES.includes(job.status);
-  const isCompletedWithWarnings = job.status === "completed_with_warnings";
+  // What this report may claim: only "complete" is a verified result; failed/cancelled scanned nothing.
+  const state = reportStateOf(job);
+  const notScanned = state === "failed" || state === "cancelled";
+  const isPartial = state === "partial";
+  const scannerLabel = (status: string | null) => status ?? (notScanned ? "not run" : "pending");
+  const incompleteScanners = job.incompleteScanners ?? [];
+  // Size and safety limits fail the same way on every retry, so no retry is offered for them.
+  const limitFailure = ["archive_too_large", "repo_too_large", "file_count", "unpacked_size", "unsafe_entry", "unsafe_path"].includes(
+    job.failure?.category ?? "",
+  );
   const repoName = `${job.repository.owner}/${job.repository.name}`;
 
   return (
@@ -393,41 +404,83 @@ export function RealReportView({ jobId }: { jobId: string }) {
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-sev-medium/50 bg-sev-medium/10 px-3 py-1 font-mono text-xs font-semibold text-sev-medium">
                   <Loader2 className="size-3.5 animate-spin" /> PARTIAL — SCAN STILL RUNNING
                 </span>
-              ) : (
+              ) : state === "complete" ? (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-accent/10 px-3 py-1 font-mono text-xs font-semibold text-accent">
                   <ShieldCheck className="size-3.5" /> VERIFIED SCAN REPORT
                 </span>
+              ) : isPartial ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-sev-medium/50 bg-sev-medium/10 px-3 py-1 font-mono text-xs font-semibold text-sev-medium">
+                  <AlertTriangle className="size-3.5" /> PARTIAL SCAN — INCOMPLETE COVERAGE
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-sev-critical/50 bg-sev-critical/10 px-3 py-1 font-mono text-xs font-semibold text-sev-critical">
+                  <ShieldX className="size-3.5" /> {state === "cancelled" ? "SCAN CANCELLED — NOT SCANNED" : "SCAN FAILED — NOT SCANNED"}
+                </span>
               )}
               <span className="font-mono text-xs text-muted">
-                {job.completedAt ? `Scanned ${new Date(job.completedAt).toLocaleString()}` : "In progress"}
+                {job.completedAt
+                  ? `${notScanned ? "Ended" : "Scanned"} ${new Date(job.completedAt).toLocaleString()}`
+                  : "In progress"}
               </span>
             </div>
             <h1 className="mt-4 break-words font-display text-3xl font-bold tracking-tight sm:text-4xl">
               {repoName}
             </h1>
             <p className="mt-2 font-mono text-xs text-muted">
-              branch {job.repository.defaultBranch ?? "main"} · commit {job.repository.commitSha?.slice(0, 7) ?? "—"} · {job.retrieval?.fileCount ?? 0} files analyzed
+              branch {job.repository.defaultBranch ?? "main"} · commit {job.repository.commitSha?.slice(0, 7) ?? "—"} ·{" "}
+              {notScanned ? "no files analyzed" : `${job.retrieval?.fileCount ?? 0} files analyzed`}
             </p>
           </div>
 
           <div className="shrink-0 sm:text-right">
-            <div className="font-display text-5xl font-bold leading-none text-accent">
-              {findings.length}
+            <div className={cn("font-display text-5xl font-bold leading-none", notScanned ? "text-muted" : "text-accent")}>
+              {notScanned ? "—" : findings.length}
             </div>
             <div className="mt-1 font-mono text-[11px] uppercase tracking-wider text-muted">
-              {isScanning ? "Findings so far" : `Verified Finding${findings.length === 1 ? "" : "s"}`}
+              {isScanning
+                ? "Findings so far"
+                : notScanned
+                  ? "Not scanned"
+                  : isPartial
+                    ? `Finding${findings.length === 1 ? "" : "s"} · partial coverage`
+                    : `Verified Finding${findings.length === 1 ? "" : "s"}`}
             </div>
           </div>
         </header>
 
+        {/* Failed or cancelled: say plainly that nothing was scanned */}
+        {notScanned && (
+          <div role="alert" className="mt-4 flex items-start gap-3 rounded-xl border border-sev-critical/40 bg-sev-critical/5 p-4 text-sm text-foreground">
+            <ShieldX className="mt-0.5 size-5 shrink-0 text-sev-critical" aria-hidden />
+            <div className="flex-1">
+              <p className="font-semibold">
+                {state === "cancelled" ? "This scan was cancelled before it finished." : "This repository was not scanned."}
+              </p>
+              {job.failure?.message && <p className="mt-1 text-sm">{job.failure.message}</p>}
+              {job.failure?.category && <p className="mt-1 font-mono text-[11px] text-muted">Reason code: {job.failure.category}</p>}
+              <p className="mt-2 text-xs text-muted">
+                No security scanner completed, so the absence of findings says nothing about this repository. This is not a clean result.
+              </p>
+            </div>
+            {job.retryable && !readOnly && !limitFailure && (
+              <Button variant="secondary" className="h-8 px-3 text-xs" onClick={() => void retryScan(job.id).then(() => loadData())}>
+                <RotateCw className="size-3.5" /> Retry Scan
+              </Button>
+            )}
+          </div>
+        )}
+
         {/* Warning banner if partial scan failure occurred */}
-        {isCompletedWithWarnings && (
+        {isPartial && (
           <div className="mt-4 flex items-start gap-3 rounded-xl border border-sev-medium/40 bg-sev-medium/5 p-4 text-sm text-foreground">
             <AlertTriangle className="mt-0.5 size-5 shrink-0 text-sev-medium" />
             <div className="flex-1">
               <p className="font-semibold">Partial Scan Warning</p>
               <p className="mt-0.5 text-xs text-muted">
-                One or more scanners encountered an issue during execution. Results below reflect successful scanners only.
+                {incompleteScanners.length
+                  ? `Did not complete: ${incompleteScanners.join(", ")}. `
+                  : "One or more scanners did not complete. "}
+                Results below come from the scanners that finished, so coverage is incomplete and an empty list is not a clean result.
               </p>
             </div>
             {job.retryable && (
@@ -451,7 +504,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
                   <KeyRound className="size-4 text-accent" /> Gitleaks
                 </span>
                 <span className={cn("text-[11px] uppercase", job.scanners.gitleaks.status === "completed" ? "text-accent" : "text-sev-medium")}>
-                  {job.scanners.gitleaks.status ?? "pending"}
+                  {scannerLabel(job.scanners.gitleaks.status)}
                 </span>
               </div>
               <p className="mt-2 text-muted">Secret &amp; credential detection</p>
@@ -466,7 +519,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
                   <Layers className="size-4 text-accent" /> Semgrep
                 </span>
                 <span className={cn("text-[11px] uppercase", job.scanners.semgrep.status === "completed" ? "text-accent" : "text-sev-medium")}>
-                  {job.scanners.semgrep.status ?? "pending"}
+                  {scannerLabel(job.scanners.semgrep.status)}
                 </span>
               </div>
               <p className="mt-2 text-muted">Static code security rules</p>
@@ -481,7 +534,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
                   <Package className="size-4 text-accent" /> OSV-Scanner
                 </span>
                 <span className={cn("text-[11px] uppercase", job.scanners.osvScanner.status === "completed" ? "text-accent" : "text-sev-medium")}>
-                  {job.scanners.osvScanner.status ?? "pending"}
+                  {scannerLabel(job.scanners.osvScanner.status)}
                 </span>
               </div>
               <p className="mt-2 text-muted">Dependency vulnerabilities</p>
@@ -512,6 +565,8 @@ export function RealReportView({ jobId }: { jobId: string }) {
           </div>
         )}
 
+        {!notScanned && (
+        <>
         {/* Severity Summary Tiles */}
         <ul className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-5" aria-label="Severity summary">
           {sevOrder.map((s) => {
@@ -709,7 +764,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
           )}
 
           {/* No findings: never presented as clean until every scanner completed */}
-          {findings.length === 0 && job.status !== "completed" ? (
+          {findings.length === 0 && state !== "complete" ? (
             <div className="mt-6 rounded-xl border border-dashed border-line-bright p-12 text-center">
               {isScanning ? (
                 <Loader2 className="mx-auto size-8 animate-spin text-accent" aria-hidden />
@@ -845,6 +900,8 @@ export function RealReportView({ jobId }: { jobId: string }) {
             </p>
           </div>
         </section>
+        </>
+        )}
 
         <RealFindingDrawer jobId={jobId} finding={selected} onClose={close} mode={mode} readOnly={readOnly} />
       </div>

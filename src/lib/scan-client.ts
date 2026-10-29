@@ -49,6 +49,21 @@ export type ScannerStatusDetail = {
   error: string | null;
 };
 
+export type ReportState = "in_progress" | "complete" | "partial" | "failed" | "cancelled";
+
+const ACTIVE_STATES: ReadonlySet<string> = new Set(["queued", "retrieving", "ready_for_scan", "scanning"]);
+
+/** The server's reportState, or the same rule derived locally (never more favourable than the data). */
+export function reportStateOf(job: Pick<PublicScanJob, "status" | "scanners" | "reportState">): ReportState {
+  if (job.reportState) return job.reportState;
+  if (ACTIVE_STATES.has(job.status)) return "in_progress";
+  if (job.status === "cancelled") return "cancelled";
+  if (job.status !== "completed" && job.status !== "completed_with_warnings") return "failed";
+  const s = job.scanners;
+  const allDone = !!s && [s.gitleaks, s.semgrep, s.osvScanner].every((x) => x?.status === "completed");
+  return job.status === "completed" && allDone ? "complete" : "partial";
+}
+
 export type PublicScanJob = {
   id: string;
   status: ScanStatus;
@@ -101,6 +116,10 @@ export type PublicScanJob = {
   failure: { category: string | null; message: string } | null;
   retryable: boolean;
   scanPerformed: boolean;
+  /** What the report may claim; only "complete" is a verified result (see server/api.ts). */
+  reportState?: ReportState;
+  /** Scanners that did not finish (terminal states only). */
+  incompleteScanners?: string[];
   workerOnline: boolean | null;
   /** Present while the scan waits for a free worker slot. */
   queue?: { waitingForSlot: boolean; position: number | null } | null;

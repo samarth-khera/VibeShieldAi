@@ -16,7 +16,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import type { PublicScanJob } from "@/lib/scan-client";
+import { reportStateOf, type PublicScanJob } from "@/lib/scan-client";
 import { cn } from "@/lib/utils";
 
 const fmtBytes = (n: number | null) =>
@@ -45,6 +45,8 @@ export function ScanStatusPanel({
   const isScanning = job.status === "scanning";
   const isCompleted = job.status === "completed" || job.status === "completed_with_warnings";
   const isReadyForScan = job.status === "ready_for_scan";
+  // Zero findings count as clean only when every scanner completed.
+  const isComplete = reportStateOf(job) === "complete";
 
   const repoName = `${job.repository.owner}/${job.repository.name}`;
 
@@ -252,14 +254,14 @@ export function ScanStatusPanel({
         <div className="mt-4 space-y-3 rounded-lg border border-line bg-surface p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              {job.summary.total > 0 ? (
-                <ShieldAlert className="size-5 text-sev-high" aria-hidden />
+              {job.summary.total > 0 || !isComplete ? (
+                <ShieldAlert className={cn("size-5", isComplete ? "text-sev-high" : "text-sev-medium")} aria-hidden />
               ) : (
                 <ShieldCheck className="size-5 text-accent" aria-hidden />
               )}
               <h2 className="font-display font-semibold text-foreground text-sm">
-                {job.status === "completed_with_warnings"
-                  ? "Scan Completed (With Scanner Warnings)"
+                {!isComplete
+                  ? "Partial Scan — Incomplete Coverage"
                   : job.summary.total > 0
                     ? `Scan Completed — ${job.summary.total} Finding${job.summary.total === 1 ? "" : "s"} Detected`
                     : "Scan Completed — No Findings Detected"}
@@ -290,7 +292,9 @@ export function ScanStatusPanel({
           </div>
 
           <p className="font-mono text-[11px] text-muted">
-            {job.summary.total === 0
+            {!isComplete
+              ? `Did not complete: ${(job.incompleteScanners ?? []).join(", ") || "one or more scanners"}. Results come only from the scanners that finished; this is not a clean result.`
+              : job.summary.total === 0
               ? "All enabled security rules and dependency databases checked without hits. Clean results indicate only that no findings were detected within active coverage."
               : "Findings have been normalized with redacted evidence. Never commit raw secrets or vulnerable dependencies."}
           </p>

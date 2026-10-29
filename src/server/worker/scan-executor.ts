@@ -6,6 +6,7 @@ import { parseGithubRepoUrl } from "../../lib/github-url";
 import type { ServerConfig } from "../config";
 import { fetchCommitSha, fetchRepoMetadata, openArchive, openArchiveUrl } from "../github";
 import { extractArchiveSafely } from "../archive";
+import { RetrievalError } from "../errors";
 import { runSecurityScanEngine } from "../scanners/engine";
 import { redactText } from "../scanners/redact";
 import type { NormalizedFinding, SingleScannerResult } from "../scanners/types";
@@ -176,7 +177,12 @@ export async function executeScanJob(ctx: ScanJobContext): Promise<"completed" |
   } catch (err: unknown) {
     const message = redactText(err instanceof Error ? err.message : String(err)).slice(0, 280);
     say(`scan failed: ${message}`);
-    await post({ status: "failed", failureCategory: "scan_failed", errorMessage: message, findings: [] }).catch(() =>
+    // Expected retrieval/limit failures keep their category and user-safe message (e.g. archive_too_large).
+    const failure =
+      err instanceof RetrievalError
+        ? { failureCategory: err.category, errorMessage: err.publicMessage }
+        : { failureCategory: "scan_failed", errorMessage: message };
+    await post({ status: "failed", ...failure, findings: [] }).catch(() =>
       say("could not report failure"),
     );
     return "failed";
