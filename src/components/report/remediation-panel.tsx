@@ -31,6 +31,7 @@ const FAILURE_REASONS: Record<string, string> = {
   patch_target_missing: "A file in the patch does not exist at the scanned commit.",
   patch_tool_unavailable: "The patch tool was unavailable in the verification runtime.",
   patch_does_not_apply: "The patch does not apply cleanly to the scanned commit.",
+  patch_integrity_mismatch: "The applied files did not match the approved patch exactly, so nothing was verified.",
   scanner_failed: "At least one required scanner did not complete, so nothing was verified.",
   target_not_resolved: "The targeted finding is still reported after the patch.",
   new_findings_introduced: "The patched repository has findings the original scan did not.",
@@ -158,6 +159,18 @@ export function RemediationPanel({
     }
   };
 
+  // After a refused approval or verification the server may have replaced the diff (e.g. regenerated
+  // with context lines) and voided the approval: show what is stored now and require a fresh tick.
+  const reloadAfterError = async () => {
+    if (!remediation) return;
+    setApprovedChecked(false);
+    const fresh = (await listRemediations(jobId).catch(() => [])).find((r) => r.id === remediation.id);
+    if (fresh) {
+      setRemediation(fresh);
+      onRemediationUpdated?.(fresh);
+    }
+  };
+
   const onApprove = async () => {
     if (!remediation) return;
     setIsApproving(true);
@@ -168,6 +181,7 @@ export function RemediationPanel({
       onRemediationUpdated?.(res);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Approval failed.");
+      await reloadAfterError();
     } finally {
       setIsApproving(false);
     }
@@ -197,6 +211,7 @@ export function RemediationPanel({
       onRemediationUpdated?.(res);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Application and rescan failed.");
+      await reloadAfterError();
     } finally {
       setIsApplying(false);
     }

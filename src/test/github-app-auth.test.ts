@@ -29,7 +29,7 @@ const TEST_OWNER = { ownerSubject: "test-owner-subject" };
 const ORIGIN = "https://vs.example";
 const COOKIE = "__Host-vibeshield_session";
 const REQS = "flask==2.0.0\nrequests==2.19.0\nnumpy==1.26.0\n";
-const DIFF = "--- a/api/requirements.txt\n+++ b/api/requirements.txt\n@@ -2,1 +2,1 @@\n-requests==2.19.0\n+requests==2.31.0\n";
+const DIFF = "--- a/api/requirements.txt\n+++ b/api/requirements.txt\n@@ -1,3 +1,3 @@\n flask==2.0.0\n-requests==2.19.0\n+requests==2.31.0\n numpy==1.26.0\n";
 
 let gh: FakeGitHubApp;
 let store: InMemoryAuthStore;

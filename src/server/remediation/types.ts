@@ -25,6 +25,7 @@ export type VerificationFailureReason =
   | "patch_target_missing"
   | "patch_tool_unavailable"
   | "patch_does_not_apply"
+  | "patch_integrity_mismatch"
   | "scanner_failed"
   | "target_not_resolved"
   | "new_findings_introduced"

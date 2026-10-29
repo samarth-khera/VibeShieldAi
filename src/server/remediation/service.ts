@@ -9,6 +9,8 @@ import { generateRemediationPatch } from "./patch";
 import { applyAndRescanInSandbox, toBaselineFinding, type BaselineFinding, type SandboxResult } from "./sandbox";
 import { COMMIT_SHA_RE, verifyRemediationOnSnapshot } from "./verify";
 import { fetchSourceAtCommit } from "./source-cache";
+import { canonicalizeDiff, diffFiles } from "./canonical-diff";
+import { parseDiffByFile } from "./strict-apply";
 import { verificationClaimOf, withVerificationClaim } from "./claims";
 import { createRemediationPullRequest, type PullRequestState } from "./github-pr";
 import type { RemediationRecord, RescanComparison } from "./types";
@@ -44,6 +46,76 @@ export class RemediationError extends Error {
   ) {
     super(message);
   }
+}
+
+/**
+ * The exact contents at the scanned commit of every file `diff` touches. Throws if any is
+ * unavailable: a patch is only offered after it has been checked against the real files.
+ */
+async function originalsAtCommit(
+  job: JobRecord,
+  commitSha: string,
+  diff: string,
+  deps: RemediationDeps,
+  known: Record<string, string | undefined> = {},
+): Promise<Map<string, string>> {
+  const originals = new Map<string, string>();
+  for (const file of diffFiles(diff)) {
+    let content = known[file] ?? deps.sourceFiles?.[file];
+    if (content === undefined && deps.fetchImpl) {
+      content = await fetchSourceAtCommit(
+        deps.fetchImpl,
+        { owner: job.owner, repo: job.repo, commitSha, filePath: file },
+        deps.config ?? getConfig(),
+      ).catch(() => undefined);
+    }
+    if (content === undefined) throw new Error(`The source of ${file} at the scanned commit is unavailable, so the patch cannot be checked.`);
+    originals.set(file, content);
+  }
+  return originals;
+}
+
+/** A hunk without any context line can only be anchored at the start or end of a file by `git apply`. */
+function hasContextFreeHunk(diff: string): boolean {
+  for (const hunks of parseDiffByFile(diff).values()) {
+    if (hunks.some((h) => !h.lines.some((l) => l.startsWith(" ")))) return true;
+  }
+  return false;
+}
+
+/**
+ * Remediations created before diffs carried context lines are re-rendered against the scanned
+ * commit before they may be approved or verified. If that changes the diff (and so its hash), the
+ * remediation returns to preview with the new diff and any approval is void: the owner must review
+ * and approve the new exact diff.
+ */
+async function upgradeLegacyDiff(job: JobRecord, remediation: RemediationRecord, deps: RemediationDeps): Promise<void> {
+  if (!remediation.unifiedDiff || !hasContextFreeHunk(remediation.unifiedDiff)) return;
+  let canonical: string;
+  try {
+    const originals = await originalsAtCommit(job, remediation.commitSha, remediation.unifiedDiff, deps);
+    canonical = canonicalizeDiff(originals, remediation.unifiedDiff);
+  } catch {
+    throw new RemediationError(
+      "patch_does_not_apply",
+      "This patch could not be checked against the scanned commit. Generate a new preview.",
+      409,
+    );
+  }
+  if (canonical === remediation.unifiedDiff) return;
+  const updated = await deps.store.transitionRemediation(job.id, remediation.id, ["preview", "failed", "approved"], {
+    status: "preview",
+    unifiedDiff: canonical,
+    approvedAt: null,
+    approvedOperations: null,
+    rescanStatus: null,
+  });
+  if (!updated) throw new RemediationError("invalid_status", "The remediation changed state; reload and try again.", 409);
+  throw new RemediationError(
+    "patch_regenerated",
+    "The patch was regenerated with context lines so it applies with standard git apply. Review the new diff and approve it again.",
+    409,
+  );
 }
 
 /**
@@ -95,7 +167,10 @@ export async function createPreview(
         llmProvider: deps.llmProvider,
         sourceContent,
       });
-      unifiedDiff = patchResult.unifiedDiff;
+      // Re-render against the real files at the scanned commit, with context lines, so the patch
+      // applies with plain `git apply`; refuse it if it does not match those files exactly.
+      const originals = await originalsAtCommit(job, commitSha!, patchResult.unifiedDiff, deps, { [finding.filePath]: sourceContent });
+      unifiedDiff = canonicalizeDiff(originals, patchResult.unifiedDiff);
       patchSummary = patchResult.patchSummary;
       affectedFiles = patchResult.affectedFiles;
     } catch (err: unknown) {
@@ -241,6 +316,8 @@ export async function approveRemediation(
   if (!job.commitSha || !COMMIT_SHA_RE.test(job.commitSha) || remediation.commitSha !== job.commitSha) {
     throw new RemediationError("commit_unknown", "The patch does not belong to this scan's commit.", 409);
   }
+  await upgradeLegacyDiff(job, remediation, deps);
+
   const now = new Date();
   // Idempotent: a still-valid approval by the same owner is returned unchanged.
   if (remediation.status === "approved" && !approvalProblem(job, remediation, actor, now)) return remediation;
@@ -313,6 +390,7 @@ export async function applyAndVerify(
     await invalidateApproval(scanJobId, remediationId, deps);
     throw new RemediationError(problem, APPROVAL_MESSAGES[problem], 409);
   }
+  await upgradeLegacyDiff(job, remediation, deps);
 
   const config = deps.config ?? getConfig();
   const reservation: VerificationReservation = deps.store.beginRemediationVerification

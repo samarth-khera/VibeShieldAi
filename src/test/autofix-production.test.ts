@@ -262,7 +262,7 @@ describe("Sandbox never treats missing or mismatched source as verified", () => 
   const base = {
     originalFindings: [{ fingerprint: "fp-pytest-prod" }],
     targetedFingerprints: ["fp-pytest-prod"],
-    unifiedDiff: "--- a/backend/requirements.txt\n+++ b/backend/requirements.txt\n@@ -2,1 +2,1 @@\n-pytest==7.1.0\n+pytest==9.0.3\n",
+    unifiedDiff: "--- a/backend/requirements.txt\n+++ b/backend/requirements.txt\n@@ -1,3 +1,3 @@\n flask==2.2.5\n-pytest==7.1.0\n+pytest==9.0.3\n requests==2.31.0\n",
   };
 
   it("fails without scanning when no repository snapshot is available (no placeholder files)", async () => {

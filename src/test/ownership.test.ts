@@ -23,7 +23,8 @@ import { InMemoryJobStore } from "@/test/mock-store";
 
 const ORIGIN = "https://vs.example";
 const COMMIT = "c".repeat(40);
-const DIFF = "--- a/requirements.txt\n+++ b/requirements.txt\n@@ -1,1 +1,1 @@\n-requests==2.19.0\n+requests==2.31.0\n";
+// Canonical form (with a context line), as every preview is now generated.
+const DIFF = "--- a/requirements.txt\n+++ b/requirements.txt\n@@ -1,2 +1,2 @@\n-requests==2.19.0\n+requests==2.31.0\n flask==2.0.0\n";
 const CALLBACK_SECRET = "test-callback-secret-0123456789abcdef";
 
 let cfg: OwnershipConfig;

@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runSubprocess } from "../scanners/runner";
@@ -7,6 +7,7 @@ import { safeEntryPath } from "../archive";
 import type { NormalizedFinding, ScanEngineResult } from "../scanners/types";
 import type { RescanComparison, VerificationFailureReason } from "./types";
 import { validateUnifiedDiff, applyUnifiedDiffString } from "./patch";
+import { applyDiffStrict, DiffApplyError } from "./strict-apply";
 export { applyUnifiedDiffString };
 
 /** What verification needs to know about each finding of the original scan. */
@@ -193,9 +194,21 @@ export async function applyAndRescanInSandbox(params: ApplyAndRescanParams): Pro
     await writeFile(patchPath, params.unifiedDiff, { mode: 0o600 });
 
     const tApply = Date.now();
-    // Generated hunks carry no context lines; --unidiff-zero still requires every removed line to
-    // match the snapshot exactly, so a patch for another revision is rejected.
-    const gitArgs = ["apply", "--whitespace=nowarn", "--unidiff-zero"];
+    // Plain `git apply`, exactly as a user applies the downloaded patch: every context and removed
+    // line must match the snapshot, so a patch for another revision is rejected.
+    const gitArgs = ["apply", "--whitespace=nowarn"];
+    // What the approved diff must produce, computed independently of git.
+    const originals = new Map<string, string>();
+    for (const rel of validation.affectedFiles) {
+      originals.set(rel, await readFile(safeEntryPath(workspace, `snapshot/${rel}`)!, "utf8"));
+    }
+    let expected: Map<string, string>;
+    try {
+      expected = applyDiffStrict(originals, params.unifiedDiff);
+    } catch (err) {
+      if (!(err instanceof DiffApplyError)) throw err;
+      return failedResult(params, "patch_does_not_apply", "The approved patch does not apply cleanly to the scanned revision.");
+    }
     const check = await runSubprocess("git", [...gitArgs, "--check", patchPath], {
       cwd: workspace,
       timeoutMs: 10_000,
@@ -212,6 +225,12 @@ export async function applyAndRescanInSandbox(params: ApplyAndRescanParams): Pro
       );
     }
     await runSubprocess("git", [...gitArgs, patchPath], { cwd: workspace, timeoutMs: 10_000 });
+    // The tree that gets rescanned must contain exactly the approved change and nothing else.
+    for (const [rel, content] of expected) {
+      if ((await readFile(safeEntryPath(workspace, `snapshot/${rel}`)!, "utf8")) !== content) {
+        return failedResult(params, "patch_integrity_mismatch", `Applied content differs from the approved patch: ${rel}`);
+      }
+    }
     const applyMs = Date.now() - tApply;
 
     const tScan = Date.now();

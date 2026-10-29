@@ -239,7 +239,7 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
           return `\`\`\`diff
 --- a/src/middleware.ts
 +++ b/src/middleware.ts
-@@ -12,2 +12,3 @@
+@@ -12,1 +12,2 @@
  export function middleware(req) {
 +  res.headers.set('X-Content-Type-Options', 'nosniff');
 \`\`\``;
@@ -249,6 +249,10 @@ describe("Phase 6.5: AI Remediation and User-Approved Auto-Fix", () => {
       deps = {
         store,
         llmProvider: mockLlm,
+        // Previews are checked against the real file at the scanned commit.
+        sourceFiles: {
+          "src/middleware.ts": `${Array.from({ length: 11 }, (_, i) => `// line ${i + 1}`).join("\n")}\nexport function middleware(req) {\n  return next(req);\n}\n`,
+        },
       };
     });
 
@@ -1080,14 +1084,13 @@ export function executeUserPayload(rawData: string) {
         scanEngine: mockEngine,
       };
 
-      await approveRemediation(job.id, staleRem.id, deps, TEST_OWNER);
-      const result = await applyAndVerify(job.id, staleRem.id, deps, TEST_OWNER);
-      // A patch that does not apply to the scanned revision is an explicit failure, never a resolution.
-      expect(result.status).toBe("failed");
-      expect(result.rescanStatus).toBe("failed");
-      expect(result.rescanSummary?.targetResolved).toBe(false);
-      expect(result.rescanSummary?.reason).toBe("patch_does_not_apply");
-      expect(result.rescanSummary?.resolvedFingerprints).toEqual([]);
+      // A patch that does not match the scanned revision is refused before it can even be approved.
+      await expect(approveRemediation(job.id, staleRem.id, deps, TEST_OWNER)).rejects.toMatchObject({ code: "patch_does_not_apply", status: 409 });
+      await expect(applyAndVerify(job.id, staleRem.id, deps, TEST_OWNER)).rejects.toMatchObject({ code: "approval_required" });
+      const after = await store.getRemediation(job.id, staleRem.id);
+      expect(after?.status).toBe("preview");
+      expect(after?.approvedAt).toBeNull();
+      expect(after?.rescanStatus).toBeNull();
     });
 
     it("case 6: an unapproved apply request is rejected", async () => {
