@@ -30,12 +30,31 @@ export type RepoAccess = {
   /** The user's own role on the repository, as GitHub reports it for this token. */
   canRead?: boolean;
   canPush?: boolean;
+  /** Repository administrator: GitHub requires this to add the repository to an installation. */
+  canAdmin?: boolean;
+  /** Immutable ID and type of the account that owns the repository. */
+  ownerId?: number;
+  ownerType?: "User" | "Organization";
   /** The repository is selected in an installation of this app that the user can access. */
   installed?: boolean;
   installationId?: number;
   installationAccount?: string;
   /** That installation grants Contents and Pull requests write. */
   appCanWrite?: boolean;
+  /**
+   * This app's installation on the repository owner's account, whether or not the repository is
+   * selected in it. Matched by the owner's immutable account ID, never by name.
+   */
+  ownerInstallation?: OwnerInstallation;
+};
+
+export type OwnerInstallation = {
+  id: number;
+  accountLogin: string;
+  repositorySelection: "all" | "selected";
+  /** "GitHub App installation repository access: write" is granted, so repositories can be added via the API. */
+  canAddRepositories: boolean;
+  appCanWrite: boolean;
 };
 
 export class GithubAuthError extends Error {
@@ -159,10 +178,15 @@ export async function revokeGrant(cfg: GithubAppConfig, accessToken: string, fet
   }
 }
 
-async function apiGet(fetchImpl: FetchLike, token: string, path: string): Promise<{ status: number; body: unknown }> {
+async function apiRequest(
+  fetchImpl: FetchLike,
+  token: string,
+  path: string,
+  method = "GET",
+): Promise<{ status: number; body: unknown }> {
   let res: Response;
   try {
-    res = await fetchImpl(`${API}${path}`, { headers: userHeaders(token), signal: AbortSignal.timeout(15_000) });
+    res = await fetchImpl(`${API}${path}`, { method, headers: userHeaders(token), signal: AbortSignal.timeout(15_000) });
   } catch {
     throw new GithubAuthError("network_error");
   }
@@ -170,8 +194,10 @@ async function apiGet(fetchImpl: FetchLike, token: string, path: string): Promis
   if (res.status === 429 || (res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0")) {
     throw new GithubAuthError("rate_limited");
   }
-  return { status: res.status, body: await res.json().catch(() => null) };
+  return { status: res.status, body: res.status === 204 || res.status === 304 ? null : await res.json().catch(() => null) };
 }
+
+const apiGet = (fetchImpl: FetchLike, token: string, path: string) => apiRequest(fetchImpl, token, path);
 
 export async function getUser(token: string, fetchImpl: FetchLike): Promise<GithubUser> {
   const r = await apiGet(fetchImpl, token, "/user");
@@ -182,9 +208,17 @@ export async function getUser(token: string, fetchImpl: FetchLike): Promise<Gith
 
 type Installation = {
   id: number;
-  account?: { login?: string };
+  account?: { id?: number; login?: string };
+  repository_selection?: string;
   permissions?: Record<string, string>;
 };
+
+/**
+ * Permission key of "GitHub App installation repository access" (repository permission, added by
+ * GitHub on 2026-10-13). With write access, a repository administrator's user token can add that
+ * repository to an existing installation of this app.
+ */
+export const INSTALLATION_REPOSITORIES_PERMISSION = "installation_repositories";
 
 export async function listUserInstallations(token: string, fetchImpl: FetchLike): Promise<Installation[]> {
   const out: Installation[] = [];
@@ -198,7 +232,7 @@ export async function listUserInstallations(token: string, fetchImpl: FetchLike)
   return out;
 }
 
-async function installationHasRepo(token: string, installationId: number, repoId: number, fetchImpl: FetchLike) {
+export async function installationHasRepo(token: string, installationId: number, repoId: number, fetchImpl: FetchLike) {
   for (let page = 1; page <= 10; page++) {
     const r = await apiGet(fetchImpl, token, `/user/installations/${installationId}/repositories?per_page=100&page=${page}`);
     const repos = (r.body as { repositories?: { id: number }[] } | null)?.repositories ?? [];
@@ -228,8 +262,10 @@ export async function checkRepositoryAccess(
       full_name: string;
       private: boolean;
       default_branch: string;
-      permissions?: { pull?: boolean; push?: boolean };
+      owner?: { id?: number; type?: string };
+      permissions?: { pull?: boolean; push?: boolean; admin?: boolean };
     };
+    const ownerType = b.owner?.type === "Organization" ? "Organization" : b.owner?.type === "User" ? "User" : undefined;
     const access: RepoAccess = {
       status: "ok",
       repoId: b.id,
@@ -238,17 +274,29 @@ export async function checkRepositoryAccess(
       defaultBranch: b.default_branch,
       canRead: b.permissions?.pull ?? !b.private,
       canPush: b.permissions?.push === true,
+      canAdmin: b.permissions?.admin === true,
+      ownerId: typeof b.owner?.id === "number" ? b.owner.id : undefined,
+      ownerType,
       installed: false,
       appCanWrite: false,
     };
-    const accountLogin = b.full_name.split("/")[0].toLowerCase();
+    if (access.ownerId === undefined) return access;
     for (const inst of await listUserInstallations(token, fetchImpl)) {
-      if (inst.account?.login?.toLowerCase() !== accountLogin) continue;
+      // The installation must belong to the account that owns this repository (immutable IDs).
+      if (inst.account?.id !== access.ownerId) continue;
+      const appCanWrite = inst.permissions?.contents === "write" && inst.permissions?.pull_requests === "write";
+      access.ownerInstallation = {
+        id: inst.id,
+        accountLogin: inst.account.login ?? "",
+        repositorySelection: inst.repository_selection === "all" ? "all" : "selected",
+        canAddRepositories: inst.permissions?.[INSTALLATION_REPOSITORIES_PERMISSION] === "write",
+        appCanWrite,
+      };
       if (!(await installationHasRepo(token, inst.id, b.id, fetchImpl))) continue;
       access.installed = true;
       access.installationId = inst.id;
       access.installationAccount = inst.account.login;
-      access.appCanWrite = inst.permissions?.contents === "write" && inst.permissions?.pull_requests === "write";
+      access.appCanWrite = appCanWrite;
       break;
     }
     return access;
@@ -258,4 +306,26 @@ export async function checkRepositoryAccess(
     }
     return { status: "error" };
   }
+}
+
+export type AddRepositoryResult = "added" | "forbidden" | "not_found" | "rejected";
+
+/**
+ * PUT /user/installations/{installation_id}/repositories/{repository_id}: adds exactly one
+ * repository, by immutable ID, to one installation. GitHub requires the user to be an
+ * administrator of the repository and the app to hold "installation repository access: write".
+ * 204 (added) and 304 (already present) are both success; the caller re-reads the installation.
+ */
+export async function addRepositoryToInstallation(
+  token: string,
+  installationId: number,
+  repoId: number,
+  fetchImpl: FetchLike,
+): Promise<AddRepositoryResult> {
+  if (!Number.isSafeInteger(installationId) || !Number.isSafeInteger(repoId)) return "rejected";
+  const r = await apiRequest(fetchImpl, token, `/user/installations/${installationId}/repositories/${repoId}`, "PUT");
+  if (r.status === 204 || r.status === 304) return "added";
+  if (r.status === 403) return "forbidden";
+  if (r.status === 404) return "not_found";
+  return "rejected";
 }

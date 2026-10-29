@@ -543,6 +543,7 @@ function pullRequestText(
   job: JobRecord,
   remediation: RemediationRecord,
   findings: FindingRecord[],
+  login: string,
 ): { title: string; body: string } {
   const s = remediation.rescanSummary;
   const scanners = s?.scannerStatuses;
@@ -588,7 +589,7 @@ function pullRequestText(
     ...limitations,
     "",
     "---",
-    "Opened through the VibeShield AI GitHub App with the authorization of the user who approved this exact diff. Review before merging; nothing was merged automatically.",
+    `Prepared by VibeShield AI on behalf of @${login}, who approved this exact diff; the branch, commit and pull request were created with @${login}'s own GitHub authorization through the VibeShield AI GitHub App. Review before merging; nothing was merged automatically.`,
   ]
     .filter((l): l is string => l !== null)
     .join("\n");
@@ -667,7 +668,7 @@ export async function requestPullRequest(
 
   const { findings } = await deps.store.getFindings(scanJobId, { limit: 1000 });
   const targeted = findings.filter((f) => remediation.findingFingerprints.includes(f.fingerprint));
-  const { title, body } = pullRequestText(job, remediation, targeted);
+  const { title, body } = pullRequestText(job, remediation, targeted, actor.login);
 
   const pullRequest = await createRemediationPullRequest({
     owner: job.owner,

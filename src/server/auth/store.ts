@@ -17,7 +17,8 @@ export type SessionRecord = { id: string; expiresAt: Date; account: AccountRecor
 export type StateRecord = {
   id: string;
   sessionId: string;
-  purpose: "connect" | "install";
+  /** "repo_access": a pending per-repository authorization; codeVerifierEnc then holds its encrypted binding. */
+  purpose: "connect" | "install" | "repo_access";
   returnTo: string;
   codeVerifierEnc: string | null;
   expiresAt: Date;

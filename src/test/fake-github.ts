@@ -8,12 +8,16 @@ type Entry = { path: string; mode: string; type: "blob" | "tree"; sha: string };
 export class FakeGitHub {
   blobs = new Map<string, string>();
   trees = new Map<string, Entry[]>();
-  commits = new Map<string, { tree: string; parents: string[]; message: string }>();
+  commits = new Map<string, { tree: string; parents: string[]; message: string; author?: { name: string; email: string } }>();
   refs = new Map<string, string>();
   pulls: { number: number; head: string; base: string; title: string; body: string; state: string; merged_at: null }[] = [];
   calls: { method: string; path: string; auth: string | null }[] = [];
   repo = { full_name: "acme/webapp", default_branch: "main", archived: false, permissions: { push: true } };
   repoId = 4242;
+  /** The GitHub user whose token is making the current request (set by FakeGitHubApp). */
+  actor: { id: number; login: string } | null = null;
+  /** Request bodies of POST /git/commits, to prove no author or committer is ever sent. */
+  commitBodies: Record<string, unknown>[] = [];
   mode: "ok" | "unauthorized" | "deny_writes" | "rate_limited" | "offline" | "missing_repo" = "ok";
 
   private sha(kind: string, data: unknown) {
@@ -70,6 +74,17 @@ export class FakeGitHub {
     return Object.fromEntries([...this.flatten(c.tree)].map(([p, e]) => [p, this.blobs.get(e.sha)!]));
   }
 
+  private commitMeta(sha: string, author?: { name: string; email: string }) {
+    return author
+      ? {
+          author: { ...author, date: "2026-10-30T00:00:00Z" },
+          committer: { name: "GitHub", email: "noreply@github.com", date: "2026-10-30T00:00:00Z" },
+          verification: { verified: true, reason: "valid" },
+          html_url: `https://github.com/acme/webapp/commit/${sha}`,
+        }
+      : {};
+  }
+
   fetch = async (url: string, init?: RequestInit): Promise<Response> => {
     const method = init?.method ?? "GET";
     const path = url.replace("https://api.github.com/repos/acme/webapp", "");
@@ -87,7 +102,7 @@ export class FakeGitHub {
     let m: RegExpMatchArray | null;
     if (method === "GET" && (m = path.match(/^\/git\/commits\/([0-9a-f]+)$/))) {
       const c = this.commits.get(m[1]);
-      return c ? json(200, { sha: m[1], tree: { sha: c.tree }, parents: c.parents.map((sha) => ({ sha })) }) : json(404, {});
+      return c ? json(200, { sha: m[1], tree: { sha: c.tree }, parents: c.parents.map((sha) => ({ sha })), ...this.commitMeta(m[1], c.author) }) : json(404, {});
     }
     if (method === "GET" && (m = path.match(/^\/git\/trees\/([0-9a-f]+)$/))) {
       const t = this.trees.get(m[1]);
@@ -103,9 +118,12 @@ export class FakeGitHub {
       return json(201, { sha: this.build(flat) });
     }
     if (method === "POST" && path === "/git/commits") {
+      this.commitBodies.push(body);
       const sha = this.sha("commit", { ...body, n: this.commits.size });
-      this.commits.set(sha, { tree: body.tree, parents: body.parents, message: body.message });
-      return json(201, { sha });
+      // As on GitHub: without an explicit author, the token's user authors and commits it.
+      const author = body.author ?? (this.actor ? { name: this.actor.login, email: `${this.actor.id}+${this.actor.login}@users.noreply.github.com` } : undefined);
+      this.commits.set(sha, { tree: body.tree, parents: body.parents, message: body.message, author });
+      return json(201, { sha, tree: { sha: body.tree }, ...this.commitMeta(sha, author) });
     }
     if (method === "GET" && (m = path.match(/^\/git\/ref\/heads\/(.+)$/))) {
       const sha = this.refs.get(`heads/${m[1]}`);
@@ -157,8 +175,24 @@ export class FakeGitHubApp {
   /** Repository role per user. */
   push = new Set<number>([1001]);
   read = new Set<number>([1001, 1002]);
+  admin = new Set<number>([1001]);
   isPrivate = false;
-  installation = { id: 77, account: "acme", repos: new Set<number>([4242]), permissions: { contents: "write", pull_requests: "write", metadata: "read" } };
+  /** The repository's owner account (acme). */
+  owner = { id: 9001, login: "acme", type: "Organization" as "User" | "Organization" };
+  installation = {
+    id: 77,
+    account: "acme",
+    accountId: 9001,
+    repositorySelection: "selected" as "selected" | "all",
+    repos: new Set<number>([4242]),
+    permissions: { contents: "write", pull_requests: "write", metadata: "read" } as Record<string, string>,
+  };
+  /** Another account's installation of the same app, visible to the same users (substitution tests). */
+  otherInstallation: { id: number; account: string; accountId: number; repos: Set<number> } | null = null;
+  /** PUT /user/installations/:id/repositories/:repo calls, in order. */
+  repoAdds: { userId: number; installationId: number; repoId: number; status: number }[] = [];
+  /** Forces the next add-repository response (e.g. 403 for an organization policy). */
+  addRepoStatus: number | null = null;
   /** Users who can see the installation (members of the account). */
   installationUsers = new Set<number>([1001, 1002]);
   codes = new Map<string, { userId: number; challenge: string }>();
@@ -232,13 +266,42 @@ export class FakeGitHubApp {
 
     if (path === "/user") return json(200, { id: userId, login: this.users.get(userId)!.login, avatar_url: "https://avatars.example/x" });
     if (path.startsWith("/user/installations?")) {
+      const inst = (i: { id: number; account: string; accountId: number }, extra: Record<string, unknown>) => ({
+        id: i.id,
+        account: { id: i.accountId, login: i.account },
+        ...extra,
+      });
       const list = this.installationUsers.has(userId)
-        ? [{ id: this.installation.id, account: { login: this.installation.account }, permissions: this.installation.permissions }]
+        ? [
+            ...(this.otherInstallation ? [inst(this.otherInstallation, { repository_selection: "selected", permissions: this.installation.permissions })] : []),
+            inst(this.installation, { repository_selection: this.installation.repositorySelection, permissions: this.installation.permissions }),
+          ]
         : [];
       return json(200, { total_count: list.length, installations: list });
     }
+    const add = path.match(/^\/user\/installations\/(\d+)\/repositories\/(\d+)$/);
+    if (add && method === "PUT") {
+      const [installationId, repoId] = [Number(add[1]), Number(add[2])];
+      const status =
+        this.addRepoStatus ??
+        (installationId !== this.installation.id || !this.installationUsers.has(userId) || repoId !== this.git.repoId
+          ? 404
+          : this.installation.permissions.installation_repositories !== "write"
+            ? 403
+            : !this.admin.has(userId)
+              ? 403
+              : this.installation.repos.has(repoId)
+                ? 304
+                : 204);
+      this.repoAdds.push({ userId, installationId, repoId, status });
+      if (status === 204 && this.addRepoStatus === null) this.installation.repos.add(repoId);
+      return status === 204 || status === 304 ? new Response(null, { status }) : json(status, { message: "refused" });
+    }
     const m = path.match(/^\/user\/installations\/(\d+)\/repositories/);
     if (m) {
+      if (this.otherInstallation && Number(m[1]) === this.otherInstallation.id) {
+        return json(200, { repositories: [...this.otherInstallation.repos].map((id) => ({ id })) });
+      }
       if (Number(m[1]) !== this.installation.id || !this.installationUsers.has(userId)) return json(404, {});
       return json(200, { repositories: installed && this.read.has(userId) ? [{ id: this.git.repoId }] : [] });
     }
@@ -250,7 +313,8 @@ export class FakeGitHubApp {
         private: this.isPrivate,
         default_branch: "main",
         archived: false,
-        permissions: { pull: true, push: this.push.has(userId) },
+        owner: { id: this.owner.id, login: this.owner.login, type: this.owner.type },
+        permissions: { pull: true, push: this.push.has(userId), admin: this.admin.has(userId) },
       });
     }
     if (path === "/repos/acme/webapp/commits/main") {
@@ -265,6 +329,7 @@ export class FakeGitHubApp {
       if (!visible) return json(404, { message: "Not Found" });
       // A user-to-server token can write only where the user can push and the app is installed.
       if (method !== "GET" && (!this.push.has(userId) || !installed)) return json(403, { message: "Resource not accessible by integration" });
+      this.git.actor = { id: userId, login: this.users.get(userId)!.login };
       return this.git.fetch(url, init);
     }
     return json(404, { message: `unhandled ${method} ${path}` });

@@ -1,5 +1,11 @@
 import type { JobRecord } from "../job-store";
 import { AUTH_FAILURE, authorizeRepository, isMissingTable, loadScanAccess, type AuthFailureCode } from "./repository-access";
+import {
+  installationSettingsUrl,
+  repositoryAuthorizationState,
+  STATE_MESSAGES,
+  type RepositoryAuthorizationState,
+} from "./repository-authorization";
 import { loadSession, safeReturnTo, type AuthDeps } from "./service";
 
 export type GithubStatus = {
@@ -19,6 +25,18 @@ export type GithubStatus = {
     readyToWrite: boolean;
     reason?: AuthFailureCode;
     message?: string;
+    /** Canonical GitHub repository ID, read live from GitHub for this user. */
+    id?: number;
+    ownerType?: "User" | "Organization";
+    canAdmin?: boolean;
+    /** Per-repository authorization: what is missing and whether it can be granted from VibeShield. */
+    authorization?: {
+      state: RepositoryAuthorizationState;
+      message: string;
+      installationId?: number;
+      installationAccount?: string;
+      installationSettingsUrl?: string;
+    };
   };
   /** Set when a stored authorization stopped working (expired, revoked). */
   authorizationProblem?: AuthFailureCode;
@@ -64,6 +82,23 @@ export async function githubStatus(
         appCanWrite: Boolean(a?.appCanWrite),
         readyToWrite: auth.ok,
         ...(auth.ok ? {} : { reason: auth.code, message: AUTH_FAILURE[auth.code].message }),
+        ...(a?.status === "ok" && (auth.ok || auth.code !== "repository_changed")
+          ? (() => {
+              const state = repositoryAuthorizationState(a);
+              return {
+                id: a.repoId,
+                ownerType: a.ownerType,
+                canAdmin: Boolean(a.canAdmin),
+                authorization: {
+                  state,
+                  message: STATE_MESSAGES[state],
+                  installationId: a.ownerInstallation?.id,
+                  installationAccount: a.ownerInstallation?.accountLogin,
+                  installationSettingsUrl: installationSettingsUrl(a) ?? undefined,
+                },
+              };
+            })()
+          : {}),
       },
       links,
     };

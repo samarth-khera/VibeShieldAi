@@ -28,7 +28,7 @@ export const AUTH_FAILURE: Record<AuthFailureCode, { status: number; message: st
   },
   not_installed: {
     status: 403,
-    message: "The VibeShield GitHub App is not installed on this repository. Authorize this repository on GitHub first.",
+    message: "VibeShield is not authorized for this repository yet. Authorize this repository from the report first.",
   },
   no_push_permission: { status: 403, message: "Your GitHub account does not have write access to this repository." },
   app_lacks_permission: {

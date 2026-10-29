@@ -30,8 +30,43 @@ export type PullRequestState = {
   baseAdvanced?: boolean;
   /** GitHub user whose authorization opened (or tried to open) the PR, via the VibeShield app. */
   openedBy?: { githubUserId: number; login: string };
+  /** The fix commit exactly as GitHub recorded it (never client-supplied). */
+  commit?: CommitAttribution;
   at: string;
 };
+
+/**
+ * Author/committer as GitHub's commit metadata reports them. VibeShield never sends an author or
+ * committer, so GitHub fills both from the user whose token created the commit. Email addresses
+ * are not stored; only whether GitHub used the user's private noreply address.
+ */
+export type CommitAttribution = {
+  sha: string;
+  url?: string;
+  authorName?: string;
+  committerName?: string;
+  authorEmailIsNoreply?: boolean;
+  /** GitHub's signature verification of the commit. */
+  verified?: boolean;
+  verificationReason?: string;
+};
+
+function attributionOf(sha: string, json: Record<string, unknown>): CommitAttribution {
+  const person = (v: unknown) => (v && typeof v === "object" ? (v as { name?: unknown; email?: unknown }) : {});
+  const author = person(json.author);
+  const committer = person(json.committer);
+  const verification = (json.verification ?? {}) as { verified?: unknown; reason?: unknown };
+  const str = (v: unknown) => (typeof v === "string" ? v.slice(0, 120) : undefined);
+  return {
+    sha,
+    url: str(json.html_url),
+    authorName: str(author.name),
+    committerName: str(committer.name),
+    authorEmailIsNoreply: typeof author.email === "string" ? /@users\.noreply\.github\.com$/i.test(author.email) : undefined,
+    verified: typeof verification.verified === "boolean" ? verification.verified : undefined,
+    verificationReason: str(verification.reason),
+  };
+}
 
 /** One branch per remediation, so retries and double clicks converge on the same branch and PR. */
 export function remediationBranchName(scanJobId: string, remediationId: string): string {
@@ -216,6 +251,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
     const newTree = String(treeRes.json.sha);
 
     // 4. Reuse our own branch if a previous attempt created it with this exact content.
+    let commitInfo: CommitAttribution | undefined;
     const existingHead = async (): Promise<string | null> => {
       const ref = await gh("GET", `/git/ref/heads/${branch}`);
       if (ref.status === 404) return null;
@@ -229,6 +265,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
         parents.length === 1 &&
         parents[0].sha === params.commitSha;
       if (!sameContent) throw new PrError("branch_conflict");
+      commitInfo = attributionOf(sha, head.json);
       return sha;
     };
 
@@ -243,7 +280,10 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
       if (commit.status !== 201) throw new PrError("github_error", ghMessage(commit));
       const commitSha = String(commit.json.sha);
       const ref = await gh("POST", "/git/refs", { ref: `refs/heads/${branch}`, sha: commitSha });
-      if (ref.status === 201) headSha = commitSha;
+      if (ref.status === 201) {
+        headSha = commitSha;
+        commitInfo = attributionOf(commitSha, commit.json);
+      }
       else if (ref.status === 422) headSha = await existingHead(); // a concurrent attempt won the race
       else if (ref.status === 404 || ref.status === 403) throw new PrError("access_denied");
       else throw new PrError("github_error", ghMessage(ref));
@@ -272,6 +312,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
         url: pr.html_url,
         state,
         baseAdvanced,
+        commit: commitInfo,
         at: at(),
       };
     };
@@ -296,6 +337,7 @@ export async function createRemediationPullRequest(params: CreatePrParams): Prom
         url: String(pr.json.html_url),
         state: "open",
         baseAdvanced,
+        commit: commitInfo,
         at: at(),
       };
     }

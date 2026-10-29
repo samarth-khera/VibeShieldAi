@@ -44,6 +44,17 @@ describe.skipIf(!PG_URL)("PostgreSQL GitHub App authorization store (live databa
     expect(await store.consumeState("st2", "s1", "connect", now)).toBeNull(); // expired
   });
 
+  it("keeps a repository authorization request single use under concurrent confirmations", async () => {
+    const now = new Date();
+    const later = new Date(now.getTime() + 600_000);
+    await store.createState({ id: "ra1", sessionId: "s1", purpose: "repo_access", returnTo: "/report/job1", codeVerifierEnc: "v1.a.b.c", expiresAt: later });
+    expect(await store.consumeState("ra1", "s1", "connect", now)).toBeNull(); // not usable as an OAuth state
+    expect(await store.consumeState("ra1", "s2", "repo_access", now)).toBeNull(); // other browser
+    const results = await Promise.all(Array.from({ length: 20 }, () => store.consumeState("ra1", "s1", "repo_access", now)));
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(results.find(Boolean)).toMatchObject({ purpose: "repo_access", codeVerifierEnc: "v1.a.b.c" });
+  });
+
   it("guards token refresh with the row version, cascades disconnect to sessions, and keeps 64-bit GitHub IDs", async () => {
     const big = 2 ** 40 + 7;
     const acct = await store.upsertAccount({
