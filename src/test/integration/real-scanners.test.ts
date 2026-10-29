@@ -16,6 +16,8 @@ import { runSecurityScanEngine } from "@/server/scanners/engine";
 import { extractArchiveSafely } from "@/server/archive";
 import { verifyRemediationOnSnapshot } from "@/server/remediation/verify";
 import { toBaselineFinding } from "@/server/remediation/sandbox";
+import { generateNpmLockfilePatch } from "@/server/remediation/npm-lockfile";
+import { renderFileDiff } from "@/server/remediation/canonical-diff";
 import { getConfig } from "@/server/config";
 import type { NormalizedFinding } from "@/server/scanners/types";
 
@@ -159,4 +161,62 @@ describe.skipIf(missing.length > 0)("Real scanners on a full repository snapshot
     expect(result.rescanStatus).not.toBe("verified");
     expect(result.summary.targetResolved).toBe(false);
   }, 120_000);
+});
+
+describe.skipIf(missing.length > 0)("Real scanners: npm lockfile fix for Job-portal's multer", () => {
+  const JP_SHA = "7f90143a47c6280f6bcf9d55bb7c4767a48c1542";
+  const fixture = (f: string) => readFile(path.join(process.cwd(), "src/test/fixtures/npm-job-portal", f), "utf8");
+  let files: Record<string, string>;
+  let tarball: Buffer;
+  let baseline: NormalizedFinding[];
+
+  beforeAll(async () => {
+    files = { "backend/package.json": await fixture("original.package.json"), "backend/package-lock.json": await fixture("original.package-lock.json"), "README.md": "# job portal\n" };
+    tarball = await tarballOf(files);
+    const dir = await mkdtemp(path.join(tmpdir(), "vs-real-npm-"));
+    try {
+      await extractArchiveSafely(Readable.from(tarball), dir, getConfig());
+      const result = await runSecurityScanEngine(dir);
+      expect([result.gitleaksStatus, result.semgrepStatus, result.osvStatus]).toEqual(["completed", "completed", "completed"]);
+      baseline = result.findings;
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it("generates the npm-equivalent upgrade from live OSV and registry data and verifies it with a full rescan", async () => {
+    const multer = baseline.filter((f) => f.scanner === "osv-scanner" && f.packageInfo?.name === "multer");
+    expect(multer.length).toBeGreaterThanOrEqual(1);
+    expect(multer.every((f) => f.filePath === "backend/package-lock.json" && f.packageInfo?.version === "2.0.2")).toBe(true);
+    const target = multer.find((f) => f.packageInfo?.fixedVersion)!;
+    const fp = (f: NormalizedFinding) => ({ ...f, fingerprint: f.fingerprint });
+    const patch = await generateNpmLockfilePatch({
+      finding: fp(target),
+      scanFindings: baseline.map(fp),
+      lockText: files["backend/package-lock.json"],
+      readFile: async (p) => files[p],
+      fetchImpl: fetch,
+    });
+    const diff = patch.files.map((f) => renderFileDiff(f.path, f.before, f.after)).join("");
+    console.log(`[npm-fix] ${patch.patchSummary}; targets ${patch.findingFingerprints.length} of ${multer.length} multer findings`);
+
+    const result = await verifyRemediationOnSnapshot({
+      owner: "samarth-khera",
+      repo: "Job-portal",
+      commitSha: JP_SHA,
+      unifiedDiff: diff,
+      targetedFingerprints: patch.findingFingerprints,
+      baselineFindings: baseline.map(toBaselineFinding),
+      config: getConfig(),
+      fetchImpl: async (url: string) => {
+        if (url === `https://api.github.com/repos/samarth-khera/Job-portal/tarball/${JP_SHA}`) return new Response(new Uint8Array(tarball), { status: 200 });
+        throw new Error(`Unexpected request: ${url}`);
+      },
+    });
+    expect(result.summary.scannerStatuses).toEqual({ gitleaks: "completed", semgrep: "completed", osvScanner: "completed" });
+    expect(new Set(result.summary.resolvedFingerprints)).toEqual(new Set(patch.findingFingerprints));
+    expect(result.summary.regressions).toEqual([]);
+    expect(result.rescanStatus).toBe("verified");
+    expect(result.rescanFindings.filter((f) => f.packageInfo?.name === "multer")).toEqual([]);
+  }, 180_000);
 });

@@ -9,7 +9,8 @@ import { generateRemediationPatch } from "./patch";
 import { applyAndRescanInSandbox, toBaselineFinding, type BaselineFinding, type SandboxResult } from "./sandbox";
 import { COMMIT_SHA_RE, verifyRemediationOnSnapshot } from "./verify";
 import { fetchSourceAtCommit } from "./source-cache";
-import { canonicalizeDiff, diffFiles } from "./canonical-diff";
+import { canonicalizeDiff, diffFiles, renderFileDiff } from "./canonical-diff";
+import { generateNpmLockfilePatch, isNpmLockfileFinding } from "./npm-lockfile";
 import { parseDiffByFile } from "./strict-apply";
 import { verificationClaimOf, withVerificationClaim } from "./claims";
 import { createRemediationPullRequest, type PullRequestState } from "./github-pr";
@@ -29,6 +30,8 @@ export type RemediationDeps = {
    * always rebuilds the snapshot from the scanned commit.
    */
   sourceFiles?: Record<string, string>;
+  /** Public npm registry access for lockfile fixes (tests inject recorded metadata). */
+  registryFetch?: FetchLike;
   /**
    * Production: hands the approved remediation to the GitHub Actions verification worker,
    * where the scanner binaries exist. When absent, verification runs in this process.
@@ -148,6 +151,7 @@ export async function createPreview(
   let unifiedDiff = "";
   let patchSummary = "";
   let affectedFiles: string[] = [];
+  let findingFingerprints = [finding.fingerprint];
 
   if (eligibility.canAutoFix) {
     let sourceContent = deps.sourceFiles ? deps.sourceFiles[finding.filePath] : undefined;
@@ -160,6 +164,31 @@ export async function createPreview(
     }
 
     try {
+      if (isNpmLockfileFinding(finding)) {
+        if (sourceContent === undefined) throw new Error(`${finding.filePath} could not be read at the scanned commit. Manual review is required.`);
+        const readFile = async (filePath: string) =>
+          deps.sourceFiles?.[filePath] ??
+          (deps.fetchImpl
+            ? await fetchSourceAtCommit(deps.fetchImpl, { owner: job.owner, repo: job.repo, commitSha: commitSha!, filePath }, deps.config ?? getConfig()).catch(
+                () => undefined,
+              )
+            : undefined);
+        const { findings: scanFindings } = await deps.store.getFindings(scanJobId, { limit: 1000 });
+        const npm = await generateNpmLockfilePatch({
+          finding,
+          scanFindings,
+          lockText: sourceContent,
+          readFile,
+          // Never the GitHub fetch: no repository credentials go to the npm registry.
+          fetchImpl: deps.registryFetch ?? fetch,
+        });
+        const raw = npm.files.map((f) => renderFileDiff(f.path, f.before, f.after)).join("");
+        unifiedDiff = canonicalizeDiff(new Map(npm.files.map((f) => [f.path, f.before])), raw);
+        patchSummary = npm.patchSummary;
+        affectedFiles = npm.files.map((f) => f.path);
+        findingFingerprints = npm.findingFingerprints;
+        eligibility.reason = npm.reason;
+      } else {
       const patchResult = await generateRemediationPatch({
         finding,
         scanJobId,
@@ -173,6 +202,7 @@ export async function createPreview(
       unifiedDiff = canonicalizeDiff(originals, patchResult.unifiedDiff);
       patchSummary = patchResult.patchSummary;
       affectedFiles = patchResult.affectedFiles;
+      }
     } catch (err: unknown) {
       const message = err instanceof Error && err.message ? err.message : "Manual review required.";
       patchSummary = `Manual review required for ${finding.ruleId}`;
@@ -192,7 +222,7 @@ export async function createPreview(
     id: randomUUID(),
     scanJobId,
     status: "preview",
-    findingFingerprints: [finding.fingerprint],
+    findingFingerprints,
     commitSha: commitSha ?? "",
     patchSummary,
     unifiedDiff,
