@@ -74,12 +74,61 @@ function normalizeOsvSeverity(vuln: OSVVulnerability): NormalizedSeverity {
   return "medium";
 }
 
+/** Orders "1.2.3" and "1.2.3-rc.1" style versions (a prerelease sorts before its release); null if not numeric. */
+function compareLooseVersions(a: string, b: string): number | null {
+  const parse = (v: string) => {
+    const t = v.trim().replace(/^v/, "");
+    const dash = t.indexOf("-");
+    const main = dash < 0 ? t : t.slice(0, dash);
+    const pre = dash < 0 ? undefined : t.slice(dash + 1);
+    const nums = main.split(".").map((x) => Number(x));
+    return nums.length >= 1 && nums.length <= 4 && nums.every((n) => Number.isInteger(n) && n >= 0) ? { nums, pre: pre ?? null } : null;
+  };
+  const x = parse(a);
+  const y = parse(b);
+  if (!x || !y) return null;
+  for (let i = 0; i < Math.max(x.nums.length, y.nums.length); i++) {
+    const d = (x.nums[i] ?? 0) - (y.nums[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  if (x.pre === y.pre) return 0;
+  if (x.pre === null) return 1;
+  if (y.pre === null) return -1;
+  return x.pre < y.pre ? -1 : 1;
+}
+
+/**
+ * The release that fixes this advisory for the installed version: the `fixed` event of the range
+ * [introduced, fixed) that contains it. Advisories often list one range per release line (for
+ * example 1.x fixed in 1.1.18 and 5.x in 5.0.9); the first `fixed` event is only a fallback when
+ * the installed version is unknown or no range matches.
+ */
 export function findFixedVersionForPackage(
   vuln: OSVVulnerability,
   packageName: string,
   ecosystem?: string,
+  installedVersion?: string,
 ): string | null {
   const normTarget = packageName.toLowerCase().replace(/[-_.]+/g, "-");
+  if (installedVersion) {
+    for (const aff of vuln.affected || []) {
+      const affName = aff.package?.name?.toLowerCase().replace(/[-_.]+/g, "-");
+      if (affName && affName !== normTarget) continue;
+      if (ecosystem && aff.package?.ecosystem && aff.package.ecosystem.toLowerCase() !== ecosystem.toLowerCase()) continue;
+      for (const r of aff.ranges || []) {
+        let introduced: string | null = null;
+        for (const ev of r.events || []) {
+          if (ev.introduced !== undefined) introduced = ev.introduced;
+          if (ev.fixed && introduced !== null) {
+            const afterStart = introduced === "0" || (compareLooseVersions(installedVersion, introduced) ?? -1) >= 0;
+            const beforeFix = (compareLooseVersions(installedVersion, ev.fixed) ?? 1) < 0;
+            if (afterStart && beforeFix) return ev.fixed;
+            introduced = null;
+          }
+        }
+      }
+    }
+  }
   for (const aff of vuln.affected || []) {
     const affName = aff.package?.name?.toLowerCase().replace(/[-_.]+/g, "-");
     if (affName && affName !== normTarget) {
@@ -197,7 +246,7 @@ export async function runOsvScan(
         for (const vuln of pkg.vulnerabilities || []) {
           const vulnId = vuln.id;
           const severity = normalizeOsvSeverity(vuln);
-          const fixedVer = findFixedVersionForPackage(vuln, pkgName, ecosystem);
+          const fixedVer = findFixedVersionForPackage(vuln, pkgName, ecosystem, pkgVersion);
 
           const cveAlias = vuln.aliases?.find((a) => a.startsWith("CVE-"));
           const primaryId = cveAlias || vulnId;
