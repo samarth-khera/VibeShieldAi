@@ -683,3 +683,21 @@ permissions are as in §13.1.
 - **Live run:** the live PR flow on production is not yet observed (§13.8). The PR steps, read-back
   and binding are covered by tests and the local run only.
 
+### 13.10 Live run attempt, 2026-10-30 17:03 UTC: **STOPPED — this automation does not hold the owning browser session**
+
+- **Ownership.** The only browser I can control is a fresh visible-Chrome profile. For it,
+  `GET /api/scans/A-NZKPwxBNay-TeEZnpfGGpWYqlikg9p` returns `viewer: {"isOwner": false}`. No Chrome
+  on this machine exposes a debugging port, so the user's running Chrome cannot be driven, and Chrome
+  does not allow remote debugging of a default profile. Copying that profile or its cookies would mean
+  moving session credentials, so it was not done.
+- **Who owns the job.** The report is owned by the browser that submitted the scan on 2026-10-29 at
+  20:54:52 UTC and connected GitHub at 20:56:08 UTC (HttpOnly `__Host-vibeshield_owner` cookie). The
+  job and the grant remain valid until 2026-11-05 20:54 UTC.
+- **State at the stop (read-only checks).**
+  - The only proxy-addr record is still the 20:57:42 `unsuitable` remediation `e2823631…`. "Check
+    again" has not been used, so no diff has been generated.
+  - On GitHub, `samarth-khera/Job-portal` has only `main`, at the scanned commit `7f90143a47c6`,
+    and no pull requests.
+- **Nothing was created.** No scan, preview, approval, verification, branch, commit or PR was
+  created by this attempt.
+
