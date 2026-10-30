@@ -19,6 +19,14 @@
 > `samarth-khera/vibeshield-e2e-lab`, was created and validated, and an OSV fixed-version bug was
 > fixed (`a4a6467`). The production part is **BLOCKED** before any scan: the GitHub App still lacks
 > "GitHub App installation repository access: write" (§15).
+>
+> **Update 2026-10-30 (final):** after the permission was granted and the installation was set to All
+> repositories, the full production acceptance ran with **one scan and zero Gemini calls**. Two real,
+> verified pull requests were opened and read back from GitHub:
+> - [PR #1](https://github.com/samarth-khera/vibeshield-e2e-lab/pull/1): Review and Approve, proxy-addr.
+> - [PR #2](https://github.com/samarth-khera/vibeshield-e2e-lab/pull/2): Safe Auto-Fix, brace-expansion.
+>
+> Both are left open and unmerged. See **§16**.
 
 **Dates:** 2026-10-28 (activation, first live session) and 2026-10-29 (final acceptance run, then three defect fixes)
 **Production:** https://vibeshield-ai-phi.vercel.app
@@ -1019,3 +1027,179 @@ Live Gemini behaviour was not tested, to preserve the free-tier quota.
    Review and Approve for proxy-addr (real PR, read back, duplicate check, never merged); Safe
    Auto-Fix for brace-expansion; then turn Safe Auto-Fix off.
 
+
+---
+
+## 16. Final production acceptance: one scan, two real pull requests (2026-10-30)
+
+**Status: PASS** on every production item that one scan can test.
+- **Production scans submitted:** **1**.
+- **Live Gemini calls:** **0**. `AiRequestLog` held 8 rows before and after.
+- **Pull requests:** two real PRs, verified by the product and read back independently from GitHub. Both are left **open and unmerged**.
+- **`main` of the test repository:** untouched at `904bc7e`.
+- **Other repositories:** none modified.
+- **Quotas and limits:** none bypassed, reset or changed.
+- **Application code:** none redeployed during the run. Production stayed at `3d23a10`; only this report was committed afterwards.
+
+- **Job:** `tzee0-wGRE1ELQoZ--Whw_Grr_a4LeaI`.
+- **Report:** https://vibeshield-ai-phi.vercel.app/report/tzee0-wGRE1ELQoZ--Whw_Grr_a4LeaI
+- **Evidence** (screenshots, timelines, diffs, JSON): `~/.vibeshield-e2e/evidence/final-acceptance-20261030T184200Z/`.
+- **Browser:** visible Google Chrome with a dedicated profile. The owner signed in to GitHub there; the sign-in was not simulated.
+
+### 16.1 Phase 1–2: configuration and migration
+
+| Check | Result |
+|---|---|
+| App permission "GitHub App installation repository access" | **PASS**: `installation_repositories: write` on the app registration (updated 2026-10-30 18:32:59Z) |
+| Installation scope | **PASS**: read live from GitHub through the owner's session (`repository-authorization` `prepare`). Installation `176245393`, account `samarth-khera`, **`repositorySelection: "all"`**. The repository was already present, so no authorization request was created. |
+| Connected identity | **PASS**: `samarth-khera` (GitHub user 188962529), via a real OAuth sign-in in visible Chrome (`github=connected`) |
+| Repository ID / write access | **PASS**: `1440088658` matches the scan. The user can push, the app can write (Contents + Pull requests), and state is `authorized` / `readyToWrite: true`. |
+| Deployed commit and health | **PASS**: `3d23a10`, `/api/health` healthy |
+| Safe Auto-Fix migration `20261030180000_add_safe_autofix_setting` | **PASS**: applied with `prisma migrate deploy` after a Neon recovery point (2026-10-30 18:36:46Z). Additive table only; every existing row count unchanged; "Database schema is up to date". No `db push`, reset or drop. |
+| Quota before the scan | 0 scans in the last hour, 2 in 24 h; default limits, unchanged |
+
+Broad installation scope ("All repositories") was **not** treated as consent: every write below
+still required the scan owner's explicit approval, or the explicit Safe Auto-Fix opt-in for this
+one repository.
+
+### 16.2 Phase 3–4: the single production scan
+
+| Step | Result |
+|---|---|
+| Submission (home form, owner browser, one click, never retried) | **PASS**: HTTP 202 in 1.9 s, job queued |
+| Lifecycle | queued → scanning (31 s) → **completed** (35.9 s after submit). `reportState: complete`. Commit `904bc7ea48639bede3e038b7100f79c13260f659`, 7 files. |
+| Scanners | **PASS**: Gitleaks completed (550 ms), Semgrep completed (1,804 ms), OSV-Scanner completed (497 ms) |
+| Findings | **PASS**: 7, exactly as predicted (§15.2). 3 critical (Semgrep `js-code-execution-eval`, Gitleaks `generic-api-key`, OSV GHSA-jqcg-44mw-7w3h), 3 high and 1 medium (the four brace-expansion advisories). |
+| Actions run | `VibeShield scan …` run 41109165522, success |
+
+### 16.3 Phase 5: report
+
+**PASS** in the owner browser:
+- **Counts:** 7 of 7; severity summary 3/3/1/0/0.
+- **Filters and search:**
+  - severity filter: high → 3;
+  - category filters: Secrets 1, Code Analysis 1, Dependencies 5;
+  - search by GHSA ID and by file path → 1 each;
+  - the empty-search state appears, and reset returns all 7.
+- **Drawer:** shows proxy-addr 2.0.7 → 2.0.8; Escape closes it.
+- **Advisory link:** points to NVD for `CVE-2026-90711`, which OSV lists as the alias of GHSA-jqcg-44mw-7w3h.
+- **Reload:** keeps the report.
+- **Errors and AI:** no console errors, no HTTP errors and no `/explain` request ("Explain with AI" was never clicked).
+
+**Observation (environment, not a product defect):** while Chrome reported the tab as `hidden`
+(its window was covered on the desktop), the page stayed on the "Loading report..." Suspense fallback.
+It rendered as soon as the tab became visible. The same applies to any streamed page in a
+background tab.
+
+### 16.4 Phase 6: Review and Approve, proxy-addr → PR #1
+
+| Step | Result |
+|---|---|
+| Repository access card (drawer, AI Auto-Fix mode) | **PASS**: repository ID 1440088658, @samarth-khera, write access yes, base `main`, scanned commit `904bc7ea4863`. Safe Auto-Fix: **Off** by default. |
+| Engine | npm (deterministic; "same result as npm install/npm update") — **no AI** |
+| Preview | **PASS** in 1.9 s. Stored stages: `checking_repository` → `checking_eligibility` → `generating_remediation` → `validating_dependency_changes` → `generating_patch` → done. Eligibility **safe**. |
+| Diff | `package-lock.json` only, 897 bytes, **SHA-256 `34db3a15f00a07802fbaba093cc31412127ef47b03024c30450c3c34f9a4a2dc`** |
+| Independent validation | **PASS**: plain `git apply --check` at `904bc7e` OK. The result is **byte-identical** to real npm 10.9.3 `npm update proxy-addr --package-lock-only`, and `package.json` is unchanged. |
+| Apply without approval | **PASS** (refused): 403 `approval_required`, state unchanged |
+| PR without approval | **PASS** (refused): 403 `approval_required` |
+| Explicit approval | "Approve, verify and open pull request", clicked once after the stored diff was re-checked against the SHA above. The browser sent only `approve` and `apply`. |
+| Verification | **PASS**: claimed by the GitHub Actions worker (run 41110493767, success). Progress `scanning` was shown. Snapshot `904bc7e`, 7 files; Gitleaks, Semgrep and OSV all completed; **target resolved**; findings 7 → 6; **0 new, 0 regressions**. |
+| Publishing (automatic after verification, as @samarth-khera) | **PASS**: steps `creating_commit` → `creating_pull_request` → created; the product read back branch, commit and PR |
+| **PR #1** | https://github.com/samarth-khera/vibeshield-e2e-lab/pull/1 |
+| Independent read-back (`gh api`) | **PASS**: open, not merged, author `samarth-khera`, base `main` @ `904bc7e`, head `vibeshield/fix-tzee0wgre1-f6ff2e86a680413ebabec569707b9c08` @ `3a758383c3fc`. 1 commit whose single parent is `904bc7e`; git author and committer `samarth-khera`; 1 file (`package-lock.json`, +7/−3). The committed file is byte-identical to the approved diff applied locally. |
+| UI | **PASS**: "View pull request on GitHub", branch → main, commit `3a75838`, "GitHub recorded the commit as authored by samarth-khera (@samarth-khera). Pull request author on GitHub: @samarth-khera" |
+
+### 16.5 Phase 7: Safe Auto-Fix, brace-expansion → PR #2
+
+| Step | Result |
+|---|---|
+| Default | **PASS**: Off |
+| Dialog | **PASS**: it states exactly what is granted: only server-classified safe fixes (transitive, patch-level, inside every parent's range, lockfile only); full three-scanner rescan; PRs opened as @samarth-khera; never merges or pushes to `main`; can be turned off any time. "Enable" stays disabled until the box naming the repository and ID 1440088658 is ticked. |
+| What the server processed | One package group only: **brace-expansion** (proxy-addr already had a remediation and was skipped). Secret and eval findings were never considered. |
+| Fix | 1.1.17 → 1.1.21, **safe**, all 4 advisories. `approvedBy: safe_autofix`. SHA-256 `9e4e430e60585c11a62b5da297d496bc00f49296d52a832808e4a8dbfffef294`. |
+| Verification | **PASS**: Actions run 41111174323. Gitleaks, Semgrep and OSV completed; 4/4 resolved; findings 7 → 3; 0 new, 0 regressions. |
+| **PR #2** | https://github.com/samarth-khera/vibeshield-e2e-lab/pull/2 |
+| Independent read-back | **PASS**: open, not merged, author `samarth-khera`, base `main` @ `904bc7e`. 1 commit `b96fcb4690d7` whose parent is `904bc7e`, `package-lock.json` only (+3/−3). Byte-identical to npm 10.9.3 `npm update brace-expansion --package-lock-only`; plain `git apply --check` OK. |
+| Turned off | **PASS**: "Turn off" in the UI; status `enabled: false`; `SafeAutoFixSetting` rows: 0 |
+
+### 16.6 Phase 8: integrity and authorization (production)
+
+| Test | Result |
+|---|---|
+| Branch starts from the scanned commit; single commit; only approved files; real author; base `main` | **PASS** for both PRs (§16.4, §16.5) |
+| Repeat create-PR | **PASS**: 200 `exists`, the same PR #1 and head SHA, re-checked live with GitHub (3.8 s). Still exactly 2 PRs and 3 branches afterwards. |
+| Altered diff SHA on create-PR | **PASS** (refused): 409 `diff_confirmation_mismatch` |
+| Re-approve an already verified fix | **PASS** (refused): 409 `invalid_status` |
+| Client-supplied identity fields (`githubUserId`, `login`) | **PASS** (refused): 400 `invalid_request` |
+| Cross-site request with the owner's cookies (from `https://example.com`) | **PASS** (refused): simple POST → 403. A JSON POST is blocked by CORS (preflight without an allow-origin). Safe Auto-Fix stayed Off. |
+| A different browser (fresh Chrome profile, no owner grant) | **PASS** (refused): preview, approve, apply, create-PR, Safe Auto-Fix enable and repository-authorization each → 403 `not_job_owner`. No Approve buttons rendered. The public report and remediation list remain readable by link, by design. |
+| After **Disconnect GitHub** (UI; `revokedAtGitHub: true`) | **PASS** (refused): create-PR, Safe Auto-Fix enable and repository-authorization each → 401 `not_connected`. A preview (database only, no GitHub access) is still allowed for the public repository, as designed. It targeted the eval finding and returned **unsuitable / manual review**, empty diff, no AI call. |
+| Repository authorization re-checked before writes | **PASS**: the stored steps show `checking_repository` before generation and before publishing. Every refused write above came from live checks. |
+| Unauthorized repository refused even when readable | **NOT TESTED in production**: it needs a scan of another repository, and only one scan was allowed. Covered locally: `github-app-auth.test.ts` ("… no push permission, not installed …") and `repository-authorization.test.ts`. |
+
+### 16.7 Phase 9: remaining features without extra scans
+
+Production observations:
+- **Patch download:** 200, `text/x-diff`, attachment `vibeshield-fix-f6ff2e86.patch`. Its SHA-256 equals the approved diff, and plain `git apply` reproduces the approved file. **PASS**.
+- **Mobile at 390 px:** report and drawer have no horizontal overflow. **PASS**.
+- **Console and network errors:** none in any session. **PASS**.
+- **Reload and progress persistence:** **PASS**.
+
+Local results (mocks or simulated GitHub; **not** production observations): the full suite was
+re-run on 2026-10-31.
+- **Result:** **510 passed, 21 skipped** (37 files; 3 files are opt-in Postgres or real-scanner suites).
+- **Coverage:**
+  - mocked AI lifecycle, structured JSON validation and fallback, caching;
+  - not-installed and private-repository fail-closed behaviour;
+  - CSRF and cross-user ownership;
+  - error, timeout, retry and revoked-credential states;
+  - Safe Auto-Fix enable and disable;
+  - approval and diff-hash integrity.
+- **Not re-run:** the local simulated-GitHub UI end-to-end run (§14) and the AI suites under a network block (§15.4: 56 passed, 1 skipped); their earlier results stand.
+
+### 16.8 Phase 10: timings and cost (measured)
+
+| Stage | proxy-addr / scan | brace-expansion |
+|---|---|---|
+| Scan submission (POST → 202) | 1.9 s | — |
+| Queue wait / runner setup | 6.9 s / 21.9 s | — |
+| Repository download / extraction | 573 ms / 17 ms | — |
+| Gitleaks / Semgrep / OSV | 550 ms / 1.8 s / 497 ms | — |
+| Submit → report complete | 35.9 s | — |
+| Patch generation | 1.9 s (server stages 1.1 s) | part of the 3.5 s from enable to verification claim |
+| Approve (or enable) → worker claimed | 26.7 s | 3.5 s |
+| Verification worker: queue / download / apply / scan / total | 38.9 s / 357 ms / 15 ms / 3.7 s / 4.7 s | 22.5 s / 208 ms / 16 ms / 3.3 s / 4.0 s |
+| Approve (or enable) → verified | 69.8 s | 30.3 s |
+| Verified → PR created and read back | ~6.6 s (commit, then PR steps observed ~3.3 s apart) | ~3.5 s |
+| Duplicate create-PR check | 3.8 s | — |
+
+Branch creation and commit push are one stored step ("creating commit", then "creating pull
+request"), so they are not timed separately.
+
+**Cost: ₹0.**
+- Vercel Hobby, Neon free tier.
+- GitHub Actions on a public repository: three runs of about 36–60 s.
+- **0 Gemini requests**.
+
+**Database counts** (read-only, before → after): scanJob 19 → 20, finding 517 → 524, remediation
+11 → 14, aiRequestLog 8 → 8, safeAutoFixSetting 0 → 0, githubAccount 1 → 0 (after Disconnect).
+
+### 16.9 Defects and observations
+
+1. **Cosmetic (not fixed during the run):** the PR title and commit subject are cut at 120
+   characters mid-word ("…package.json unchang", "…package.jso"), at
+   `src/server/remediation/service.ts:797`.
+   - Suggested fix: shorten the summary or truncate on a word boundary.
+   - Not redeployed during acceptance, as instructed.
+2. **UI wording:** after the duplicate test, the PR panel headline changes from "created" to "Pull
+   request #1 already exists (open)". This is accurate, but a reader may not realise VibeShield created it.
+3. **Hidden-tab rendering:** see §16.3. Environment only.
+
+### 16.10 State left behind
+
+- **PRs:** #1 and #2 **open**, never merged.
+- **Branches:** `main` unchanged at `904bc7e`. The two `vibeshield/fix-…` branches are kept.
+- **Safe Auto-Fix:** **Off**.
+- **GitHub connection:** disconnected for the test browser profile, with VibeShield's authorization revoked at GitHub by the Disconnect test. To use VibeShield again, sign in with "Connect GitHub". The app installation (All repositories) is unchanged.
+- **Kept, not deleted:** the repository `samarth-khera/vibeshield-e2e-lab` and the evidence directory.
+- **Production environment file:** the temporary copy pulled for the migration was deleted.
