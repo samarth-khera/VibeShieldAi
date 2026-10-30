@@ -9,6 +9,11 @@
 > eligible npm fix at the preview (HTTP 500). It is fixed and deployed at `41fb7e9`, together with
 > transitive npm fixes and a truthful status UI. See **§13**. The live PR step needs the owner's
 > own browser session (§13.8).
+>
+> **Update 2026-10-30 (evening):** the complete Auto-Fix workflow was built out and deployed at
+> `9180734`: real progress for every stage, one approval that verifies and then publishes, and an
+> opt-in Safe Auto-Fix. It was tested locally against simulated GitHub, with no production scan or AI
+> quota used. See **§14**, including the steps for your own final test.
 
 **Dates:** 2026-10-28 (activation, first live session) and 2026-10-29 (final acceptance run, then three defect fixes)
 **Production:** https://vibeshield-ai-phi.vercel.app
@@ -700,4 +705,207 @@ permissions are as in §13.1.
     and no pull requests.
 - **Nothing was created.** No scan, preview, approval, verification, branch, commit or PR was
   created by this attempt.
+
+---
+
+## 14. Complete Auto-Fix workflow: diagnosis, both modes, local verification (2026-10-30)
+
+**Code:** `797e0fc` (server), `81cda0a` (UI), `9180734` (local test harness), fast-forward from
+`7ec78ec`. **Production:** `dpl_5pLRPDj9eQRFKStW65X6w8WbP5Bf`, READY, target production,
+`meta.githubCommitSha` = `9180734d0dead784ad07f6ae5762c9219c187c3d`, aliased to
+`vibeshield-ai-phi.vercel.app`. `/api/health` reported `healthy`, database `healthy`,
+`githubApp: "configured"`, dispatcher `ready`.
+
+**Quota:** no production scan, no production preview or remediation, and no AI (Gemini) request
+were made during this task. Production was only read:
+- read-only database queries;
+- Vercel request logs;
+- GET-only page loads, with zero POSTs observed in the browser check.
+
+### 14.1 Why the new report showed "No fix generated yet"
+
+Your 17:07 UTC scan created a new job, `tgXZMOF1onmDJsS3mATJRptGoVGUHgDe` (same commit `7f90143`;
+`proxy-addr` finding `cmvv87qcr000tl50858hrlz1p`). GitHub was connected at 17:09.
+- **What the records show:** the request logs have no `POST …/remediation/preview` for that job and
+  the database has no remediation for it, so **no fix was ever requested**. The status was accurate;
+  nothing had failed.
+- **The previous failure was different.** On the earlier job, eligible previews returned HTTP 500
+  (P2000, fixed in `bedc5b4`), and `proxy-addr` was wrongly refused (fixed in `85f8df3`), §13.
+- **What was missing as a product:**
+  - nothing said that a preview had to be requested, or whether it uses AI quota;
+  - generation was one opaque request;
+  - approval, verification and the PR were three separate manual steps;
+  - verification showed nothing until the end;
+  - a "Potentially Breaking" badge came from a client-side guess before the server had decided.
+
+### 14.2 How a fix is generated (evidence for `proxy-addr`)
+
+For `proxy-addr` 2.0.7, installed through `express@5.1.0` (`"^2.0.7"`), the fix is → **2.0.8**:
+- **Change:** lockfile only, identical to `npm update proxy-addr --package-lock-only` (byte-equal
+  fixture).
+- **Classification:** **safe** — transitive, patch-level, inside the parent's range, and no other
+  lockfile entry changes.
+- **Engine:** the deterministic npm engine, which makes **no AI request**.
+
+Stored generation steps, as observed in the local run (HTTP 201):
+1. `checking_repository`, recording that the account can publish to `samarth-khera/Job-portal`
+2. `checking_eligibility`
+3. `generating_remediation`
+4. `validating_dependency_changes`
+5. `generating_patch`
+
+The verification worker applies the result with plain `git apply` and a byte check (§7.2).
+
+| Package (existing scan) | Server decision |
+|---|---|
+| proxy-addr 2.0.7, jws 3.2.2, brace-expansion 1.1.12 (one advisory → 1.1.21) | **Safe**: lockfile-only patch updates |
+| multer 2.0.2 → 2.5.0 (direct), path-to-regexp → 8.4.2, moment, follow-redirects | Eligible, **potentially breaking**: a person must approve |
+| mongoose, body-parser, qs, minimatch, picomatch, react-router, frontend lockfile, … | Manual review, with the reason shown (§13.4) |
+
+### 14.3 The two modes and their permission boundaries
+
+**Review and Approve (default).**
+1. **Fix with AI:** the user clicks Preview Proposed Patch. The status says beforehand that nothing
+   runs until then, and the engine note says whether AI is used.
+2. **Live steps:** the stored steps are shown while generation runs, and the exact diff appears at
+   the end.
+3. **One explicit approval.** When the repository is authorized, the approval also states and
+   authorizes publishing: a new branch, a commit of exactly this diff, and a PR with the user's
+   account; never merged, default branch untouched. Consent counts only if GitHub confirms, live,
+   that the connected account can write to the repository.
+4. **Verification:** it starts immediately. The worker posts signed progress: snapshot rebuilt,
+   patch applied, then Gitleaks, Semgrep and OSV-Scanner each running and finished.
+5. **Publishing after it passes,** with the approving user's own stored authorization, re-checked
+   live: account still connected, token valid, same repository ID, push and installation write. The
+   steps are recorded (re-check, commit, branch push, PR, read-back), and the branch ref, commit tree
+   and parent, and PR head, base and author are read back before success is shown.
+6. **Retries are safe.** A recovery pump finishes interrupted publications, and retries reuse the
+   same branch and PR.
+
+**Safe Auto-Fix (explicit per-repository opt-in, off by default).**
+- **Enabling requires:**
+  - the job owner's browser;
+  - a same-origin request;
+  - a connected GitHub user whose write access GitHub confirms live;
+  - a confirmation dialog;
+  - the exact repository ID.
+- **What it processes:** for a completed scan (and on "Run on this scan now"), it generates fixes for
+  up to 25 vulnerable npm packages. Only server-classified **safe** fixes are approved by the policy
+  (recorded as `approvedBy: safe_autofix`), verified and published.
+- **What it never processes:** potentially breaking upgrades, manual-review findings, secrets,
+  AI-generated code changes and private repositories. Those stay as previews for a person.
+- **Turning it off** cancels pending publications (`publish_cancelled`).
+- **Audit:** every step is recorded (`safe_autofix` and `pull_request` events).
+
+**Never, in either mode:** direct pushes to the default branch, merges, client-supplied authors (the
+approve request reads only `publish`; the PR request schema is strict), or success shown before
+GitHub's read-back.
+
+### 14.4 Tests
+
+| Suite | Result |
+|---|---|
+| `vitest` (unit, integration, UI) | **507 passed**, 21 skipped (Postgres, real-scanner and live suites run separately) |
+| Real scanners (`npm run test:scanners`) | **63/63** |
+| PostgreSQL (`npm run test:postgres`, incl. the new `SafeAutoFixSetting` table) | **20/20** |
+| Typecheck, lint, production build | Clean |
+| Gitleaks on commits `7ec78ec..9180734` / `npm audit --omit=dev` | No leaks / 0 vulnerabilities |
+| Semgrep on the changed files | 5 notices, reviewed: linear regexes with validated inputs (ReDoS false positives) |
+
+New tests (`autofix-automation`, `autofix-status-ui`, `postgres-auth`) cover:
+- authorization does not imply a fix;
+- Preview sends exactly one request and shows the stored steps;
+- a reload while generating, and an interrupted generation;
+- safe versus potentially-breaking classification;
+- the stored diff hash;
+- publish consent needing live write access;
+- failed verification preventing any commit;
+- signed progress callbacks, with an unsigned one refused;
+- automatic publishing with read-back, and no duplicate commit or PR from late callbacks or polls;
+- a disconnected account blocking later writes;
+- Safe Auto-Fix: off by default, explicit confirmation, write access required, only safe fixes,
+  cancellation on turning it off, policy refusal of non-safe fixes, and the lowest-fix
+  representative;
+- the opt-in store against real Postgres.
+
+Existing suites still cover cross-user access, CSRF, forged identities, altered patches and
+attribution.
+
+**Bugs found and fixed during testing:**
+- **Scan callback failure:** Next's `after()` throws outside a request scope, which made the
+  scan-completion callback fail in an integration test. Deferred work now runs detached when
+  `after()` is unavailable, and can never fail the request that scheduled it.
+- **Safe Auto-Fix missed in-range fixes:** it started from the first advisory of a package; it now
+  starts from the lowest fixed release, which is the one npm can reach inside the parents' ranges.
+
+### 14.5 Visible-browser tests and what was simulated
+
+**Local (`http://localhost:3100`).**
+- **Setup:** a production build; local PostgreSQL with a copy of the existing report `tgXZ…` (180
+  findings); **real** Gitleaks, Semgrep and OSV-Scanner; the live npm registry.
+- **Simulated GitHub:** in-process (`src/test/e2e/local-github-preload.mts`, seeded with the real
+  Job-portal tree at `7f90143`). Every other outbound host, including AI, was blocked, and PR links
+  point to `simulated-github.local`. **These are simulated results, not real pull requests.**
+
+Observed in visible Chrome, with no console or network errors:
+1. **Before any preview:** the card shows `samarth-khera/Job-portal` (ID 1106558267), authorized
+   account @samarth-khera, write access, base branch `main`, and that a branch, commit and PR are
+   possible after a verified approval. Safe Auto-Fix is Off. Status "No fix generated yet"; engine
+   note "No AI request".
+2. **Preview:** HTTP 201 with the five stored steps, eligibility `safe`, and the exact diff (2.0.8).
+3. **Refusal:** mongoose shows its release-line reason.
+4. **One approval with publish consent:** real verification, then simulated branch, commit and
+   **PR #1** read back (about 9 seconds). Status "Pull request #1 created"; it persisted after a
+   reload.
+5. **Duplicate check:** two more PR requests both returned PR #1. Simulated GitHub still had 1
+   commit and 1 PR, and the commit request carried only `message`, `parents` and `tree`.
+6. **Safe Auto-Fix:**
+   - Enabled through the dialog.
+   - `jws` was processed automatically: policy approval, real rescan, simulated **PR #2**.
+   - `multer` and `path-to-regexp` were left as potentially-breaking previews.
+   - Every refusal kept its reason.
+
+**Production (read-only, non-owner):** on the new report, the `proxy-addr` panel shows "Checked on
+preview", "Status: No fix generated yet", that nothing runs until the preview, and "No AI request:
+VibeShield's deterministic npm engine…". The page sent **zero POST requests** and logged no console
+errors.
+
+### 14.6 Not verified live (quota preservation and permissions)
+
+- **Not run in production:** preview, approval, the Actions worker's progress callbacks, publishing
+  and Safe Auto-Fix. These were verified only locally, against simulated GitHub, and by tests.
+- **Safe Auto-Fix needs one database migration in production.** The additive migration
+  `20261030180000_add_safe_autofix_setting` (a single `CREATE TABLE "SafeAutoFixSetting"`) is the
+  only pending one; `prisma migrate status` confirmed this read-only. Applying it was refused by this
+  session's permission policy. Until it is applied, the card shows no Safe Auto-Fix control and
+  enabling returns "setup incomplete". Review and Approve does not need it.
+- **Real GitHub writes** (branch, commit, PR) were not performed in this task.
+
+### 14.7 Your production test, step by step
+
+1. **Optional, for Safe Auto-Fix.** Apply the migration once, from the repository:
+   - `npx vercel env pull .env.production.local --environment=production`
+   - `set -a; . ./.env.production.local; set +a; npx prisma migrate status` (expect only
+     `20261030180000_add_safe_autofix_setting`)
+   - `npx prisma migrate deploy`
+   - `rm .env.production.local`
+2. **Open your report.** Use the browser that started the scan:
+   `https://vibeshield-ai-phi.vercel.app/report/tgXZMOF1onmDJsS3mATJRptGoVGUHgDe`. Choose
+   **AI Auto-Fix**, then the `proxy-addr` finding. The card should say "Repository authorized" with
+   your account, write access, `main` and `7f90143`.
+3. **Preview.** Click **Preview Proposed Patch** (no AI request). Watch the five steps; expect
+   "Preview ready — waiting for your explicit approval", a **Safe to Auto-Fix** badge, and a one-file
+   diff to `proxy-addr` 2.0.8.
+4. **Approve.** Tick the approval, which names the repository and your account, then click **Approve,
+   verify and open pull request**.
+5. **Watch verification.** Expect: rebuilding the repository, applying the approved patch, then
+   Gitleaks, Semgrep and OSV-Scanner each finishing (on the GitHub Actions worker), then "Security
+   verification complete — creating the pull request automatically".
+6. **Watch publishing.** Expect: commit, branch push, pull request, then "Branch, commit and pull
+   request were read back from GitHub and match". Open the PR link and confirm it on GitHub: base
+   `main`, a single commit whose parent is `7f90143`, and only `backend/package-lock.json` changed.
+   **Do not merge it.**
+7. **Optional, after step 1.** Enable Safe Auto-Fix in the card; expect `jws` (and one
+   `brace-expansion` advisory) to be processed into separate PRs automatically, with everything else
+   left for review. Turn it off afterwards if you don't want it.
 
