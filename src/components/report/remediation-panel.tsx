@@ -19,13 +19,15 @@ import {
   approveRemediation,
   createRemediationPreview,
   listRemediations,
+  type GenerationStage,
   type PublicFinding,
   type PublicRemediation,
+  type ScannerProgress,
 } from "@/lib/scan-client";
 import { GithubPullRequestPanel } from "./github-pr-panel";
 import { RepositoryAuthorizationPanel, useGithubStatus } from "./repository-authorization";
 import { DiffViewer } from "./diff-viewer";
-import { classifyRemediationEligibility } from "@/lib/remediation-eligibility";
+import { classifyRemediationEligibility, ENGINE_NOTES, remediationEngine } from "@/lib/remediation-eligibility";
 import { useAdaptivePoll } from "@/lib/use-adaptive-poll";
 
 const FAILURE_REASONS: Record<string, string> = {
@@ -110,6 +112,7 @@ export function RemediationPanel({
   onRemediationUpdated,
   mode = "review",
   readOnly = false,
+  scannedCommit,
 }: {
   jobId: string;
   finding: PublicFinding;
@@ -118,6 +121,8 @@ export function RemediationPanel({
   mode?: "review" | "autofix";
   /** Not the job owner: show the current fix and its verification, but no actions. */
   readOnly?: boolean;
+  /** The immutable commit the scan ran on (shown with the repository authorization). */
+  scannedCommit?: string | null;
 }) {
   const [remediation, setRemediation] = useState<PublicRemediation | null>(existingRemediation ?? null);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -125,6 +130,8 @@ export function RemediationPanel({
   const [isApplying, setIsApplying] = useState(false);
   const [approvedChecked, setApprovedChecked] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The record being generated right now, with its stored steps.
+  const [generating, setGenerating] = useState<PublicRemediation | null>(null);
   // One live GitHub status for both the repository access card and the pull-request panel.
   const github = useGithubStatus(
     jobId,
@@ -158,6 +165,15 @@ export function RemediationPanel({
   const onGeneratePreview = async () => {
     setIsGenerating(true);
     setError(null);
+    const startedAt = new Date(Date.now() - 2000).toISOString();
+    // Follow the server's stored steps while the request runs.
+    const follow = setInterval(async () => {
+      const list = await listRemediations(jobId).catch(() => []);
+      const live = list
+        .filter((r) => r.findingFingerprints.includes(finding.fingerprint) && r.createdAt >= startedAt)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+      if (live?.generation?.state === "running") setGenerating(live);
+    }, 700);
     try {
       const res = await createRemediationPreview(jobId, finding.id);
       setRemediation(res);
@@ -165,6 +181,8 @@ export function RemediationPanel({
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to generate preview.");
     } finally {
+      clearInterval(follow);
+      setGenerating(null);
       setIsGenerating(false);
     }
   };
@@ -181,14 +199,27 @@ export function RemediationPanel({
     }
   };
 
+  const canPublish = mode === "autofix" && Boolean(github.status?.repository?.readyToWrite);
+  const githubLogin = github.status?.user?.login;
   const onApprove = async () => {
     if (!remediation) return;
     setIsApproving(true);
     setError(null);
     try {
-      const res = await approveRemediation(jobId, remediation.id);
+      const res = await approveRemediation(jobId, remediation.id, { publish: canPublish });
       setRemediation(res);
       onRemediationUpdated?.(res);
+      // The approval starts the full verification immediately; publishing follows if it passes.
+      if (res.status === "approved" && mode === "autofix") {
+        setIsApplying(true);
+        try {
+          const applied = await applyRemediation(jobId, res.id);
+          setRemediation(applied);
+          onRemediationUpdated?.(applied);
+        } finally {
+          setIsApplying(false);
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Approval failed.");
       await reloadAfterError();
@@ -203,13 +234,26 @@ export function RemediationPanel({
     const list = await listRemediations(jobId);
     const fresh = list.find((r) => r.id === remediation.id);
     if (!fresh) return false;
-    if (fresh.status !== remediation.status || fresh.updatedAt !== remediation.updatedAt) {
+    if (fresh.status !== remediation.status || fresh.updatedAt !== remediation.updatedAt || JSON.stringify(fresh.pullRequest) !== JSON.stringify(remediation.pullRequest)) {
       setRemediation(fresh);
       onRemediationUpdated?.(fresh);
     }
-    return fresh.status === "applied";
+    const stillGenerating = fresh.generation?.state === "running" && Date.now() - Date.parse(fresh.generation.at) < GENERATION_STALE_MS;
+    const stillPublishing =
+      fresh.status === "verified" && Boolean(fresh.publishAfterVerification) && !["created", "exists", "failed"].includes(fresh.pullRequest?.status ?? "");
+    return fresh.status === "applied" || stillGenerating || stillPublishing;
   }, [jobId, remediation, onRemediationUpdated]);
-  useAdaptivePoll(pollVerification, remediation?.status === "applied", { initialMs: 3000, maxMs: 5000 });
+  // Captured once: a generation whose last step is older than this was interrupted, not running.
+  const [mountedAt] = useState(() => Date.now());
+  const generationRunning =
+    remediation?.generation?.state === "running" && Date.parse(remediation.generation.at) > mountedAt - GENERATION_STALE_MS;
+  const publishPending =
+    remediation?.status === "verified" &&
+    Boolean(remediation.publishAfterVerification) &&
+    remediation.pullRequest?.status !== "created" &&
+    remediation.pullRequest?.status !== "exists" &&
+    remediation.pullRequest?.status !== "failed";
+  useAdaptivePoll(pollVerification, remediation?.status === "applied" || isApplying || generationRunning || publishPending, { initialMs: 2000, maxMs: 5000 });
 
   const onApplyAndVerify = async () => {
     if (!remediation) return;
@@ -240,7 +284,9 @@ export function RemediationPanel({
   }, [running]);
   const since = (iso?: string | null) => (iso ? formatElapsed(now - Date.parse(iso)) : null);
 
-  const stage = workflowStage({ remediation, isSecret, isGenerating, initial: initialEligibility, since });
+  const shown = generating ?? (generationRunning ? remediation : null);
+  const stage = workflowStage({ remediation, isSecret, isGenerating: isGenerating || Boolean(shown), live: shown, initial: initialEligibility, since, isApplying });
+  const engine = remediationEngine(finding);
 
   return (
     <div className="rounded-xl border border-line bg-surface/50 p-4 space-y-4">
@@ -259,6 +305,10 @@ export function RemediationPanel({
         {isSecret ? (
           <span className="inline-flex items-center gap-1 rounded-full bg-sev-critical/15 px-2.5 py-0.5 text-xs font-semibold text-sev-critical">
             <ShieldAlert className="size-3" /> Manual Credential Rotation Required
+          </span>
+        ) : !remediation && initialEligibility.decidedOnPreview ? (
+          <span className="inline-flex items-center gap-1 rounded-full bg-surface-subtle px-2.5 py-0.5 text-xs font-semibold text-muted">
+            Checked on preview
           </span>
         ) : effectiveEligibility === "safe" ? (
           <span className="inline-flex items-center gap-1 rounded-full bg-accent/15 px-2.5 py-0.5 text-xs font-semibold text-accent">
@@ -304,7 +354,7 @@ export function RemediationPanel({
       )}
 
       {mode === "autofix" && !readOnly && !isSecret && (
-        <RepositoryAuthorizationPanel jobId={jobId} remediationId={remediation?.id} github={github} />
+        <RepositoryAuthorizationPanel jobId={jobId} remediationId={remediation?.id} github={github} scannedCommit={scannedCommit ?? remediation?.commitSha} />
       )}
 
       {/* Not eligible before any preview: say why, offer no fake action */}
@@ -332,6 +382,10 @@ export function RemediationPanel({
             will be modified without your explicit approval.
             {initialEligibility.decidedOnPreview ? ` ${initialEligibility.reason}` : ""}
           </p>
+          <p className="text-[11px] text-muted" data-testid="engine-note">
+            {ENGINE_NOTES[engine]}
+          </p>
+          {shown?.generation && <GenerationSteps generation={shown.generation} />}
           {readOnly ? (
             <p className="text-xs text-muted">Only the browser that started this scan can generate a fix.</p>
           ) : (
@@ -463,14 +517,27 @@ export function RemediationPanel({
                       className="mt-0.5 rounded border-line text-accent focus:ring-accent"
                     />
                     <span>
-                      I have reviewed the proposed diff and authorize applying it in an isolated sandbox for security verification.
+                      {canPublish ? (
+                        <>
+                          I approve exactly this diff. VibeShield applies it to commit {remediation.commitSha.slice(0, 7)} in an
+                          isolated workspace and reruns Gitleaks, Semgrep and OSV-Scanner on the whole repository. Only if that
+                          passes, it creates a new branch, commits exactly this diff and opens a pull request in{" "}
+                          {github.status?.repository?.fullName} with my GitHub account (@{githubLogin}). Nothing is merged and the
+                          default branch is not touched.
+                        </>
+                      ) : (
+                        <>
+                          I have reviewed the proposed diff and authorize applying it in an isolated workspace for a full security
+                          rescan. (Publishing a pull request needs a connected GitHub account with access to this repository.)
+                        </>
+                      )}
                     </span>
                   </label>
 
                   <div className="flex items-center gap-2">
-                    <Button onClick={onApprove} disabled={!approvedChecked || isApproving} size="sm">
-                      {isApproving ? <Loader2 className="size-3.5 animate-spin" /> : <CheckCircle2 className="size-3.5" />}
-                      Approve Patch
+                    <Button onClick={onApprove} disabled={!approvedChecked || isApproving || isApplying} size="sm">
+                      {isApproving || isApplying ? <Loader2 className="size-3.5 animate-spin" /> : <CheckCircle2 className="size-3.5" />}
+                      {canPublish ? "Approve, verify and open pull request" : "Approve and verify"}
                     </Button>
                     {patchDownloadUrl && (
                       <a
@@ -520,6 +587,7 @@ export function RemediationPanel({
                   ? "Applying the patch in an isolated environment and running Gitleaks, Semgrep and OSV-Scanner…"
                   : "Queued for an isolated verification worker…"}
               </div>
+              {remediation.verification?.progress && <ScannerSteps progress={remediation.verification.progress} />}
               <p className="text-muted">
                 {remediation.verification?.claimedAt
                   ? `${remediation.verification.runtime === "warm-worker" ? "Persistent scanner worker" : "GitHub Actions scanner worker"} started ${since(remediation.verification.claimedAt)} ago.`
@@ -599,33 +667,125 @@ function formatElapsed(ms: number): string {
 
 type Stage = { tone: "info" | "running" | "done" | "warn" | "error"; title: string; detail?: string };
 
+/** A generation that stopped updating this long ago did not finish; "Check again" starts a new one. */
+const GENERATION_STALE_MS = 2 * 60_000;
+
+const GENERATION_LABELS: Record<GenerationStage, string> = {
+  checking_repository: "Checking repository permission",
+  checking_eligibility: "Checking finding eligibility",
+  generating_remediation: "Generating remediation",
+  validating_dependency_changes: "Validating dependency changes",
+  generating_patch: "Generating patch (context lines, exact re-apply check)",
+};
+const GENERATION_ORDER: GenerationStage[] = [
+  "checking_repository",
+  "checking_eligibility",
+  "generating_remediation",
+  "validating_dependency_changes",
+  "generating_patch",
+];
+
+/** The steps the server stored while generating this preview. */
+function GenerationSteps({ generation }: { generation: NonNullable<PublicRemediation["generation"]> }) {
+  const done = new Set(generation.stages.map((s) => s.stage));
+  const steps = GENERATION_ORDER.filter((s) => done.has(s) || generation.state === "running");
+  return (
+    <ul className="space-y-1 text-[11px]" aria-label="Fix generation steps" data-testid="generation-steps">
+      {steps.map((s) => {
+        const current = generation.state === "running" && generation.stage === s;
+        const finished = done.has(s) && !current;
+        return (
+          <li key={s} className={`flex items-center gap-1.5 ${finished ? "text-foreground" : "text-muted"}`}>
+            {current ? <Loader2 className="size-3 animate-spin text-accent" /> : finished ? <CheckCircle2 className="size-3 text-accent" /> : <span className="inline-block size-3 rounded-full border border-line" />}
+            {GENERATION_LABELS[s]}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+const SCANNER_LABELS = { gitleaks: "Gitleaks", semgrep: "Semgrep", osvScanner: "OSV-Scanner" } as const;
+
+/** Real verification progress reported by the worker (or the local run). */
+function ScannerSteps({ progress }: { progress: NonNullable<NonNullable<PublicRemediation["verification"]>["progress"]> }) {
+  const applied = progress.stage === "scanning";
+  const icon = (st: ScannerProgress | "done" | "running" | "pending") =>
+    st === "running" ? (
+      <Loader2 className="size-3 animate-spin text-accent" />
+    ) : st === "completed" || st === "done" ? (
+      <CheckCircle2 className="size-3 text-accent" />
+    ) : st === "pending" ? (
+      <span className="inline-block size-3 rounded-full border border-line" />
+    ) : (
+      <AlertCircle className="size-3 text-sev-high" />
+    );
+  return (
+    <ul className="space-y-1 text-[11px]" aria-label="Verification steps" data-testid="verification-steps">
+      <li className="flex items-center gap-1.5">
+        {icon(progress.stage === "preparing_snapshot" ? "running" : "done")} Rebuilding the repository at the scanned commit
+      </li>
+      <li className="flex items-center gap-1.5">
+        {icon(progress.stage === "applying_patch" ? "running" : applied ? "done" : "pending")} Applying approved patch (plain git apply, byte check)
+      </li>
+      {(Object.keys(SCANNER_LABELS) as (keyof typeof SCANNER_LABELS)[]).map((k) => (
+        <li key={k} className="flex items-center gap-1.5">
+          {icon(progress.scanners[k])} Running {SCANNER_LABELS[k]}
+          {progress.scanners[k] !== "running" && progress.scanners[k] !== "pending" ? ` — ${progress.scanners[k].replace("_", " ")}` : ""}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 /** The current step of the Auto-Fix workflow, derived only from stored server state. */
 function workflowStage(p: {
   remediation: PublicRemediation | null;
   isSecret: boolean;
   isGenerating: boolean;
+  live: PublicRemediation | null;
   initial: ReturnType<typeof classifyRemediationEligibility>;
   since: (iso?: string | null) => string | null;
+  isApplying: boolean;
 }): Stage {
   const r = p.remediation;
   if (p.isSecret) return { tone: "warn", title: "Finding not eligible for automatic remediation", detail: "Leaked credentials must be rotated; code edits cannot revoke them." };
-  if (p.isGenerating) return { tone: "running", title: "Generating remediation…", detail: "Building the exact patch against the scanned commit." };
+  if (p.isGenerating) {
+    const g = p.live?.generation;
+    return { tone: "running", title: g?.stage ? `${GENERATION_LABELS[g.stage]}…` : "Generating remediation…", detail: "Building the exact patch against the scanned commit." };
+  }
   if (!r) {
     return p.initial.canAutoFix
-      ? { tone: "info", title: "No fix generated yet", detail: p.initial.decidedOnPreview ? "Eligibility is decided when the preview is generated." : undefined }
+      ? { tone: "info", title: "No fix generated yet", detail: p.initial.decidedOnPreview ? "Nothing runs until you generate the preview; eligibility is decided then, by the server." : undefined }
       : { tone: "warn", title: "Finding not eligible for automatic remediation", detail: p.initial.reason };
   }
+  if (r.generation?.state === "running") {
+    return { tone: "warn", title: "Fix generation was interrupted", detail: "No result was stored. Use Check again to start a new one." };
+  }
+  if (r.generation?.state === "failed") return { tone: "error", title: "Fix generation failed", detail: r.eligibilityReason };
   if (!r.unifiedDiff) return { tone: "warn", title: "Manual review required", detail: r.eligibilityReason };
   const pr = r.pullRequest;
+  const scannersDone = r.verification?.progress
+    ? Object.values(r.verification.progress.scanners).filter((s) => s !== "pending" && s !== "running").length
+    : 0;
   switch (r.status) {
     case "preview":
-      return { tone: "info", title: "Patch preview ready — waiting for your explicit approval" };
+      return { tone: "info", title: "Preview ready — waiting for your explicit approval" };
     case "approved":
-      return { tone: "info", title: "Approved — verification not started yet" };
-    case "applied":
+      return p.isApplying
+        ? { tone: "running", title: "Starting the security verification…" }
+        : { tone: "info", title: "Approved — verification not started yet" };
+    case "applied": {
+      const prog = r.verification?.progress;
+      if (prog?.stage === "scanning") {
+        return { tone: "running", title: `Running Gitleaks, Semgrep and OSV-Scanner (${scannersDone} of 3 finished)`, detail: r.verification?.claimedAt ? `Started ${p.since(r.verification.claimedAt)} ago.` : undefined };
+      }
+      if (prog?.stage === "applying_patch") return { tone: "running", title: "Applying approved patch in the isolated environment" };
+      if (prog?.stage === "preparing_snapshot") return { tone: "running", title: "Rebuilding the repository at the scanned commit" };
       return r.verification?.claimedAt
-        ? { tone: "running", title: "Running Gitleaks, Semgrep and OSV-Scanner on the patched repository", detail: `Started ${p.since(r.verification.claimedAt)} ago.` }
+        ? { tone: "running", title: "Verification worker started", detail: `Started ${p.since(r.verification.claimedAt)} ago.` }
         : { tone: "running", title: "Applying patch in isolated verification environment (queued)", detail: `Waiting ${p.since(r.updatedAt)} for a worker.` };
+    }
     case "failed":
       return r.rescanSummary?.reason === "verification_timeout"
         ? { tone: "error", title: "Verification timed out — nothing was verified" }
@@ -643,10 +803,15 @@ function workflowStage(p: {
             ? "GitHub rate limit reached — nothing was created"
             : pr.code === "credential_invalid"
               ? "GitHub authorization expired or revoked — nothing was created"
-              : "Fix verified, but pull request creation failed";
+              : pr.code === "publish_cancelled"
+                ? "Publishing cancelled — nothing was created"
+                : "Fix verified, but pull request creation failed";
         return { tone: "error", title, detail: pr.message };
       }
-      return { tone: "done", title: "Fix verified — ready to open a pull request" };
+      if (r.publishAfterVerification) {
+        return { tone: "running", title: "Security verification complete — creating the pull request automatically", detail: `As @${r.publishAfterVerification.login}.` };
+      }
+      return { tone: "done", title: "Security verification complete — ready to open a pull request" };
   }
   return { tone: "info", title: r.status };
 }

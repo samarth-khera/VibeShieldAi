@@ -33,6 +33,7 @@ export function RealFindingDrawer({
   mode = "review",
   readOnly = false,
   onRemediationUpdated,
+  scannedCommit,
 }: {
   jobId: string;
   finding: PublicFinding | null;
@@ -42,6 +43,8 @@ export function RealFindingDrawer({
   readOnly?: boolean;
   /** Keeps the report list's fix status in step with the panel. */
   onRemediationUpdated?: (r: PublicRemediation) => void;
+  /** The immutable commit the scan ran on. */
+  scannedCommit?: string | null;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLElement>(null);
@@ -478,7 +481,7 @@ export function RealFindingDrawer({
 
           {/* AI Remediation & Auto-Fix Panel */}
           <section>
-            <RemediationPanel jobId={jobId} finding={finding} mode={mode} readOnly={readOnly} onRemediationUpdated={onRemediationUpdated} />
+            <RemediationPanel jobId={jobId} finding={finding} mode={mode} readOnly={readOnly} onRemediationUpdated={onRemediationUpdated} scannedCommit={scannedCommit} />
           </section>
 
           {/* External References */}

@@ -179,12 +179,24 @@ export type FindingFixStatus = {
 
 export function findingFixStatus(
   finding: Parameters<typeof classifyRemediationEligibility>[0],
-  serverDecision?: { eligibility: RemediationEligibilityType; unifiedDiff: string; eligibilityReason: string } | null,
+  serverDecision?: {
+    eligibility: RemediationEligibilityType;
+    unifiedDiff: string;
+    eligibilityReason: string;
+    generation?: { state: string } | null;
+  } | null,
 ): FindingFixStatus {
-  if (serverDecision) {
-    return serverDecision.eligibility === "unsuitable" || !serverDecision.unifiedDiff
-      ? { kind: "manual_review", label: "Manual Review", eligible: false, reason: serverDecision.eligibilityReason }
-      : { kind: "fix_ready", label: "Fix Ready", eligible: true, reason: serverDecision.eligibilityReason };
+  // A preview still being generated is not a decision yet.
+  if (serverDecision && serverDecision.generation?.state !== "running") {
+    if (serverDecision.eligibility === "unsuitable" || !serverDecision.unifiedDiff) {
+      return { kind: "manual_review", label: "Manual Review", eligible: false, reason: serverDecision.eligibilityReason };
+    }
+    return {
+      kind: "fix_ready",
+      label: serverDecision.eligibility === "safe" ? "Safe Fix Ready" : "Fix Ready",
+      eligible: true,
+      reason: serverDecision.eligibilityReason,
+    };
   }
   const e = classifyRemediationEligibility(finding);
   if (e.requiresRotation) return { kind: "rotate_credential", label: "Rotate Credential", eligible: false, reason: e.reason };
@@ -194,3 +206,34 @@ export function findingFixStatus(
     ? { kind: "safe", label: "Safe Fix", eligible: true, reason: e.reason }
     : { kind: "potentially_breaking", label: "Potentially Breaking", eligible: true, reason: e.reason };
 }
+
+/**
+ * Which engine a preview for this finding uses, mirroring the server's remediationEngineFor:
+ * only "ai" calls the AI provider (and counts toward its quota).
+ */
+export function remediationEngine(finding: {
+  scanner?: string | null;
+  filePath?: string | null;
+  ruleId?: string | null;
+  category?: string | null;
+  packageInfo?: unknown;
+  redactedEvidence?: string | null;
+  title?: string | null;
+  metadata?: unknown;
+}): "npm" | "manifest" | "deterministic" | "ai" | "none" {
+  const e = classifyRemediationEligibility(finding);
+  if (!e.canAutoFix) return "none";
+  const pkg = (finding.packageInfo ?? null) as { ecosystem?: string } | null;
+  if (finding.scanner === "osv-scanner" && /(^|\/)package-lock\.json$/.test(finding.filePath || "") && pkg?.ecosystem?.toLowerCase() === "npm") return "npm";
+  if (finding.packageInfo != null || finding.scanner === "osv-scanner" || finding.category === "Dependencies") return "manifest";
+  if ((finding.ruleId || "").toLowerCase().includes("eval") || /\beval\s*\(/.test(finding.redactedEvidence || "")) return "deterministic";
+  return "ai";
+}
+
+export const ENGINE_NOTES: Record<ReturnType<typeof remediationEngine>, string> = {
+  npm: "No AI request: VibeShield's deterministic npm engine builds the fix (the same result as npm install/npm update, checked against the scanned lockfile).",
+  manifest: "No AI request: a deterministic manifest version bump against the file at the scanned commit.",
+  deterministic: "No AI request: a deterministic, source-checked code transformation.",
+  ai: "Uses the AI provider to propose the change (counts toward the AI quota); the result is still checked against the scanned file.",
+  none: "No automated fix is offered for this finding.",
+};

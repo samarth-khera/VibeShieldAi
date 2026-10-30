@@ -9,6 +9,7 @@ import {
   confirmRepositoryAuthorization,
   fetchGithubStatus,
   prepareRepositoryAuthorization,
+  safeAutoFix,
   type GithubStatus,
   type RepositoryAuthorizationPrepared,
   type RepositoryAuthorizationState,
@@ -69,10 +70,12 @@ export function RepositoryAuthorizationPanel({
   jobId,
   remediationId,
   github,
+  scannedCommit,
 }: {
   jobId: string;
   remediationId?: string;
   github: GithubStatusHandle;
+  scannedCommit?: string | null;
 }) {
   const { status } = github;
   const [prepared, setPrepared] = useState<RepositoryAuthorizationPrepared | null>(null);
@@ -81,10 +84,40 @@ export function RepositoryAuthorizationPanel({
   const [checked, setChecked] = useState(false);
   const [error, setError] = useState<{ message: string; link?: string | null } | null>(null);
   const [justAuthorized, setJustAuthorized] = useState<string | null>(null);
+  const [safeDialog, setSafeDialog] = useState(false);
+  const [safeChecked, setSafeChecked] = useState(false);
+  const [safeBusy, setSafeBusy] = useState(false);
+  const [safeNotice, setSafeNotice] = useState<string | null>(null);
 
   if (!status || !status.configured) return null;
   const repo = status.repository;
   const authz = repo?.authorization;
+
+  const changeSafeAutoFix = async (action: "enable" | "disable" | "run") => {
+    if (!repo?.id) return;
+    setSafeBusy(true);
+    setError(null);
+    try {
+      const r =
+        action === "enable"
+          ? await safeAutoFix(jobId, { action, confirm: true, repositoryId: repo.id })
+          : await safeAutoFix(jobId, { action });
+      setSafeDialog(false);
+      setSafeNotice(
+        action === "disable"
+          ? "Safe Auto-Fix is off. Nothing will be generated or published automatically."
+          : r.enabled
+            ? "Safe Auto-Fix is processing this scan's dependency findings; results appear on each finding."
+            : null,
+      );
+    } catch (err) {
+      setError({ message: err instanceof Error ? err.message : "Safe Auto-Fix could not be changed." });
+    } finally {
+      setSafeBusy(false);
+      setSafeChecked(false);
+      github.reload();
+    }
+  };
 
   const open = async () => {
     setError(null);
@@ -164,6 +197,29 @@ export function RepositoryAuthorizationPanel({
           {justAuthorized && ok && (
             <p className="text-accent">GitHub now lists {justAuthorized} in the VibeShield AI installation.</p>
           )}
+          {ok && (
+            <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 font-mono text-[11px] text-muted" data-testid="authorized-details">
+              <dt>Repository</dt>
+              <dd>
+                {repo.fullName}
+                {repo.id ? ` (ID ${repo.id})` : ""}
+              </dd>
+              <dt>Authorized account</dt>
+              <dd>@{status.user?.login}</dd>
+              <dt>Write access</dt>
+              <dd>{repo.canPush ? "yes — you can push; the installation grants Contents and Pull requests write" : "no"}</dd>
+              <dt>Base branch</dt>
+              <dd>{repo.defaultBranch ?? "unknown"}</dd>
+              {scannedCommit && (
+                <>
+                  <dt>Scanned commit</dt>
+                  <dd>{scannedCommit.slice(0, 12)}</dd>
+                </>
+              )}
+              <dt>Branch, commit, PR</dt>
+              <dd>{repo.readyToWrite ? "VibeShield can create them with your account after you approve a verified fix" : "not possible yet"}</dd>
+            </dl>
+          )}
           {!ok && <p className="text-muted">{authz.message}</p>}
           <div className="flex flex-wrap items-center gap-2">
             {state === "authorization_required" && (
@@ -188,6 +244,63 @@ export function RepositoryAuthorizationPanel({
                 </a>
               )}
           </div>
+          {ok && repo.safeAutoFix?.available && (
+            <div className="rounded border border-line bg-surface-subtle p-2 space-y-1.5" data-testid="safe-autofix">
+              <p className="font-medium text-foreground">
+                Safe Auto-Fix for {repo.fullName}: {repo.safeAutoFix.enabled ? `On (enabled by @${repo.safeAutoFix.enabledBy})` : "Off"}
+              </p>
+              <p className="text-[11px] text-muted">
+                Off by default. When on, fixes the server classifies as safe (patch-level dependency updates inside the declared
+                range that change only the lockfile) are generated, verified by a full rescan and opened as pull requests with
+                your account, without asking each time. Everything else still waits for your review.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {repo.safeAutoFix.enabled ? (
+                  <>
+                    <Button size="sm" variant="secondary" onClick={() => changeSafeAutoFix("run")} disabled={safeBusy}>
+                      Run on this scan now
+                    </Button>
+                    <Button size="sm" variant="secondary" onClick={() => changeSafeAutoFix("disable")} disabled={safeBusy}>
+                      Turn off
+                    </Button>
+                  </>
+                ) : (
+                  <Button size="sm" variant="secondary" onClick={() => setSafeDialog(true)} disabled={safeBusy}>
+                    Enable Safe Auto-Fix…
+                  </Button>
+                )}
+              </div>
+              {safeNotice && <p className="text-[11px] text-accent">{safeNotice}</p>}
+            </div>
+          )}
+          {safeDialog && repo.id && (
+            <div role="dialog" aria-modal="true" aria-label="Enable Safe Auto-Fix" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4">
+              <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-line bg-surface p-4 space-y-3 text-xs">
+                <h3 className="text-sm font-semibold text-foreground">Enable Safe Auto-Fix for {repo.fullName}?</h3>
+                <ul className="list-disc pl-4 text-muted space-y-1">
+                  <li>Only fixes the server classifies as safe: a dependency reached only through other packages, updated to a patch release (same major and minor version) inside every parent&apos;s declared range, changing only package-lock.json.</li>
+                  <li>Each fix is applied in an isolated workspace and the whole repository is rescanned with Gitleaks, Semgrep and OSV-Scanner. Only if every scanner completes, the targets are resolved and nothing new appears, VibeShield creates a new branch, commits exactly that fix and opens a pull request with your GitHub account (@{status.user?.login}).</li>
+                  <li>Potentially breaking upgrades, manual-review findings, secrets and AI-generated code changes are never processed automatically.</li>
+                  <li>Never merges, never pushes to {repo.defaultBranch ?? "the default branch"}. You can turn it off at any time; nothing pending is published after that.</li>
+                </ul>
+                <label className="flex items-start gap-2 text-foreground">
+                  <input type="checkbox" checked={safeChecked} onChange={(e) => setSafeChecked(e.target.checked)} className="mt-0.5" />
+                  <span>
+                    I authorize VibeShield to open pull requests for safe fixes in {repo.fullName} (repository ID {repo.id}) with my
+                    GitHub account, without asking each time.
+                  </span>
+                </label>
+                <div className="flex justify-end gap-2">
+                  <Button variant="secondary" size="sm" onClick={() => setSafeDialog(false)} disabled={safeBusy}>
+                    Cancel
+                  </Button>
+                  <Button size="sm" onClick={() => changeSafeAutoFix("enable")} disabled={!safeChecked || safeBusy}>
+                    {safeBusy ? <Loader2 className="size-3.5 animate-spin" /> : null} Enable Safe Auto-Fix
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
           {state === "installation_required" && repo.ownerType === "Organization" && (
             <p className="text-[11px] text-muted">
               For an organization, GitHub may ask an owner to approve the installation; VibeShield shows it as requested until then.

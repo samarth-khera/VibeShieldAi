@@ -310,7 +310,12 @@ export type PublicRemediation = {
   pullRequestUrl: string | null;
   pullRequest: RemediationPullRequest | null;
   /** While verification runs: whether a worker has claimed it yet. */
-  verification?: { claimedAt: string | null; runtime: "warm-worker" | "github-actions" | null } | null;
+  verification?: { claimedAt: string | null; runtime: "warm-worker" | "github-actions" | null; progress?: VerificationProgress | null } | null;
+  /** How the preview was produced and the steps the server recorded while producing it. */
+  generation?: GenerationState | null;
+  approvedBy?: "job_owner" | "safe_autofix" | null;
+  /** The approval also authorized publishing after a passed verification, as this GitHub user. */
+  publishAfterVerification?: { login: string } | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -327,7 +332,9 @@ export type PullRequestFailureCode =
   | "branch_conflict"
   | "github_error"
   | "network_error"
-  | "not_confirmed";
+  | "not_confirmed"
+  | "publish_cancelled"
+  | "approval_invalid";
 
 /** Steps of publishing a verified fix (stored while they run). */
 export type PullRequestStep = "checking_repository" | "creating_commit" | "pushing_branch" | "creating_pull_request" | "confirming";
@@ -360,6 +367,33 @@ export type RemediationPullRequest = {
   };
   /** The pull request's author as GitHub reports it. */
   prAuthor?: string;
+  at: string;
+};
+
+/** Which engine produces a fix; only "ai" calls the AI provider (and uses its quota). */
+export type RemediationEngine = "npm" | "manifest" | "deterministic" | "ai" | "none";
+
+export type GenerationStage =
+  | "checking_repository"
+  | "checking_eligibility"
+  | "generating_remediation"
+  | "validating_dependency_changes"
+  | "generating_patch";
+
+export type GenerationState = {
+  state: "running" | "done" | "failed";
+  stage?: GenerationStage;
+  engine: RemediationEngine;
+  repository?: { canPublish: boolean; reason: string | null; fullName: string; login: string | null } | null;
+  stages: { stage: GenerationStage; at: string }[];
+  startedAt: string;
+  at: string;
+};
+
+export type ScannerProgress = "pending" | "running" | "completed" | "failed" | "timed_out" | "skipped";
+export type VerificationProgress = {
+  stage: "preparing_snapshot" | "applying_patch" | "scanning";
+  scanners: { gitleaks: ScannerProgress; semgrep: ScannerProgress; osvScanner: ScannerProgress };
   at: string;
 };
 
@@ -414,6 +448,7 @@ export type GithubStatus = {
       installationAccount?: string;
       installationSettingsUrl?: string;
     };
+    safeAutoFix?: { enabled: boolean; enabledBy: string | null; enabledAt: string | null; available: boolean };
   };
   authorizationProblem?: GithubAuthFailureCode;
   links: { connect: string; install: string; manageInstallations: string };
@@ -485,11 +520,24 @@ export const createRemediationPreview = (jobId: string, findingId: string) =>
 export const listRemediations = (jobId: string) =>
   request<PublicRemediation[]>(`/api/scans/${encodeURIComponent(jobId)}/remediation`);
 
-export const approveRemediation = (jobId: string, remediationId: string) =>
+/** `publish`: also authorize the branch, commit and pull request once the patch passes verification. */
+export const approveRemediation = (jobId: string, remediationId: string, opts: { publish?: boolean } = {}) =>
   request<PublicRemediation>(
     `/api/scans/${encodeURIComponent(jobId)}/remediation/${encodeURIComponent(remediationId)}/approve`,
-    { method: "POST" },
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts.publish ? { publish: true } : {}) },
   );
+
+export type SafeAutoFixState = { enabled: boolean; enabledBy: string | null; enabledAt: string | null; started?: boolean };
+
+export const safeAutoFix = (
+  jobId: string,
+  body: { action: "enable"; confirm: true; repositoryId: number } | { action: "disable" } | { action: "run" },
+) =>
+  request<SafeAutoFixState>(`/api/scans/${encodeURIComponent(jobId)}/safe-autofix`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
 export const applyRemediation = (jobId: string, remediationId: string) =>
   request<PublicRemediation>(

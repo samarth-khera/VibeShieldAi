@@ -939,6 +939,7 @@ export function RealReportView({ jobId }: { jobId: string }) {
           mode={mode}
           readOnly={readOnly}
           onRemediationUpdated={onRemediationUpdated}
+          scannedCommit={job?.repository.commitSha}
         />
       </div>
     </div>

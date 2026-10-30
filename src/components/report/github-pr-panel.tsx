@@ -119,8 +119,10 @@ export function GithubPullRequestPanel({
   const [now, setNow] = useState(() => Date.now());
   const inProgress = pr?.status === "in_progress" && now - Date.parse(pr.at) < PR_STALE_MS;
   const interrupted = pr?.status === "in_progress" && !inProgress;
+  // Approved with consent to publish: the server opens the PR itself once verification passes.
+  const autoPublishing = verified && Boolean(remediation.publishAfterVerification) && !prDone && !inProgress && !interrupted && pr?.status !== "failed";
   useEffect(() => {
-    if (!creating && !inProgress) return;
+    if (!creating && !inProgress && !autoPublishing) return;
     const t = setInterval(async () => {
       setNow(Date.now());
       const fresh = await listRemediations(jobId)
@@ -129,7 +131,7 @@ export function GithubPullRequestPanel({
       if (fresh && JSON.stringify(fresh.pullRequest) !== JSON.stringify(remediation.pullRequest)) onRemediationUpdated(fresh);
     }, 1000);
     return () => clearInterval(t);
-  }, [creating, inProgress, jobId, remediation.id, remediation.pullRequest, onRemediationUpdated]);
+  }, [creating, inProgress, autoPublishing, jobId, remediation.id, remediation.pullRequest, onRemediationUpdated]);
   const repo = status?.repository;
   const lastFailure = prError ?? (pr?.status === "failed" && pr.code ? { code: pr.code, message: pr.message } : null);
   // The repository can be authorized from VibeShield itself (see RepositoryAuthorizationPanel).
@@ -190,6 +192,12 @@ export function GithubPullRequestPanel({
       label: pr.status === "created" ? `Pull request #${pr.number} created` : `Pull request #${pr.number} exists (${pr.state})`,
       state: "done",
       detail: "Branch, commit and pull request were read back from GitHub and match.",
+    });
+  } else if (autoPublishing) {
+    steps.push({
+      label: `Creating branch, commit and pull request automatically as @${remediation.publishAfterVerification!.login}`,
+      state: "running",
+      detail: "You approved publishing this exact diff once it passed verification; each step appears here as GitHub confirms it.",
     });
   } else if (interrupted) {
     steps.push({
@@ -327,7 +335,7 @@ export function GithubPullRequestPanel({
             <GitBranch className="size-3.5" /> Authorize this repository
           </a>
         )}
-        {verified && !prDone && repo?.readyToWrite && (
+        {verified && !prDone && !autoPublishing && repo?.readyToWrite && (
           <Button onClick={() => setDialogOpen(true)} size="sm" disabled={creating || inProgress}>
             {creating || inProgress ? <Loader2 className="size-3.5 animate-spin" /> : <GitPullRequest className="size-3.5" />}{" "}
             {creating || inProgress ? "Publishing…" : lastFailure || interrupted ? "Retry pull request" : "Review & create pull request"}

@@ -119,8 +119,7 @@ describe("Auto-Fix status is truthful", () => {
     expect(screen.queryByText(/create pull request/i)).toBeNull();
 
     fireEvent.click(within(box).getByText("Check again"));
-    expect((await screen.findByTestId("workflow-status")).textContent).toMatch(/Status: (Generating remediation|Patch preview ready)/);
-    expect((await screen.findByText(/Patch preview ready — waiting for your explicit approval/))).toBeTruthy();
+    expect((await screen.findByText(/Preview ready — waiting for your explicit approval/))).toBeTruthy();
     expect(calls.filter((c) => c.method === "POST" && c.url.endsWith("/remediation/preview"))).toHaveLength(1);
   });
 
@@ -130,15 +129,16 @@ describe("Auto-Fix status is truthful", () => {
     expect(await screen.findByText(/^Repository authorized/)).toBeTruthy();
     const s = await status();
     expect(s.textContent).toContain("Status: No fix generated yet");
-    expect(s.textContent).toContain("Eligibility is decided when the preview is generated.");
-    expect(screen.queryByText(/verified/i)).toBeNull();
+    expect(s.textContent).toContain("Nothing runs until you generate the preview; eligibility is decided then, by the server.");
+    expect(screen.getByTestId("engine-note").textContent).toMatch(/^No AI request: VibeShield's deterministic npm engine/);
+    expect(screen.queryByText(/Security verification complete|Fix Verified|Pull request #/)).toBeNull();
     expect(screen.queryByText(/Pull request #/)).toBeNull();
     cleanup();
 
     stub([[rem()]]);
     render_();
-    expect((await status()).textContent).toContain("Status: Patch preview ready — waiting for your explicit approval");
-    const approve = (await screen.findByText("Approve Patch")).closest("button")!;
+    expect((await status()).textContent).toContain("Status: Preview ready — waiting for your explicit approval");
+    const approve = (await screen.findByText("Approve, verify and open pull request")).closest("button")!;
     expect(approve.disabled).toBe(true); // until the reviewer ticks the box
   });
 
@@ -160,7 +160,7 @@ describe("Auto-Fix status is truthful", () => {
 
     stub([[rem({ status: "applied", approvedAt: "2026-10-30T10:00:00Z", verification: { claimedAt: "2026-10-30T10:00:25Z", runtime: "github-actions" } })]]);
     render_();
-    expect((await status()).textContent).toContain("Running Gitleaks, Semgrep and OSV-Scanner on the patched repository");
+    expect((await status()).textContent).toContain("Verification worker started");
     expect(screen.getByTestId("verification-running").textContent).toContain("GitHub Actions scanner worker started 5s ago");
     expect(screen.getByTestId("verification-running").textContent).toContain("after 15 minutes without a result it is marked as timed out");
   });
@@ -244,6 +244,137 @@ describe("Auto-Fix status is truthful", () => {
       expect((await status()).textContent).toContain(text);
       cleanup();
     }
+  });
+});
+
+describe("complete Auto-Fix interaction", () => {
+  const generating = (stage: string, stages: string[]) =>
+    rem({
+      unifiedDiff: "",
+      eligibilityReason: "Generating…",
+      generation: { state: "running", stage: stage as never, engine: "npm", stages: stages.map((s) => ({ stage: s as never, at: new Date().toISOString() })), startedAt: new Date().toISOString(), at: new Date().toISOString() },
+      createdAt: new Date().toISOString(),
+    });
+
+  it("clicking Preview sends one preview request for this finding and shows the server's stored steps while it runs", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const posts: { url: string; body: unknown }[] = [];
+    stub([[], [generating("validating_dependency_changes", ["checking_repository", "checking_eligibility", "generating_remediation", "validating_dependency_changes"])]], (url, init) => {
+      if (url.endsWith("/remediation/preview") && init?.method === "POST") {
+        posts.push({ url, body: JSON.parse(String(init.body)) });
+        return null;
+      }
+      return null;
+    });
+    // The preview POST resolves only when released, like a slow server.
+    const original = globalThis.fetch;
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/remediation/preview") && init?.method === "POST") {
+        posts.push({ url, body: JSON.parse(String(init.body)) });
+        await gate;
+        return new Response(JSON.stringify({ data: rem({ eligibility: "safe", generation: { state: "done", engine: "npm", stages: [], startedAt: "x", at: "x" } }) }), { status: 201 });
+      }
+      return original(url, init);
+    });
+    render_();
+    fireEvent.click(await screen.findByText("Preview Proposed Patch"));
+    expect(posts).toEqual([{ url: "/api/scans/A-NZKPwxBNay-TeEZnpfGGpWYqlikg9p/remediation/preview", body: { findingId: proxyAddr.id } }]);
+    const steps = await screen.findByTestId("generation-steps", {}, { timeout: 3000 });
+    expect(steps.textContent).toContain("Checking finding eligibility");
+    expect(steps.textContent).toContain("Validating dependency changes");
+    expect((await status()).textContent).toContain("Validating dependency changes…");
+    release();
+    expect(await screen.findByText(/Preview ready — waiting for your explicit approval/)).toBeTruthy();
+  });
+
+  it("after a reload, an interrupted generation is reported as interrupted, not as running", async () => {
+    stub([[{ ...generating("generating_remediation", ["checking_eligibility"]), generation: { ...generating("x", []).generation!, state: "running", at: "2026-10-01T00:00:00Z" } }]]);
+    render_();
+    expect((await status()).textContent).toContain("Fix generation was interrupted");
+  });
+
+  it("one explicit approval authorizes publishing and starts the full verification", async () => {
+    const calls: { url: string; body?: string }[] = [];
+    stub([[rem()]], (url, init) => {
+      if (url.endsWith("/approve")) {
+        calls.push({ url, body: String(init?.body) });
+        return new Response(JSON.stringify({ data: rem({ status: "approved", approvedAt: "2026-10-30T10:00:00Z", publishAfterVerification: { login: "samarth-khera" } }) }), { status: 200 });
+      }
+      if (url.endsWith("/apply")) {
+        calls.push({ url });
+        return new Response(JSON.stringify({ data: rem({ status: "applied", approvedAt: "2026-10-30T10:00:00Z", verification: { claimedAt: null, runtime: null, progress: null } }) }), { status: 202 });
+      }
+      return null;
+    });
+    render_();
+    const label = await screen.findByText(/I approve exactly this diff/);
+    expect(label.textContent).toContain("opens a pull request in samarth-khera/Job-portal with my GitHub account (@samarth-khera)");
+    expect(label.textContent).toContain("Nothing is merged and the default branch is not touched.");
+    fireEvent.click(screen.getByRole("checkbox", { name: /I approve exactly this diff/ }));
+    fireEvent.click(screen.getByText("Approve, verify and open pull request"));
+    expect(await screen.findByTestId("verification-running")).toBeTruthy();
+    expect(calls.map((c) => c.url.split("/").pop())).toEqual(["approve", "apply"]);
+    expect(JSON.parse(calls[0].body!)).toEqual({ publish: true });
+  });
+
+  it("shows each scanner's real progress, then automatic publishing after a passed verification", async () => {
+    stub([
+      [
+        rem({
+          status: "applied",
+          approvedAt: "x",
+          verification: {
+            claimedAt: new Date().toISOString(),
+            runtime: "github-actions",
+            progress: { stage: "scanning", scanners: { gitleaks: "completed", semgrep: "running", osvScanner: "completed" }, at: "x" },
+          },
+        }),
+      ],
+    ]);
+    render_();
+    expect((await status()).textContent).toContain("Running Gitleaks, Semgrep and OSV-Scanner (2 of 3 finished)");
+    const steps = screen.getByTestId("verification-steps").textContent!;
+    expect(steps).toContain("Running Gitleaks — completed");
+    expect(steps).toContain("Running OSV-Scanner — completed");
+    expect(steps).toMatch(/Running Semgrep(?! —)/);
+    cleanup();
+
+    stub([[rem({ status: "verified", rescanStatus: "verified", approvedAt: "x", publishAfterVerification: { login: "samarth-khera" } })]]);
+    render_();
+    expect((await status()).textContent).toContain("Security verification complete — creating the pull request automatically");
+    expect(screen.queryByText("Review & create pull request")).toBeNull();
+  });
+
+  it("Safe Auto-Fix is off by default and needs an explicit, repository-specific confirmation", async () => {
+    const bodies: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.startsWith("/api/auth/github/status")) {
+          return new Response(JSON.stringify({ data: { ...authorized, repository: { ...authorized.repository!, safeAutoFix: { enabled: false, enabledBy: null, enabledAt: null, available: true } } } }), { status: 200 });
+        }
+        if (url.endsWith("/safe-autofix")) {
+          bodies.push(JSON.parse(String(init?.body)));
+          return new Response(JSON.stringify({ data: { enabled: true, enabledBy: "samarth-khera", enabledAt: "x", started: true } }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      }),
+    );
+    render_();
+    const box = await screen.findByTestId("safe-autofix");
+    expect(box.textContent).toContain("Safe Auto-Fix for samarth-khera/Job-portal: Off");
+    expect(screen.getByTestId("authorized-details").textContent).toContain("Authorized account@samarth-khera");
+    fireEvent.click(within(box).getByText("Enable Safe Auto-Fix…"));
+    const dialog = await screen.findByRole("dialog", { name: "Enable Safe Auto-Fix" });
+    expect(dialog.textContent).toContain("Potentially breaking upgrades, manual-review findings, secrets and AI-generated code changes are never processed automatically.");
+    const enable = within(dialog).getByText("Enable Safe Auto-Fix").closest("button")!;
+    expect(enable.disabled).toBe(true);
+    expect(bodies).toEqual([]);
+    fireEvent.click(within(dialog).getByRole("checkbox"));
+    fireEvent.click(enable);
+    expect(await screen.findByText(/Safe Auto-Fix is processing this scan's dependency findings/)).toBeTruthy();
+    expect(bodies).toEqual([{ action: "enable", confirm: true, repositoryId: 1106558267 }]);
   });
 });
 
