@@ -16,9 +16,11 @@ import {
   type RemediationDeps,
 } from "./service";
 import { toPublicRemediation, type RemediationRecord, type RescanComparison } from "./types";
+import { publishVerifiedRemediation, pumpPublications, runSafeAutoFix, safeAutoFixSetting } from "./automation";
+import { recordVerificationProgress, type RepositoryCheck } from "./service";
 import { isWarmLease } from "../quota";
 import { verificationClaimOf } from "./claims";
-import { AUTH_FAILURE, authorizeRepository, checkJobAccess } from "../auth/repository-access";
+import { AUTH_FAILURE, authorizeRepository, checkJobAccess, isMissingTable } from "../auth/repository-access";
 import { isSameOrigin, loadSession, type AuthDeps } from "../auth/service";
 import { loadScanAccess } from "../auth/repository-access";
 import { resolvePrivateSource } from "../auth/private-source";
@@ -45,7 +47,22 @@ export async function handleCreatePreview(
   if (!findingId) return fail(400, "missing_parameter", "findingId is required.");
 
   try {
-    const preview = await createPreview(scanJobId, findingId, deps);
+    const auth = deps.auth;
+    const job = await deps.store.get(scanJobId);
+    const checkRepository =
+      auth?.app && job
+        ? async (): Promise<RepositoryCheck> => {
+            const scanAccess = await loadScanAccess(auth, scanJobId);
+            const r = await authorizeRepository(req, auth, job, scanAccess, "write");
+            return {
+              canPublish: r.ok,
+              reason: r.ok ? null : r.code,
+              fullName: r.access?.fullName ?? `${job.owner}/${job.repo}`,
+              login: r.account?.login ?? null,
+            };
+          }
+        : undefined;
+    const preview = await createPreview(scanJobId, findingId, deps, { checkRepository });
     return ok(toPublicRemediation(preview), 201);
   } catch (err) {
     console.error("Preview error:", err);
@@ -65,6 +82,7 @@ export async function handleListRemediations(
   // Release slots held by verifications whose worker never reported back, so the UI sees a final state.
   await deps.store.reapStale(new Date(), deps.config ?? getConfig()).catch(() => undefined);
   await pumpVerifications(scanJobId, deps).catch(() => undefined);
+  await runLater(deps, () => pumpPublications(scanJobId, deps));
   const list = await deps.store.listRemediations(scanJobId);
   return ok(list.map((r) => toPublicRemediation(r)));
 }
@@ -73,6 +91,9 @@ export async function handleListRemediations(
  * POST …/approve. `ownerSubject` comes from the verified owner grant (route gate), never from the
  * request body. A connected GitHub user is recorded too, so publishing can be tied to them.
  */
+// Only `publish` is read; identity fields a client might send (owner, GitHub user, approver) are ignored.
+const ApproveSchema = z.object({ publish: z.boolean().optional() });
+
 export async function handleApproveRemediation(
   req: Request,
   scanJobId: string,
@@ -82,13 +103,35 @@ export async function handleApproveRemediation(
 ): Promise<Response> {
   if (!JOB_ID_RE.test(scanJobId)) return fail(404, "not_found", "Scan job not found.");
 
+  let wantsPublish = false;
+  try {
+    const text = await req.text();
+    wantsPublish = text ? ApproveSchema.parse(JSON.parse(text)).publish === true : false;
+  } catch {
+    return fail(400, "invalid_request", "Invalid approval request.");
+  }
+
   try {
     const session = deps.auth?.app ? await loadSession(req, deps.auth).catch(() => null) : null;
     const scanAccess = deps.auth ? await loadScanAccess(deps.auth, scanJobId) : null;
+    // Consent to publish after verification counts only for a repository GitHub confirms, right
+    // now, that this GitHub user can write to through the VibeShield installation.
+    let publish: { githubUserId: number; login: string } | null = null;
+    if (wantsPublish) {
+      const job = await deps.store.get(scanJobId);
+      if (!deps.auth?.app || !job) return fail(503, "not_configured", AUTH_FAILURE.not_configured.message);
+      const authz = await authorizeRepository(req, deps.auth, job, scanAccess, "write");
+      if (!authz.ok) {
+        const f = AUTH_FAILURE[authz.code];
+        return fail(409, "publish_not_authorized", `Cannot authorize publishing: ${f.message}`);
+      }
+      publish = { githubUserId: authz.account.githubUserId, login: authz.account.login };
+    }
     const approved = await approveRemediation(scanJobId, remediationId, deps, {
       ownerSubject,
-      githubUserId: session?.account?.githubUserId ?? null,
+      githubUserId: publish?.githubUserId ?? session?.account?.githubUserId ?? null,
       githubRepoId: scanAccess?.githubRepoId ?? null,
+      publish,
     });
     return ok(toPublicRemediation(approved));
   } catch (err) {
@@ -109,8 +152,11 @@ export async function handleApplyRemediation(
 
   try {
     const result = await applyAndVerify(scanJobId, remediationId, deps, { ownerSubject });
+    // In-process verification (local runtime) already finished: publish now if approved for it.
+    if (result.status === "verified") await publishVerifiedRemediation(scanJobId, remediationId, deps).catch(() => null);
+    const latest = (await deps.store.getRemediation(scanJobId, remediationId)) ?? result;
     // 202: verification is running on the worker; poll the remediation list for the result.
-    return ok(toPublicRemediation(result), result.status === "applied" ? 202 : 200);
+    return ok(toPublicRemediation(latest), latest.status === "applied" ? 202 : 200);
   } catch (err) {
     if (err instanceof RemediationError) {
       return fail(err.status, err.code, err.message, err.status === 429 ? { "Retry-After": "60" } : undefined);
@@ -311,6 +357,25 @@ export async function buildVerificationSpec(job: JobRecord, remediation: Remedia
 }
 
 const ScannerStatusSchema = z.string().max(30);
+const VerificationProgressSchema = z
+  .object({
+    scanJobId: z.string().max(32),
+    remediationId: z.string().max(36),
+    lease: z.string().max(100).optional(),
+    progress: z.union([
+      z.object({ stage: z.enum(["preparing_snapshot", "applying_patch", "scanning"]) }).strict(),
+      z.object({ scanner: z.enum(["gitleaks", "semgrep", "osv-scanner"]), status: z.string().max(20) }).strict(),
+    ]),
+  })
+  .strict();
+
+/** Runs work after the response when the platform supports it (Vercel `after`), else inline. */
+function runLater(deps: RemediationDeps, task: () => Promise<unknown>): void | Promise<void> {
+  const safe = () => task().then(() => undefined, (err) => log("error", "deferred_task_failed", { error: err instanceof Error ? err.message.slice(0, 200) : "unknown" }));
+  if (deps.defer) deps.defer(safe);
+  else return safe();
+}
+
 const VerificationResultSchema = z.object({
   scanJobId: z.string().max(32),
   remediationId: z.string().max(36),
@@ -364,12 +429,29 @@ export async function handleVerificationResult(
     signedBy = "warm";
   }
 
-  let parsed;
+  let json: unknown;
   try {
-    parsed = VerificationResultSchema.safeParse(JSON.parse(raw));
+    json = JSON.parse(raw);
   } catch {
     return fail(400, "invalid_json", "Verification result must be valid JSON.");
   }
+  // Real progress from the worker (patch applied, scanners started, each scanner finished).
+  if (json && typeof json === "object" && "progress" in json) {
+    const p = VerificationProgressSchema.safeParse(json);
+    if (!p.success) return fail(400, "validation_failed", "Verification progress does not match schema.");
+    if (p.data.scanJobId !== scanJobId || p.data.remediationId !== remediationId) {
+      return fail(400, "id_mismatch", "Payload identifiers do not match the route.");
+    }
+    const current = await deps.store.getRemediation(scanJobId, remediationId);
+    if (!current) return fail(404, "not_found", "Remediation not found.");
+    const progressClaim = verificationClaimOf(current.approvedOperations);
+    if (isWarmLease(progressClaim?.lease) ? p.data.lease !== progressClaim?.lease : signedBy === "warm" || Boolean(p.data.lease)) {
+      return fail(409, "stale_lease", "This worker no longer owns the verification.");
+    }
+    const accepted = await recordVerificationProgress(scanJobId, remediationId, p.data.progress, deps);
+    return ok({ accepted });
+  }
+  const parsed = VerificationResultSchema.safeParse(json);
   if (!parsed.success) return fail(400, "validation_failed", "Verification result does not match schema.");
   const body = parsed.data;
   if (body.scanJobId !== scanJobId || body.remediationId !== remediationId) {
@@ -410,5 +492,84 @@ export async function handleVerificationResult(
     totalMs: summary.timings?.totalMs ?? null,
   });
   if (!updated) return ok({ accepted: false, message: "Remediation is not awaiting verification." });
+  // Approved for publishing: create the branch, commit and pull request now that it passed.
+  if (status === "verified") await runLater(deps, () => publishVerifiedRemediation(scanJobId, remediationId, deps));
   return ok({ accepted: true, status });
+}
+
+const SafeAutoFixSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("enable"), confirm: z.literal(true), repositoryId: z.number().int().positive() }).strict(),
+  z.object({ action: z.literal("disable") }).strict(),
+  z.object({ action: z.literal("run") }).strict(),
+]);
+
+/**
+ * POST /api/scans/:id/safe-autofix — the per-repository Safe Auto-Fix opt-in (off by default).
+ * enable: explicit confirmation of the exact repository ID by a connected user who GitHub confirms
+ * can write to it now; the fixes of this scan are then processed. disable: turns it off (pending
+ * auto-publications are cancelled). run: processes this scan again. The route checked job ownership.
+ */
+export async function handleSafeAutoFix(req: Request, scanJobId: string, deps: RemediationDeps): Promise<Response> {
+  if (!JOB_ID_RE.test(scanJobId)) return fail(404, "not_found", "Scan job not found.");
+  const auth = deps.auth;
+  if (!auth?.app) return fail(503, "not_configured", AUTH_FAILURE.not_configured.message);
+  if (!isSameOrigin(req, auth.app)) return fail(403, "forbidden_origin", "Cross-site request refused.");
+  let body: z.infer<typeof SafeAutoFixSchema>;
+  try {
+    body = SafeAutoFixSchema.parse(await req.json());
+  } catch {
+    return fail(400, "invalid_request", "Safe Auto-Fix needs an explicit action (and, to enable it, confirmation of the repository).");
+  }
+  try {
+    const job = await deps.store.get(scanJobId);
+    if (!job) return fail(404, "not_found", "Scan job not found.");
+    const gate = await checkJobAccess(req, auth, job);
+    if (gate.denied) return gate.denied;
+    const scanAccess = gate.scanAccess ?? (await loadScanAccess(auth, scanJobId));
+    if (!scanAccess) return fail(409, "repository_unknown", "The scanned repository's GitHub ID is unknown, so Safe Auto-Fix cannot be tied to it.");
+    if (scanAccess.isPrivate) return fail(409, "private_repository", "Safe Auto-Fix is not available for private repositories.");
+    const repository = `${job.owner}/${job.repo}`;
+
+    const authz = await authorizeRepository(req, auth, job, scanAccess, "write");
+    if (!authz.ok) {
+      // Turning it off never needs write access; turning it on or running it does.
+      if (body.action === "disable" && authz.account) {
+        await auth.store.deleteSafeAutoFix(scanAccess.githubRepoId);
+        await auth.store.audit({ action: "safe_autofix", outcome: "disabled", githubUserId: authz.account.githubUserId, githubLogin: authz.account.login, scanJobId, repository });
+        return ok({ enabled: false });
+      }
+      const f = AUTH_FAILURE[authz.code];
+      return fail(f.status, authz.code, f.message);
+    }
+    const user = authz.account;
+    if (body.action === "disable") {
+      await auth.store.deleteSafeAutoFix(scanAccess.githubRepoId);
+      await auth.store.audit({ action: "safe_autofix", outcome: "disabled", githubUserId: user.githubUserId, githubLogin: user.login, scanJobId, repository });
+      return ok({ enabled: false });
+    }
+    if (body.action === "enable") {
+      if (body.repositoryId !== scanAccess.githubRepoId || authz.access.repoId !== scanAccess.githubRepoId) {
+        return fail(409, "repository_mismatch", "The confirmed repository is not the scanned repository.");
+      }
+      await auth.store.setSafeAutoFix({ githubRepoId: scanAccess.githubRepoId, enabledByGithubUserId: user.githubUserId, enabledByLogin: user.login });
+      await auth.store.audit({
+        action: "safe_autofix",
+        outcome: "enabled",
+        githubUserId: user.githubUserId,
+        githubLogin: user.login,
+        scanJobId,
+        repository,
+        detail: `repo ${scanAccess.githubRepoId} scope safe_dependency_patch`,
+      });
+    } else if (!(await safeAutoFixSetting(deps, scanAccess.githubRepoId))) {
+      return fail(409, "not_enabled", "Safe Auto-Fix is off for this repository.");
+    }
+    await runLater(deps, () => runSafeAutoFix(scanJobId, deps));
+    const setting = await safeAutoFixSetting(deps, scanAccess.githubRepoId);
+    return ok({ enabled: Boolean(setting), enabledBy: setting?.enabledByLogin ?? null, enabledAt: setting?.enabledAt.toISOString() ?? null, started: true });
+  } catch (err) {
+    if (isMissingTable(err)) return fail(503, "setup_incomplete", "Safe Auto-Fix needs the add_safe_autofix_setting database migration on this deployment.");
+    log("error", "safe_autofix_failed", { jobId: scanJobId });
+    return fail(500, "internal_error", "Safe Auto-Fix request failed. Nothing was changed.");
+  }
 }

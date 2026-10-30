@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runSubprocess } from "../scanners/runner";
-import { runSecurityScanEngine } from "../scanners/engine";
+import { runSecurityScanEngine, type ScanEngineOptions } from "../scanners/engine";
 import { safeEntryPath } from "../archive";
 import type { NormalizedFinding, ScanEngineResult } from "../scanners/types";
 import type { RescanComparison, VerificationFailureReason } from "./types";
@@ -101,8 +101,14 @@ export type ApplyAndRescanParams = {
   sourceDir?: string;
   /** Complete in-memory repository snapshot (local fixtures and tests). */
   sourceFiles?: Record<string, string>;
-  scanEngine?: (dir: string) => Promise<ScanEngineResult>;
+  scanEngine?: (dir: string, options?: ScanEngineOptions) => Promise<ScanEngineResult>;
+  /** Real progress as it happens: patch applied, scanners started, each scanner finished. */
+  onProgress?: (event: VerificationProgressEvent) => Promise<void> | void;
 };
+
+export type VerificationProgressEvent =
+  | { stage: "preparing_snapshot" | "applying_patch" | "scanning" }
+  | { scanner: "gitleaks" | "semgrep" | "osv-scanner"; status: string };
 
 export type SandboxResult = {
   rescanStatus: "verified" | "needs_review" | "failed";
@@ -193,6 +199,7 @@ export async function applyAndRescanInSandbox(params: ApplyAndRescanParams): Pro
     const patchPath = path.join(scratch, "fix.patch");
     await writeFile(patchPath, params.unifiedDiff, { mode: 0o600 });
 
+    await params.onProgress?.({ stage: "applying_patch" });
     const tApply = Date.now();
     // Plain `git apply`, exactly as a user applies the downloaded patch: every context and removed
     // line must match the snapshot, so a patch for another revision is rejected.
@@ -234,7 +241,10 @@ export async function applyAndRescanInSandbox(params: ApplyAndRescanParams): Pro
     const applyMs = Date.now() - tApply;
 
     const tScan = Date.now();
-    const rescanResult = await engine(workspace);
+    await params.onProgress?.({ stage: "scanning" });
+    const rescanResult = await engine(workspace, {
+      onScannerComplete: (r) => params.onProgress?.({ scanner: r.scanner, status: r.status }),
+    });
     const scanMs = Date.now() - tScan;
 
     const scannerStatuses = {

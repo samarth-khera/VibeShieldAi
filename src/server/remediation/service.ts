@@ -6,7 +6,13 @@ import { getConfig, type ServerConfig } from "../config";
 import { log } from "../errors";
 import { classifyRemediationEligibility } from "./eligibility";
 import { generateRemediationPatch } from "./patch";
-import { applyAndRescanInSandbox, toBaselineFinding, type BaselineFinding, type SandboxResult } from "./sandbox";
+import {
+  applyAndRescanInSandbox,
+  toBaselineFinding,
+  type BaselineFinding,
+  type SandboxResult,
+  type VerificationProgressEvent,
+} from "./sandbox";
 import { COMMIT_SHA_RE, verifyRemediationOnSnapshot } from "./verify";
 import { fetchSourceAtCommit } from "./source-cache";
 import { canonicalizeDiff, diffFiles, renderFileDiff } from "./canonical-diff";
@@ -14,7 +20,18 @@ import { generateNpmLockfilePatch, isNpmLockfileFinding } from "./npm-lockfile";
 import { parseDiffByFile } from "./strict-apply";
 import { verificationClaimOf, withVerificationClaim } from "./claims";
 import { createRemediationPullRequest, remediationBranchName, type PrStep, type PullRequestState } from "./github-pr";
-import { fitColumn, REMEDIATION_TEXT_LIMITS, type RemediationRecord, type RescanComparison } from "./types";
+import {
+  fitColumn,
+  REMEDIATION_TEXT_LIMITS,
+  type GenerationStage,
+  type GenerationState,
+  type NewRemediation,
+  type RemediationEngine,
+  type RemediationRecord,
+  type RescanComparison,
+  type ScannerProgress,
+  type VerificationProgress,
+} from "./types";
 import type { AuthDeps } from "../auth/service";
 
 export type RemediationDeps = {
@@ -39,6 +56,8 @@ export type RemediationDeps = {
   dispatchVerification?: (job: JobRecord, remediation: RemediationRecord) => Promise<void>;
   /** True while a persistent warm worker is healthy; it then gets first claim on verifications. */
   warmWorkerHealthy?: () => Promise<boolean>;
+  /** Runs a task after the HTTP response (Vercel `after`); absent in tests, where tasks run inline. */
+  defer?: (task: () => Promise<void>) => void;
 };
 
 export class RemediationError extends Error {
@@ -121,13 +140,32 @@ async function upgradeLegacyDiff(job: JobRecord, remediation: RemediationRecord,
   );
 }
 
+/** Live repository check result recorded as the first generation step (previews never write). */
+export type RepositoryCheck = { canPublish: boolean; reason: string | null; fullName: string; login: string | null };
+
+/** Which engine will produce the fix; only "ai" calls the AI provider. Mirrors generateRemediationPatch. */
+export function remediationEngineFor(
+  finding: Pick<FindingRecord, "fingerprint" | "scanner" | "filePath" | "ruleId" | "category" | "packageInfo" | "redactedEvidence">,
+  canAutoFix: boolean,
+): RemediationEngine {
+  if (!canAutoFix) return "none";
+  if (isNpmLockfileFinding(finding)) return "npm";
+  if (finding.packageInfo != null || finding.scanner === "osv-scanner" || finding.category === "Dependencies") return "manifest";
+  const rule = (finding.ruleId || "").toLowerCase();
+  if (rule.includes("eval") || /\beval\s*\(/.test(finding.redactedEvidence || "")) return "deterministic";
+  return "ai";
+}
+
 /**
- * Creates an exact, reviewable remediation preview without modifying any repository files.
+ * Creates an exact, reviewable remediation preview without modifying any repository files. The
+ * record is stored at the first step and each step is recorded as it starts, so the report shows
+ * real progress and a reload finds it; the final diff, decision and reason replace it at the end.
  */
 export async function createPreview(
   scanJobId: string,
   findingId: string,
   deps: RemediationDeps,
+  opts: { checkRepository?: () => Promise<RepositoryCheck | null> } = {},
 ): Promise<RemediationRecord> {
   const job = await deps.store.get(scanJobId);
   if (!job) {
@@ -148,82 +186,138 @@ export async function createPreview(
     eligibility.reason = "The scanned commit is unknown, so an exact patch cannot be generated.";
   }
 
+  const id = randomUUID();
+  const now = () => new Date().toISOString();
+  const generation: GenerationState = {
+    state: "running",
+    engine: remediationEngineFor(finding, eligibility.canAutoFix),
+    stages: [],
+    startedAt: now(),
+    at: now(),
+  };
+  await deps.store.createRemediation({
+    id,
+    scanJobId,
+    status: "preview",
+    findingFingerprints: [finding.fingerprint],
+    commitSha: commitSha ?? "",
+    patchSummary: `Generating a fix for ${finding.ruleId}…`.slice(0, 500),
+    unifiedDiff: "",
+    affectedFiles: [finding.filePath],
+    eligibility: eligibility.eligibility,
+    eligibilityReason: "Generating…",
+    requiresRotation: eligibility.requiresRotation,
+    warnings: [],
+    approvedAt: null,
+    approvedOperations: { generation },
+    rescanStatus: null,
+    rescanSummary: null,
+    branchName: null,
+    pullRequestUrl: null,
+  } as NewRemediation);
+  const stage = async (s: GenerationStage) => {
+    generation.stage = s;
+    generation.stages.push({ stage: s, at: now() });
+    generation.at = now();
+    await deps.store.updateRemediation(scanJobId, id, { approvedOperations: { generation } });
+  };
+
   let unifiedDiff = "";
   let patchSummary = "";
   let affectedFiles: string[] = [];
   let findingFingerprints = [finding.fingerprint];
 
-  if (eligibility.canAutoFix) {
-    let sourceContent = deps.sourceFiles ? deps.sourceFiles[finding.filePath] : undefined;
-    if (sourceContent === undefined && deps.fetchImpl && commitSha) {
-      sourceContent = await fetchSourceAtCommit(
-        deps.fetchImpl,
-        { owner: job.owner, repo: job.repo, commitSha, filePath: finding.filePath },
-        deps.config ?? getConfig(),
-      ).catch(() => undefined); // Fail closed: the patch generator handles missing source.
+  try {
+    if (opts.checkRepository) {
+      await stage("checking_repository");
+      generation.repository = await opts.checkRepository().catch(() => null);
     }
-
-    try {
-      if (isNpmLockfileFinding(finding)) {
-        if (sourceContent === undefined) throw new Error(`${finding.filePath} could not be read at the scanned commit. Manual review is required.`);
-        const readFile = async (filePath: string) =>
-          deps.sourceFiles?.[filePath] ??
-          (deps.fetchImpl
-            ? await fetchSourceAtCommit(deps.fetchImpl, { owner: job.owner, repo: job.repo, commitSha: commitSha!, filePath }, deps.config ?? getConfig()).catch(
-                () => undefined,
-              )
-            : undefined);
-        const { findings: scanFindings } = await deps.store.getFindings(scanJobId, { limit: 1000 });
-        const npm = await generateNpmLockfilePatch({
-          finding,
-          scanFindings,
-          lockText: sourceContent,
-          readFile,
-          // Never the GitHub fetch: no repository credentials go to the npm registry.
-          fetchImpl: deps.registryFetch ?? fetch,
-        });
-        const raw = npm.files.map((f) => renderFileDiff(f.path, f.before, f.after)).join("");
-        unifiedDiff = canonicalizeDiff(new Map(npm.files.map((f) => [f.path, f.before])), raw);
-        patchSummary = npm.patchSummary;
-        affectedFiles = npm.files.map((f) => f.path);
-        findingFingerprints = npm.findingFingerprints;
-        eligibility.reason = npm.reason;
-      } else {
-      const patchResult = await generateRemediationPatch({
-        finding,
-        scanJobId,
-        commitSha: commitSha!,
-        llmProvider: deps.llmProvider,
-        sourceContent,
-      });
-      // Re-render against the real files at the scanned commit, with context lines, so the patch
-      // applies with plain `git apply`; refuse it if it does not match those files exactly.
-      const originals = await originalsAtCommit(job, commitSha!, patchResult.unifiedDiff, deps, { [finding.filePath]: sourceContent });
-      unifiedDiff = canonicalizeDiff(originals, patchResult.unifiedDiff);
-      patchSummary = patchResult.patchSummary;
-      affectedFiles = patchResult.affectedFiles;
+    await stage("checking_eligibility");
+    if (eligibility.canAutoFix) {
+      let sourceContent = deps.sourceFiles ? deps.sourceFiles[finding.filePath] : undefined;
+      if (sourceContent === undefined && deps.fetchImpl && commitSha) {
+        sourceContent = await fetchSourceAtCommit(
+          deps.fetchImpl,
+          { owner: job.owner, repo: job.repo, commitSha, filePath: finding.filePath },
+          deps.config ?? getConfig(),
+        ).catch(() => undefined); // Fail closed: the patch generator handles missing source.
       }
-    } catch (err: unknown) {
-      const message = err instanceof Error && err.message ? err.message : "Manual review required.";
+
+      try {
+        if (isNpmLockfileFinding(finding)) {
+          if (sourceContent === undefined) throw new Error(`${finding.filePath} could not be read at the scanned commit. Manual review is required.`);
+          const readFile = async (filePath: string) =>
+            deps.sourceFiles?.[filePath] ??
+            (deps.fetchImpl
+              ? await fetchSourceAtCommit(deps.fetchImpl, { owner: job.owner, repo: job.repo, commitSha: commitSha!, filePath }, deps.config ?? getConfig()).catch(
+                  () => undefined,
+                )
+              : undefined);
+          const { findings: scanFindings } = await deps.store.getFindings(scanJobId, { limit: 1000 });
+          const npm = await generateNpmLockfilePatch({
+            finding,
+            scanFindings,
+            lockText: sourceContent,
+            readFile,
+            // Never the GitHub fetch: no repository credentials go to the npm registry.
+            fetchImpl: deps.registryFetch ?? fetch,
+            onStage: stage,
+          });
+          await stage("generating_patch");
+          const raw = npm.files.map((f) => renderFileDiff(f.path, f.before, f.after)).join("");
+          unifiedDiff = canonicalizeDiff(new Map(npm.files.map((f) => [f.path, f.before])), raw);
+          patchSummary = npm.patchSummary;
+          affectedFiles = npm.files.map((f) => f.path);
+          findingFingerprints = npm.findingFingerprints;
+          eligibility.reason = npm.reason;
+          if (npm.safe) {
+            eligibility.eligibility = "safe";
+            eligibility.warnings = ["Patch-level update inside the declared range; still run the project's tests before merging."];
+          }
+        } else {
+          await stage("generating_remediation");
+          const patchResult = await generateRemediationPatch({
+            finding,
+            scanJobId,
+            commitSha: commitSha!,
+            llmProvider: deps.llmProvider,
+            sourceContent,
+          });
+          // Re-render against the real files at the scanned commit, with context lines, so the patch
+          // applies with plain `git apply`; refuse it if it does not match those files exactly.
+          await stage("generating_patch");
+          const originals = await originalsAtCommit(job, commitSha!, patchResult.unifiedDiff, deps, { [finding.filePath]: sourceContent });
+          unifiedDiff = canonicalizeDiff(originals, patchResult.unifiedDiff);
+          patchSummary = patchResult.patchSummary;
+          affectedFiles = patchResult.affectedFiles;
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error && err.message ? err.message : "Manual review required.";
+        patchSummary = `Manual review required for ${finding.ruleId}`;
+        affectedFiles = [finding.filePath];
+        unifiedDiff = "";
+        eligibility.canAutoFix = false;
+        eligibility.eligibility = "unsuitable";
+        eligibility.reason = message;
+        eligibility.warnings.push("No automated fix could be safely generated. Please review and apply changes manually.");
+      }
+    } else {
       patchSummary = `Manual review required for ${finding.ruleId}`;
       affectedFiles = [finding.filePath];
-      unifiedDiff = "";
-      eligibility.canAutoFix = false;
-      eligibility.eligibility = "unsuitable";
-      eligibility.reason = message;
-      eligibility.warnings.push("No automated fix could be safely generated. Please review and apply changes manually.");
     }
-  } else {
-    patchSummary = `Manual review required for ${finding.ruleId}`;
-    affectedFiles = [finding.filePath];
+    generation.state = "done";
+  } catch (err) {
+    // Storage or infrastructure failure: record it instead of leaving a step "running".
+    generation.state = "failed";
+    unifiedDiff = "";
+    patchSummary = `Fix generation failed for ${finding.ruleId}`;
+    eligibility.eligibility = "unsuitable";
+    eligibility.reason = `Generating the fix failed (${err instanceof Error ? err.message.slice(0, 200) : "unknown error"}). Nothing was changed; try again.`;
   }
+  generation.at = now();
 
-  const record = await deps.store.createRemediation({
-    id: randomUUID(),
-    scanJobId,
-    status: "preview",
+  return deps.store.updateRemediation(scanJobId, id, {
     findingFingerprints,
-    commitSha: commitSha ?? "",
     patchSummary: fitColumn(patchSummary, REMEDIATION_TEXT_LIMITS.patchSummary),
     unifiedDiff,
     affectedFiles,
@@ -231,28 +325,33 @@ export async function createPreview(
     eligibilityReason: fitColumn(eligibility.reason, REMEDIATION_TEXT_LIMITS.eligibilityReason),
     requiresRotation: eligibility.requiresRotation,
     warnings: eligibility.warnings,
-    approvedAt: null,
-    rescanStatus: null,
-    rescanSummary: null,
-    branchName: null,
-    pullRequestUrl: null,
+    approvedOperations: { generation },
   });
-
-  return record;
 }
 
 /**
  * Who approves: the job owner's session subject, their GitHub user when connected, and the
  * canonical GitHub repository ID recorded for the scan (when the GitHub App is configured).
  */
-export type ApprovalActor = { ownerSubject: string; githubUserId?: number | null; githubRepoId?: number | null };
+export type ApprovalActor = {
+  ownerSubject: string;
+  githubUserId?: number | null;
+  githubRepoId?: number | null;
+  /**
+   * The approval also authorizes publishing (branch, commit, pull request) after the patch passes the
+   * full security rescan, as this GitHub user. Only set after the repository was confirmed writable.
+   */
+  publish?: { githubUserId: number; login: string } | null;
+  /** "safe_autofix": approved by the repository's Safe Auto-Fix policy instead of a person. */
+  approvedBy?: "job_owner" | "safe_autofix";
+};
 
 /** An approval is valid for this long; after that the owner must review and approve again. */
 export const APPROVAL_TTL_MS = 24 * 3600_000;
 
 /** Stored in Remediation.approvedOperations: what exactly was approved, and by whom. */
 export type ApprovalBinding = {
-  approvedBy: "job_owner";
+  approvedBy: "job_owner" | "safe_autofix";
   ownerSubject: string;
   githubUserId: number | null;
   /** Canonical (immutable) GitHub repository ID of the scanned repository, when known. */
@@ -264,6 +363,8 @@ export type ApprovalBinding = {
   approvedFiles: string[];
   diffSha256: string;
   approvedAt: string;
+  /** Publish after a passed verification, as this GitHub user (null: the user publishes manually). */
+  publish: { githubUserId: number; login: string } | null;
 };
 
 export type ApprovalProblem =
@@ -290,7 +391,9 @@ export function approvalProblem(
   opts: { checkExpiry?: boolean } = {},
 ): ApprovalProblem | null {
   const b = remediation.approvedOperations as Partial<ApprovalBinding> | null;
-  if (!remediation.approvedAt || !b || b.approvedBy !== "job_owner" || !b.ownerSubject) return "approval_missing";
+  if (!remediation.approvedAt || !b || (b.approvedBy !== "job_owner" && b.approvedBy !== "safe_autofix") || !b.ownerSubject) {
+    return "approval_missing";
+  }
   if (b.ownerSubject !== actor.ownerSubject) return "approval_session_mismatch";
   const sameFindings =
     Array.isArray(b.findingFingerprints) &&
@@ -355,10 +458,15 @@ export async function approveRemediation(
 
   const now = new Date();
   // Idempotent: a still-valid approval by the same owner is returned unchanged.
-  if (remediation.status === "approved" && !approvalProblem(job, remediation, actor, now)) return remediation;
+  const samePublish =
+    ((remediation.approvedOperations as Partial<ApprovalBinding> | null)?.publish?.githubUserId ?? null) === (actor.publish?.githubUserId ?? null);
+  if (remediation.status === "approved" && samePublish && !approvalProblem(job, remediation, actor, now)) return remediation;
 
+  if (actor.approvedBy === "safe_autofix" && remediation.eligibility !== "safe") {
+    throw new RemediationError("not_safe", "Only fixes classified as safe can be approved by the Safe Auto-Fix policy.", 409);
+  }
   const binding: ApprovalBinding = {
-    approvedBy: "job_owner",
+    approvedBy: actor.approvedBy ?? "job_owner",
     ownerSubject: actor.ownerSubject,
     githubUserId: actor.githubUserId ?? null,
     githubRepoId: actor.githubRepoId ?? null,
@@ -369,6 +477,7 @@ export async function approveRemediation(
     approvedFiles: [...remediation.affectedFiles],
     diffSha256: diffDigest(remediation.unifiedDiff),
     approvedAt: now.toISOString(),
+    publish: actor.publish ?? null,
   };
   // A failed verification (e.g. worker outage) or a lapsed approval may be re-approved; in-flight
   // or finished ones may not.
@@ -471,6 +580,12 @@ export async function applyAndVerify(
   }
 
   const baselineFindings = await listBaselineFindings(deps.store, scanJobId);
+  // Real progress, stored one event at a time (scanner callbacks can arrive together).
+  let progressChain: Promise<unknown> = Promise.resolve();
+  const onProgress = async (event: VerificationProgressEvent): Promise<void> => {
+    progressChain = progressChain.then(() => recordVerificationProgress(scanJobId, remediationId, event, deps)).catch(() => undefined);
+    await progressChain;
+  };
   const t0 = Date.now();
   let result: SandboxResult;
   if (deps.sourceFiles) {
@@ -480,6 +595,7 @@ export async function applyAndVerify(
       unifiedDiff: remediation.unifiedDiff,
       sourceFiles: deps.sourceFiles,
       scanEngine: deps.scanEngine,
+      onProgress,
     });
   } else {
     result = await verifyRemediationOnSnapshot({
@@ -492,8 +608,10 @@ export async function applyAndVerify(
       config,
       fetchImpl: deps.fetchImpl,
       scanEngine: deps.scanEngine,
+      onProgress,
     });
   }
+  await progressChain;
   result.summary.runtime = "local";
   result.summary.timings = { ...result.summary.timings, totalMs: Date.now() - t0 };
 
@@ -542,6 +660,45 @@ export async function pumpVerifications(scanJobId: string, deps: RemediationDeps
     }
   }
   return dispatched;
+}
+
+const SCANNER_KEYS = { gitleaks: "gitleaks", semgrep: "semgrep", "osv-scanner": "osvScanner" } as const;
+
+/**
+ * Merges one real verification event (from the worker's signed callback or the in-process run) into
+ * the stored progress. Only a remediation that is still being verified accepts it.
+ */
+export async function recordVerificationProgress(
+  scanJobId: string,
+  remediationId: string,
+  event: VerificationProgressEvent,
+  deps: Pick<RemediationDeps, "store">,
+): Promise<boolean> {
+  const r = await deps.store.getRemediation(scanJobId, remediationId);
+  if (!r || r.status !== "applied") return false;
+  const ops = (r.approvedOperations as Record<string, unknown> | null) ?? {};
+  const at = new Date().toISOString();
+  const prev = (ops.verificationProgress as VerificationProgress | undefined) ?? {
+    stage: "preparing_snapshot" as const,
+    scanners: { gitleaks: "pending" as const, semgrep: "pending" as const, osvScanner: "pending" as const },
+    at,
+  };
+  const next: VerificationProgress = { ...prev, scanners: { ...prev.scanners }, at };
+  if ("stage" in event) {
+    next.stage = event.stage;
+    if (event.stage === "scanning") {
+      for (const k of Object.keys(next.scanners) as (keyof VerificationProgress["scanners"])[]) {
+        if (next.scanners[k] === "pending") next.scanners[k] = "running";
+      }
+    }
+  } else {
+    const key = SCANNER_KEYS[event.scanner];
+    const allowed: ScannerProgress[] = ["completed", "failed", "timed_out", "skipped"];
+    next.scanners[key] = (allowed as string[]).includes(event.status) ? (event.status as ScannerProgress) : "failed";
+  }
+  return Boolean(
+    await deps.store.transitionRemediation(scanJobId, remediationId, ["applied"], { approvedOperations: { ...ops, verificationProgress: next } }),
+  );
 }
 
 /** Every finding of the original scan: the regression baseline for verification. */

@@ -37,6 +37,8 @@ export type GithubStatus = {
       installationAccount?: string;
       installationSettingsUrl?: string;
     };
+    /** Per-repository Safe Auto-Fix opt-in (off unless explicitly enabled). */
+    safeAutoFix?: { enabled: boolean; enabledBy: string | null; enabledAt: string | null; available: boolean };
   };
   /** Set when a stored authorization stopped working (expired, revoked). */
   authorizationProblem?: AuthFailureCode;
@@ -64,6 +66,16 @@ export async function githubStatus(
 
     const scanAccess = await loadScanAccess(deps, job.id);
     const auth = await authorizeRepository(req, deps, job, scanAccess, "write");
+    let safeAutoFix: NonNullable<GithubStatus["repository"]>["safeAutoFix"];
+    if (scanAccess && !scanAccess.isPrivate) {
+      try {
+        const s = await deps.store.getSafeAutoFix(scanAccess.githubRepoId);
+        safeAutoFix = { enabled: Boolean(s), enabledBy: s?.enabledByLogin ?? null, enabledAt: s?.enabledAt.toISOString() ?? null, available: true };
+      } catch (err) {
+        if (!isMissingTable(err)) throw err;
+        safeAutoFix = { enabled: false, enabledBy: null, enabledAt: null, available: false };
+      }
+    }
     if (!auth.ok && (auth.code === "authorization_expired" || auth.code === "authorization_revoked" || auth.code === "not_connected")) {
       return { configured: true, connected: false, authorizationProblem: auth.code, links };
     }
@@ -81,6 +93,7 @@ export async function githubStatus(
         installed: Boolean(a?.installed),
         appCanWrite: Boolean(a?.appCanWrite),
         readyToWrite: auth.ok,
+        safeAutoFix,
         ...(auth.ok ? {} : { reason: auth.code, message: AUTH_FAILURE[auth.code].message }),
         ...(a?.status === "ok" && (auth.ok || auth.code !== "repository_changed")
           ? (() => {

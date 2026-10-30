@@ -16,6 +16,10 @@ export class FakeGitHub {
   calls: { method: string; path: string; auth: string | null }[] = [];
   repo = { full_name: "acme/webapp", default_branch: "main", archived: false, permissions: { push: true } };
   repoId = 4242;
+  /** Where requests are routed; repo.full_name is what GitHub reports (they differ after a rename). */
+  apiRepo = "acme/webapp";
+  /** Host used in html_url links (a non-GitHub host marks simulated results in local UI runs). */
+  webHost = "github.com";
   /** The GitHub user whose token is making the current request (set by FakeGitHubApp). */
   actor: { id: number; login: string } | null = null;
   /** Request bodies of POST /git/commits, to prove no author or committer is ever sent. */
@@ -59,14 +63,14 @@ export class FakeGitHub {
     }
     return out;
   }
-  seed(files: Record<string, string | { content: string; mode: string }>): string {
+  seed(files: Record<string, string | { content: string; mode: string }>, commitSha?: string): string {
     const flat = new Map<string, { mode: string; sha: string }>();
     for (const [p, v] of Object.entries(files)) {
       const { content, mode } = typeof v === "string" ? { content: v, mode: "100644" } : v;
       flat.set(p, { mode, sha: this.blob(content) });
     }
     const tree = this.build(flat);
-    const sha = this.sha("commit", { tree, parents: [] });
+    const sha = commitSha ?? this.sha("commit", { tree, parents: [] });
     this.commits.set(sha, { tree, parents: [], message: "init" });
     this.refs.set("heads/main", sha);
     return sha;
@@ -82,14 +86,14 @@ export class FakeGitHub {
           author: { ...author, date: "2026-10-30T00:00:00Z" },
           committer: { name: "GitHub", email: "noreply@github.com", date: "2026-10-30T00:00:00Z" },
           verification: { verified: true, reason: "valid" },
-          html_url: `https://github.com/acme/webapp/commit/${sha}`,
+          html_url: `https://${this.webHost}/${this.repo.full_name}/commit/${sha}`,
         }
       : {};
   }
 
   fetch = async (url: string, init?: RequestInit): Promise<Response> => {
     const method = init?.method ?? "GET";
-    const path = url.replace("https://api.github.com/repos/acme/webapp", "");
+    const path = url.replace(`https://api.github.com/repos/${this.apiRepo}`, "");
     this.calls.push({ method, path, auth: new Headers(init?.headers).get("authorization") });
     const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
       new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
@@ -141,7 +145,7 @@ export class FakeGitHub {
       const head = decodeURIComponent(new URL(`https://x${path}`).searchParams.get("head")!).split(":")[1];
       return json(
         200,
-        this.pulls.filter((p) => p.head === head).map((p) => ({ ...p, html_url: `https://github.com/acme/webapp/pull/${p.number}`, base: { ref: p.base } })),
+        this.pulls.filter((p) => p.head === head).map((p) => ({ ...p, html_url: `https://${this.webHost}/${this.repo.full_name}/pull/${p.number}`, base: { ref: p.base } })),
       );
     }
     if (method === "GET" && (m = path.match(/^\/pulls\/(\d+)$/))) {
@@ -152,7 +156,7 @@ export class FakeGitHub {
         number: p.number,
         state: p.state,
         merged_at: p.merged_at,
-        html_url: `https://github.com/acme/webapp/pull/${p.number}`,
+        html_url: `https://${this.webHost}/${this.repo.full_name}/pull/${p.number}`,
         head: { ref: p.head, sha: headSha },
         base: { ref: p.base },
         user: { login: p.user },
@@ -169,7 +173,7 @@ export class FakeGitHub {
       }
       const number = this.pulls.length + 1;
       this.pulls.push({ number, head: body.head, base: body.base, title: body.title, body: body.body, state: "open", merged_at: null, user: this.actor?.login ?? "token-user" });
-      return json(201, { number, html_url: `https://github.com/acme/webapp/pull/${number}` });
+      return json(201, { number, html_url: `https://${this.webHost}/${this.repo.full_name}/pull/${number}` });
     }
     return json(404, { message: `unhandled ${method} ${path}` });
   };
@@ -279,9 +283,22 @@ export class FakeGitHubApp {
       return new Response(null, { status: 204 });
     }
 
-    const userId = this.tokens.get(auth.replace(/^Bearer /, ""));
-    if (!userId) return json(401, { message: "Bad credentials" });
     const path = url.replace("https://api.github.com", "");
+    const userId = this.tokens.get(auth.replace(/^Bearer /, ""));
+    if (!userId) {
+      // Like GitHub: a public repository's contents and archive can be read without a token.
+      const publicRead = !auth && method === "GET" && !this.isPrivate && path.startsWith(`/repos/${this.git.apiRepo}/`) && /\/(contents|tarball)\//.test(path);
+      if (!publicRead) return json(401, { message: "Bad credentials" });
+      const tb = path.slice(`/repos/${this.git.apiRepo}/tarball/`.length).match(/^([0-9a-f]{40})$/);
+      if (path.startsWith(`/repos/${this.git.apiRepo}/tarball/`) && tb) {
+        return new Response(null, { status: 302, headers: { location: `https://codeload.github.com/${this.git.apiRepo}/legacy.tar.gz/${tb[1]}` } });
+      }
+      const u = new URL(`https://x${path}`);
+      const file = decodeURIComponent(u.pathname.slice(`/repos/${this.git.apiRepo}/contents/`.length));
+      const ref = u.searchParams.get("ref") ?? "";
+      const files = this.git.commits.has(ref) ? this.git.filesAt(ref) : {};
+      return file in files ? new Response(files[file], { status: 200 }) : json(404, { message: "Not Found" });
+    }
     const installed = this.installation.repos.has(this.git.repoId);
     const visible = this.read.has(userId) && (!this.isPrivate || (installed && this.installationUsers.has(userId)));
 
@@ -326,7 +343,8 @@ export class FakeGitHubApp {
       if (Number(m[1]) !== this.installation.id || !this.installationUsers.has(userId)) return json(404, {});
       return json(200, { repositories: installed && this.read.has(userId) ? [{ id: this.git.repoId }] : [] });
     }
-    if (path === "/repos/acme/webapp" && method === "GET") {
+    const repoPath = `/repos/${this.git.apiRepo}`;
+    if (path === repoPath && method === "GET") {
       if (!visible) return json(404, { message: "Not Found" });
       return json(200, {
         id: this.git.repoId,
@@ -338,15 +356,23 @@ export class FakeGitHubApp {
         permissions: { pull: true, push: this.push.has(userId), admin: this.admin.has(userId) },
       });
     }
-    if (path === "/repos/acme/webapp/commits/main") {
+    if (path === `${repoPath}/commits/main`) {
       return visible ? new Response(this.git.refs.get("heads/main")!, { status: 200 }) : json(404, {});
     }
-    const tb = path.match(/^\/repos\/acme\/webapp\/tarball\/([0-9a-f]{40})$/);
+    const tb = path.startsWith(`${repoPath}/tarball/`) ? path.slice(`${repoPath}/tarball/`.length).match(/^([0-9a-f]{40})$/) : null;
     if (tb) {
       if (!visible) return json(404, {});
-      return new Response(null, { status: 302, headers: { location: `https://codeload.github.com/acme/webapp/legacy.tar.gz/${tb[1]}?token=TMPARCHIVE` } });
+      return new Response(null, { status: 302, headers: { location: `https://codeload.github.com/${this.git.apiRepo}/legacy.tar.gz/${tb[1]}?token=TMPARCHIVE` } });
     }
-    if (path.startsWith("/repos/acme/webapp")) {
+    if (path.startsWith(`${repoPath}/contents/`) && method === "GET") {
+      // GET /repos/o/r/contents/<path>?ref=<sha> with the raw media type: the file at that commit.
+      if (!visible) return json(404, { message: "Not Found" });
+      const u = new URL(`https://x${path}`);
+      const file = decodeURIComponent(u.pathname.slice(`${repoPath}/contents/`.length));
+      const files = this.git.commits.has(u.searchParams.get("ref") ?? "") ? this.git.filesAt(u.searchParams.get("ref")!) : {};
+      return file in files ? new Response(files[file], { status: 200 }) : json(404, { message: "Not Found" });
+    }
+    if (path.startsWith(repoPath)) {
       if (!visible) return json(404, { message: "Not Found" });
       // A user-to-server token can write only where the user can push and the app is installed.
       if (method !== "GET" && (!this.push.has(userId) || !installed)) return json(403, { message: "Resource not accessible by integration" });

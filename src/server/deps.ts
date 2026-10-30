@@ -1,3 +1,4 @@
+import { after } from "next/server";
 import { getConfig, type ServerConfig } from "./config";
 import { prisma, prismaJobStore } from "./db";
 import { enqueueRetrieval, getRedis, isWorkerOnline } from "./queue";
@@ -113,6 +114,8 @@ export function getRemediationDeps(config: ServerConfig = getConfig()): Remediat
     llmProvider: getLlmProvider(),
     fetchImpl: fetch,
     config,
+    // Publishing and Safe Auto-Fix run after the response so worker callbacks and page polls stay fast.
+    defer: runAfterResponse,
   };
   if (config.scanDispatchBackend === "github-actions") {
     deps.dispatchVerification = async (job, remediation) => {
@@ -126,5 +129,19 @@ export function getRemediationDeps(config: ServerConfig = getConfig()): Remediat
       prismaJobStore.warmWorkerHealthy?.(new Date(), config.warmWorkerHealthyMs) ?? Promise.resolve(false);
   }
   return deps;
+}
+
+/**
+ * Runs `task` after the HTTP response (Next's `after`). Outside a request scope (scripts, direct
+ * handler calls) `after` throws; the task then runs detached instead, so a deferred side task can
+ * never fail the request that scheduled it.
+ */
+export function runAfterResponse(task: () => Promise<unknown>): void {
+  const safe = () => task().then(() => undefined, () => undefined);
+  try {
+    after(safe);
+  } catch {
+    void safe();
+  }
 }
 

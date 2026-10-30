@@ -540,6 +540,11 @@ export type NpmLockfilePatch = {
   files: { path: string; before: string; after: string }[];
   patchSummary: string;
   reason: string;
+  /**
+   * Safe for automatic processing: a transitive, lockfile-only, patch-level (same major.minor)
+   * update inside every dependent's declared range that changes no other lockfile entry.
+   */
+  safe: boolean;
   /** The finding itself first, then every other advisory this upgrade resolves for the same package. */
   findingFingerprints: string[];
 };
@@ -586,6 +591,8 @@ export async function generateNpmLockfilePatch(params: {
   lockText: string;
   readFile: (path: string) => Promise<string | undefined>;
   fetchImpl: FetchLike;
+  /** Called as each real step starts (fetching registry data, validating the lockfile change). */
+  onStage?: (stage: "generating_remediation" | "validating_dependency_changes") => Promise<void> | void;
 }): Promise<NpmLockfilePatch> {
   const { finding } = params;
   const pkg = pkgOf(finding);
@@ -637,10 +644,13 @@ export async function generateNpmLockfilePatch(params: {
 
   const dir = finding.filePath.includes("/") ? finding.filePath.slice(0, finding.filePath.lastIndexOf("/") + 1) : "";
   const manifestPath = `${dir}package.json`;
+  await params.onStage?.("generating_remediation");
   const manifestText = await params.readFile(manifestPath);
   if (manifestText === undefined) return refuse(`${manifestPath} could not be read at the scanned commit.`);
   const registryManifest = await fetchNpmVersionManifest(pkg.name, toVersion, params.fetchImpl);
+  await params.onStage?.("validating_dependency_changes");
   const plan = planNpmUpgrade({ manifestText, lockText: params.lockText, name: pkg.name, fromVersion: pkg.version, toVersion, registryManifest });
+  const safe = plan.dependency.kind === "transitive" && isPatchLevel(pkg.version, toVersion) && onlyEntryChanged(params.lockText, plan.lockText, `node_modules/${pkg.name}`);
 
   // Kept short: it is stored in a VARCHAR(500) column. The targeted advisories travel as
   // findingFingerprints and are listed in the pull request body.
@@ -655,8 +665,10 @@ export async function generateNpmLockfilePatch(params: {
       patchSummary: `Update ${pkg.name} ${pkg.version} → ${toVersion} in ${finding.filePath} (transitive; fixes ${advisories}; package.json unchanged)`,
       reason:
         `${pkg.name} is not in package.json; ${parents} installs it. ${toVersion} is the newest release that range allows and fixes ${advisories} reported for ${pkg.version}. ` +
-        `Only package-lock.json changes, using ${integrity}. Same result as \`npm update ${pkg.name} --package-lock-only\`.`,
+        `Only package-lock.json changes, using ${integrity}. Same result as \`npm update ${pkg.name} --package-lock-only\`.` +
+        (safe ? " Patch-level update; no other lockfile entry changes." : ""),
       findingFingerprints: fingerprints,
+      safe,
     };
   }
   return {
@@ -669,5 +681,25 @@ export async function generateNpmLockfilePatch(params: {
       `${toVersion} is the lowest ${pkg.name} release that fixes all ${advisories} reported for ${pkg.version} in this scan. ` +
       `package.json: "${plan.oldSpec}" → "${plan.newSpec}"; the lockfile entry uses ${integrity}. Same result as \`npm install ${pkg.name}@${toVersion} --package-lock-only\`.`,
     findingFingerprints: fingerprints,
+    safe: false,
   };
+}
+
+/** Same major and minor version: a semver patch release. */
+function isPatchLevel(from: string, to: string): boolean {
+  const a = parseVersion(from);
+  const b = parseVersion(to);
+  return Boolean(a && b && a[0] === b[0] && a[1] === b[1] && b[2] > a[2]);
+}
+
+/** The lockfile change touches exactly one entry: no other package is added, removed or re-flagged. */
+function onlyEntryChanged(before: string, after: string, loc: string): boolean {
+  const a = (JSON.parse(before) as { packages: Packages }).packages;
+  const b = (JSON.parse(after) as { packages: Packages }).packages;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) {
+    if (k === loc) continue;
+    if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) return false;
+  }
+  return Boolean(a[loc] && b[loc]);
 }

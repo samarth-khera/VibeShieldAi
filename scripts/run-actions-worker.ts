@@ -5,6 +5,7 @@ import { verificationSpecSigningPayload } from "../src/server/callback-auth";
 import { executeScanJob } from "../src/server/worker/scan-executor";
 import { getSigned, postSigned } from "../src/server/worker/signed-http";
 import { verifyRemediationOnSnapshot } from "../src/server/remediation/verify";
+import type { VerificationProgressEvent } from "../src/server/remediation/sandbox";
 import { PRIVATE_REPOSITORY } from "../src/server/worker/private-repository";
 import type { RescanComparison } from "../src/server/remediation/types";
 import type { BaselineFinding } from "../src/server/remediation/sandbox";
@@ -124,6 +125,15 @@ async function runVerification(ctx: RunContext, remediationId: string) {
         : `Verifying ${spec.owner}/${spec.repo}@${spec.commitSha} against ${spec.baselineFindings.length} baseline findings`,
     );
 
+    // Real progress for the report (snapshot prepared, patch applied, each scanner finished), signed
+    // like the result and sent in order; a failed progress post never affects the verification.
+    let progressChain: Promise<unknown> = Promise.resolve();
+    const onProgress = async (progress: VerificationProgressEvent): Promise<void> => {
+      progressChain = progressChain
+        .then(() => postSigned(callbackUrl, callbackSecret, { scanJobId: jobId, remediationId, progress }))
+        .catch(() => undefined);
+      await progressChain;
+    };
     const result = await verifyRemediationOnSnapshot({
       owner: spec.owner,
       repo: spec.repo,
@@ -133,7 +143,9 @@ async function runVerification(ctx: RunContext, remediationId: string) {
       baselineFindings: spec.baselineFindings,
       config: getConfig(),
       archiveUrl: isPrivate ? spec.archiveUrl : undefined,
+      onProgress,
     });
+    await progressChain;
 
     const queuedAt = Date.parse(spec.queuedAt);
     result.summary.workflowRunUrl = ctx.runUrl;

@@ -26,7 +26,7 @@ describe.skipIf(!PG_URL)("PostgreSQL GitHub App authorization store (live databa
     store = (await import("@/server/auth/store")).createPrismaAuthStore(prisma);
   });
   beforeEach(async () => {
-    await prisma.$executeRawUnsafe('TRUNCATE "AuthSession", "GithubAccount", "OAuthState", "ScanAccess", "AuditEvent" CASCADE');
+    await prisma.$executeRawUnsafe('TRUNCATE "AuthSession", "GithubAccount", "OAuthState", "ScanAccess", "AuditEvent", "SafeAutoFixSetting" CASCADE');
   });
   afterAll(async () => {
     await prisma?.$disconnect();
@@ -53,6 +53,20 @@ describe.skipIf(!PG_URL)("PostgreSQL GitHub App authorization store (live databa
     const results = await Promise.all(Array.from({ length: 20 }, () => store.consumeState("ra1", "s1", "repo_access", now)));
     expect(results.filter(Boolean)).toHaveLength(1);
     expect(results.find(Boolean)).toMatchObject({ purpose: "repo_access", codeVerifierEnc: "v1.a.b.c" });
+  });
+
+  it("stores the Safe Auto-Fix opt-in per repository (off when absent) with 64-bit IDs", async () => {
+    expect(await store.getSafeAutoFix(1106558267)).toBeNull();
+    const big = 2 ** 40 + 7;
+    const on = await store.setSafeAutoFix({ githubRepoId: big, enabledByGithubUserId: 188962529, enabledByLogin: "samarth-khera" });
+    expect(on).toMatchObject({ githubRepoId: big, enabledByGithubUserId: 188962529, enabledByLogin: "samarth-khera", scope: "safe_dependency_patch" });
+    // Re-enabling by another user replaces the owner of the opt-in; it never creates a second row.
+    await store.setSafeAutoFix({ githubRepoId: big, enabledByGithubUserId: 42, enabledByLogin: "other" });
+    expect(await prisma.safeAutoFixSetting.count()).toBe(1);
+    expect((await store.getSafeAutoFix(big))?.enabledByLogin).toBe("other");
+    await store.deleteSafeAutoFix(big);
+    await store.deleteSafeAutoFix(big); // idempotent
+    expect(await store.getSafeAutoFix(big)).toBeNull();
   });
 
   it("guards token refresh with the row version, cascades disconnect to sessions, and keeps 64-bit GitHub IDs", async () => {

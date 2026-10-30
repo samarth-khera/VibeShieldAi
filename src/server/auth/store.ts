@@ -24,6 +24,8 @@ export type StateRecord = {
   expiresAt: Date;
 };
 
+export type SafeAutoFixRecord = { githubRepoId: number; enabledByGithubUserId: number; enabledByLogin: string; scope: string; enabledAt: Date };
+
 export type ScanAccessRecord = { scanJobId: string; githubRepoId: number; isPrivate: boolean; githubUserId: number | null };
 
 export type AuditInput = {
@@ -66,6 +68,9 @@ export interface AuthStore {
   getScanAccess(scanJobId: string): Promise<ScanAccessRecord | null>;
   setScanAccess(rec: ScanAccessRecord): Promise<void>;
   audit(event: AuditInput): Promise<void>;
+  getSafeAutoFix(githubRepoId: number): Promise<SafeAutoFixRecord | null>;
+  setSafeAutoFix(rec: { githubRepoId: number; enabledByGithubUserId: number; enabledByLogin: string }): Promise<SafeAutoFixRecord>;
+  deleteSafeAutoFix(githubRepoId: number): Promise<void>;
 }
 
 const toAccount = (a: {
@@ -151,6 +156,22 @@ export function createPrismaAuthStore(prisma: PrismaClient): AuthStore {
       };
       await prisma.scanAccess.upsert({ where: { scanJobId: rec.scanJobId }, create: { scanJobId: rec.scanJobId, ...data }, update: data });
     },
+    async getSafeAutoFix(githubRepoId) {
+      const r = await prisma.safeAutoFixSetting.findUnique({ where: { githubRepoId: BigInt(githubRepoId) } });
+      return r ? { ...r, githubRepoId: Number(r.githubRepoId), enabledByGithubUserId: Number(r.enabledByGithubUserId) } : null;
+    },
+    async setSafeAutoFix(rec) {
+      const data = { enabledByGithubUserId: BigInt(rec.enabledByGithubUserId), enabledByLogin: rec.enabledByLogin, enabledAt: new Date() };
+      const r = await prisma.safeAutoFixSetting.upsert({
+        where: { githubRepoId: BigInt(rec.githubRepoId) },
+        create: { githubRepoId: BigInt(rec.githubRepoId), ...data },
+        update: data,
+      });
+      return { ...r, githubRepoId: Number(r.githubRepoId), enabledByGithubUserId: Number(r.enabledByGithubUserId) };
+    },
+    async deleteSafeAutoFix(githubRepoId) {
+      await prisma.safeAutoFixSetting.deleteMany({ where: { githubRepoId: BigInt(githubRepoId) } });
+    },
     async audit(e) {
       await prisma.auditEvent.create({
         data: {
@@ -229,6 +250,18 @@ export class InMemoryAuthStore implements AuthStore {
   }
   async setScanAccess(rec: ScanAccessRecord) {
     this.access.set(rec.scanJobId, rec);
+  }
+  safeAutoFix = new Map<number, SafeAutoFixRecord>();
+  async getSafeAutoFix(githubRepoId: number) {
+    return this.safeAutoFix.get(githubRepoId) ?? null;
+  }
+  async setSafeAutoFix(rec: { githubRepoId: number; enabledByGithubUserId: number; enabledByLogin: string }) {
+    const r: SafeAutoFixRecord = { ...rec, scope: "safe_dependency_patch", enabledAt: new Date() };
+    this.safeAutoFix.set(rec.githubRepoId, r);
+    return r;
+  }
+  async deleteSafeAutoFix(githubRepoId: number) {
+    this.safeAutoFix.delete(githubRepoId);
   }
   async audit(event: AuditInput) {
     this.events.push(event);

@@ -287,3 +287,17 @@ model AuditEvent {
   @@index([at])
   @@index([githubUserId, at])
 }
+
+/// Per-repository opt-in to Safe Auto-Fix: fixes the server classifies as safe are generated,
+/// approved by policy, verified by a full rescan and published as pull requests with the
+/// enabling user's own GitHub authorization. Absent row = off (the default).
+model SafeAutoFixSetting {
+  /// Canonical GitHub repository ID.
+  githubRepoId          BigInt   @id
+  enabledByGithubUserId BigInt
+  enabledByLogin        String   @db.VarChar(39)
+  /// What the policy may process; only "safe_dependency_patch" exists.
+  scope                 String   @default("safe_dependency_patch") @db.VarChar(40)
+  enabledAt             DateTime @default(now())
+}
+

@@ -119,7 +119,13 @@ export type PublicRemediation = {
   /** Outcome of the last pull-request attempt; GitHub authorization state comes from /api/auth/github/status. */
   pullRequest: PullRequestState | null;
   /** While status is "applied": whether a worker has claimed the verification yet (never the lease itself). */
-  verification: { claimedAt: string | null; runtime: "warm-worker" | "github-actions" | null } | null;
+  verification: { claimedAt: string | null; runtime: "warm-worker" | "github-actions" | null; progress: VerificationProgress | null } | null;
+  /** How the preview was produced and its stored steps (present from the first step on). */
+  generation: GenerationState | null;
+  /** Who approved: the job owner, or the repository's Safe Auto-Fix policy. */
+  approvedBy: "job_owner" | "safe_autofix" | null;
+  /** The approval also authorized publishing after a passed verification, as this GitHub user. */
+  publishAfterVerification: { login: string } | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -127,6 +133,12 @@ export type PublicRemediation = {
 export function toPublicRemediation(r: RemediationRecord): PublicRemediation {
   const last = (r.approvedOperations as { pullRequest?: PullRequestState } | null)?.pullRequest;
   const claim = r.status === "applied" ? verificationClaimOf(r.approvedOperations) : null;
+  const ops = (r.approvedOperations ?? {}) as {
+    verificationProgress?: VerificationProgress;
+    generation?: GenerationState;
+    approvedBy?: string;
+    publish?: { login?: string } | null;
+  };
   return {
     id: r.id,
     scanJobId: r.scanJobId,
@@ -148,8 +160,15 @@ export function toPublicRemediation(r: RemediationRecord): PublicRemediation {
     pullRequest: last ?? null,
     verification:
       r.status === "applied"
-        ? { claimedAt: claim?.at ?? null, runtime: claim ? (isWarmLease(claim.lease) ? "warm-worker" : "github-actions") : null }
+        ? {
+            claimedAt: claim?.at ?? null,
+            runtime: claim ? (isWarmLease(claim.lease) ? "warm-worker" : "github-actions") : null,
+            progress: ops.verificationProgress ?? null,
+          }
         : null,
+    generation: ops.generation ?? null,
+    approvedBy: r.approvedAt ? (ops.approvedBy === "safe_autofix" ? "safe_autofix" : "job_owner") : null,
+    publishAfterVerification: r.approvedAt && ops.publish?.login ? { login: ops.publish.login } : null,
     createdAt: r.createdAt.toISOString(),
     updatedAt: r.updatedAt.toISOString(),
   };
@@ -162,3 +181,34 @@ export const REMEDIATION_TEXT_LIMITS = { patchSummary: 500, eligibilityReason: 5
 export function fitColumn(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
+
+/** Which engine produces a fix: only "ai" calls the AI provider (and uses its quota). */
+export type RemediationEngine = "npm" | "manifest" | "deterministic" | "ai" | "none";
+
+export type GenerationStage =
+  | "checking_repository"
+  | "checking_eligibility"
+  | "generating_remediation"
+  | "validating_dependency_changes"
+  | "generating_patch";
+
+/** Stored in approvedOperations.generation while (and after) a preview is generated. */
+export type GenerationState = {
+  state: "running" | "done" | "failed";
+  stage?: GenerationStage;
+  engine: RemediationEngine;
+  /** Live repository check made when generation started (informational; previews never write). */
+  repository?: { canPublish: boolean; reason: string | null; fullName: string; login: string | null } | null;
+  stages: { stage: GenerationStage; at: string }[];
+  startedAt: string;
+  at: string;
+};
+
+export type ScannerProgress = "pending" | "running" | "completed" | "failed" | "timed_out" | "skipped";
+
+/** Stored in approvedOperations.verificationProgress from real worker events while verifying. */
+export type VerificationProgress = {
+  stage: "preparing_snapshot" | "applying_patch" | "scanning";
+  scanners: { gitleaks: ScannerProgress; semgrep: ScannerProgress; osvScanner: ScannerProgress };
+  at: string;
+};

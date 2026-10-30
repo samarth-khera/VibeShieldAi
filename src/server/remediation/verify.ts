@@ -5,9 +5,8 @@ import { Readable } from "node:stream";
 import type { ServerConfig } from "../config";
 import { openArchive, openArchiveUrl, type FetchLike } from "../github";
 import { extractArchiveSafely } from "../archive";
-import type { ScanEngineResult } from "../scanners/types";
 import type { ArchiveSource } from "../worker/scan-executor";
-import { applyAndRescanInSandbox, failedResult, type BaselineFinding, type SandboxResult } from "./sandbox";
+import { applyAndRescanInSandbox, failedResult, type ApplyAndRescanParams, type BaselineFinding, type SandboxResult } from "./sandbox";
 
 export const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -22,7 +21,8 @@ export type SnapshotVerificationParams = {
   baselineFindings: BaselineFinding[];
   config: Pick<ServerConfig, "maxArchiveBytes" | "maxUnpackedBytes" | "maxFileCount" | "retrievalTimeoutMs" | "githubToken">;
   fetchImpl?: FetchLike;
-  scanEngine?: (dir: string) => Promise<ScanEngineResult>;
+  scanEngine?: ApplyAndRescanParams["scanEngine"];
+  onProgress?: ApplyAndRescanParams["onProgress"];
   /** Archive source (the warm worker reuses the archive its scan already downloaded). */
   archives?: ArchiveSource;
   /** Private repositories: short-lived archive URL from the signed spec. Takes precedence. */
@@ -45,6 +45,7 @@ export async function verifyRemediationOnSnapshot(params: SnapshotVerificationPa
   }
 
   const fetchImpl = params.fetchImpl ?? fetch;
+  await params.onProgress?.({ stage: "preparing_snapshot" });
   const workspace = await mkdtemp(path.join(tmpdir(), "vibeshield-verify-"));
   await chmod(workspace, 0o700);
   const sourceDir = path.join(workspace, "src");
@@ -80,6 +81,7 @@ export async function verifyRemediationOnSnapshot(params: SnapshotVerificationPa
       unifiedDiff: params.unifiedDiff,
       sourceDir,
       scanEngine: params.scanEngine,
+      onProgress: params.onProgress,
     });
     result.summary.snapshot = { commitSha: params.commitSha, fileCount: stats.fileCount };
     result.summary.timings = { ...result.summary.timings, downloadMs, extractionMs };

@@ -14,7 +14,9 @@ export type PrFailureCode =
   | "branch_conflict"
   | "github_error"
   | "network_error"
-  | "not_confirmed";
+  | "not_confirmed"
+  | "publish_cancelled"
+  | "approval_invalid";
 
 /** Steps of publishing a verified fix, persisted while they run so the UI can show real progress. */
 export type PrStep = "checking_repository" | "creating_commit" | "pushing_branch" | "creating_pull_request" | "confirming";
@@ -119,6 +121,8 @@ const MESSAGES: Record<PrFailureCode, string> = {
     "The remediation branch already exists with different content. It was left untouched; no pull request was opened.",
   github_error: "GitHub rejected the request.",
   network_error: "Could not reach the GitHub API. Nothing was confirmed; retrying is safe.",
+  publish_cancelled: "Publishing was cancelled before anything was created.",
+  approval_invalid: "The approval no longer matches the remediation, so nothing was published.",
   not_confirmed:
     "GitHub accepted the request, but reading the branch, commit or pull request back did not match. It is not reported as created; retrying is safe.",
 };
