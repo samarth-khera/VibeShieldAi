@@ -7,3 +7,10 @@ This version has breaking changes — APIs, conventions, and file structure may 
 This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
 
 <!-- END:nextjs-agent-rules -->
+
+## Git Attribution Policy
+
+- Do not automatically add AI model names or AI `Co-Authored-By` trailers to commits.
+- Do not add AI attribution footers to PR descriptions.
+- Use the configured Git identity for commit author and committer fields.
+- Never alter actual human authorship or misrepresent who authored the work.
